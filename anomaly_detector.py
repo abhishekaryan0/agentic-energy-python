@@ -94,7 +94,8 @@ if TORCH_AVAILABLE:
 
         def forward(self, x):
             _, (hidden, _) = self.encoder(x)
-            decoder_input = hidden.repeat(1, x.shape[1], 1)
+            # hidden is (1, batch, hidden_dim), we want (batch, seq_len, hidden_dim)
+            decoder_input = hidden.permute(1, 0, 2).repeat(1, x.shape[1], 1)
             decoded, _ = self.decoder(decoder_input)
             reconstructed = self.linear(decoded)
             return reconstructed

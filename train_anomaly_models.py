@@ -402,6 +402,10 @@ def train_lstm_autoencoder(X_train, X_test, well_type, features):
         X_train_tensor = torch.FloatTensor(np.array(sequences_train))
         X_test_tensor = torch.FloatTensor(np.array(sequences_test))
         
+        BATCH_SIZE = 64
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, X_train_tensor)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        
         input_dim = X_train_scaled.shape[1]
         model = LSTMAutoencoder(input_dim=input_dim, hidden_dim=64)
         criterion = nn.MSELoss()
@@ -409,14 +413,20 @@ def train_lstm_autoencoder(X_train, X_test, well_type, features):
         
         model.train()
         for epoch in range(LSTM_EPOCHS):
-            optimizer.zero_grad()
-            output = model(X_train_tensor)
-            loss = criterion(output, X_train_tensor)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            total_loss = 0.0
+            for batch_x, _ in train_loader:
+                optimizer.zero_grad()
+                output = model(batch_x)
+                loss = criterion(output, batch_x)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item() * batch_x.size(0)
+            
+            avg_loss = total_loss / len(train_dataset)
+                
             if epoch % 5 == 0:
-                logger.info(f"Epoch {epoch}/{LSTM_EPOCHS}, Loss: {loss.item():.4f}")
+                logger.info(f"Epoch {epoch}/{LSTM_EPOCHS}, Loss: {avg_loss:.4f}")
         
         # Evaluate on test set
         model.eval()
