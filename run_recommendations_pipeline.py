@@ -2,24 +2,26 @@
 """
 Integrated Operational Recommendations Pipeline
 
-This script:
-1. Trains the DecisionTree model on all well data
-2. Runs predictions on all wells
+1. Trains models (via train_operational_models) on all well data
+2. Runs predictions on all wells (via operational_recommendations)
 3. For each detected recommendation:
    - Stores in Snowflake (operation_recommendation table)
    - Stores in PostgreSQL (operation_suggestion table with OpenAI details)
 4. Generates a comprehensive report
 
-Bridges operational_recommendations.py and operation.py modules
+Bridges: train_operational_models, operational_recommendations, operation_suggestions
 """
 
 import sys
-import json
+import os
 import logging
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, '/home/abhishekkumar/Desktop/porjects/at-risk-assets')
+# Ensure project root is on path
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from operational_recommendations import (
     train_with_synthetic_labels,
@@ -29,14 +31,13 @@ from operational_recommendations import (
     ACTION_CATEGORY_MAP
 )
 
-from operation import (
+from operation_suggestions import (
     save_operation_suggestion,
     get_operation_suggestions,
     create_operation_suggestion_table,
     infer_action_category_priority
 )
 
-import os
 from dotenv import load_dotenv
 try:
     from snowflake.connector import connect as snowflake_connect
@@ -265,14 +266,18 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         # Train model
         train_result = None
         if not skip_training:
-            logger.info("\n3. Training DecisionTree Model...")
+            logger.info("\n3. Training Operational Recommendation Models (per lift-type + fallback)...")
             model_path = 'models/decision_tree_alldata.joblib'
             train_result = train_with_synthetic_labels(snowflake_conn, model_path=model_path)
-            logger.info(f"✓ Model trained")
-            logger.info(f"  - Train Accuracy: {train_result.get('train_accuracy', 0):.1%}")
-            logger.info(f"  - Test Accuracy: {train_result.get('test_accuracy', 0):.1%}")
+            logger.info(f"✓ Models trained")
             logger.info(f"  - Samples: {train_result.get('trained_on', 0)}")
             logger.info(f"  - Label Distribution: {train_result.get('label_distribution', {})}")
+            per_lt = train_result.get('per_lift_type', {})
+            for k, v in per_lt.items():
+                if k == '_fallback':
+                    logger.info(f"  - Fallback: acc={v.get('test_accuracy', 0):.1%}")
+                else:
+                    logger.info(f"  - {k}: acc={v.get('test_accuracy', 0):.1%}, n={v.get('trained_on', 0)}")
         else:
             logger.info("\n3. Skipping training (--skip-training)")
             model_path = 'models/decision_tree_alldata.joblib'

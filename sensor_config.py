@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dynamic configuration loader - fetches sensor configs and rules from Snowflake.
+Sensor configuration loader - fetches lift types, sensor definitions and rules from Snowflake.
 """
 
 import os
@@ -100,6 +100,26 @@ def get_form_fields(lift_type_name):
     """Get form field names for a lift type."""
     sensors = get_form_sensors(lift_type_name)
     return [s['field_name'] for s in sensors]
+
+
+def get_features_for_lift_type(lift_type_name):
+    """Get sensor field names for a lift type (sensors with min/max for training and detection)."""
+    sensors = get_sensors_for_lift_type(lift_type_name)
+    return [s['field_name'] for s in sensors if s.get('min') is not None and s.get('max') is not None]
+
+
+def get_all_sensor_columns():
+    """Get union of all sensor field names across lift types (for dynamic queries)."""
+    seen = set()
+    for lt_name in get_lift_types().keys():
+        for f in get_features_for_lift_type(lt_name):
+            seen.add(f)
+    common = ['surface_pressure', 'casing_pressure', 'wellhead_temp', 'tubing_pressure']
+    for c in common:
+        seen.add(c)
+    base = ['well_id', 'timestamp', 'lift_type']
+    return base + sorted(seen)
+
 
 def get_anomaly_rules(lift_type_name):
     """Fetch anomaly rules for a lift type."""

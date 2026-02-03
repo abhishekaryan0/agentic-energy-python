@@ -26,12 +26,14 @@ CATEGORY_DESCRIPTIONS = {
     'Maintenance': 'Recommendations focused on preventing failure, extending equipment life, or reducing downtime.',
 }
 
-# canonical feature list used across training/prediction
-FEATURES = [
+# Canonical feature list - used consistently across ALL training and prediction (action + category models)
+CANONICAL_FEATURES = [
     'oil_volume_slope', 'motor_current_slope', 'motor_temp_slope', 'surface_pressure_slope', 'gas_volume_slope',
     'motor_current_roll_mean', 'motor_temp_roll_mean', 'surface_pressure_roll_mean', 'oil_volume_roll_mean', 'gas_volume_roll_mean',
-    'missing_rate'
+    'missing_rate', 'motor_current_motor_temp_corr'
 ]
+# Backward compatibility alias
+FEATURES = CANONICAL_FEATURES
 
 # Action mapping from measured field violations to recommended actions
 ACTION_MAPPING = {
@@ -143,7 +145,7 @@ class TrendAnalyzer:
         except Exception:
             return None
 
-    def baseline_stats(self, field: str, lookback_points: int = 168, exclude_last: int = 24):
+    def baseline_stats(self, field: str, lookback_points: int = 720, exclude_last: int = 24):
         """Compute baseline mean/std and slope for a field using a lookback window.
 
         - lookback_points: number of historical samples to use (e.g., 168 for 7 days hourly)
@@ -192,8 +194,9 @@ class TrendAnalyzer:
             else:
                 metrics[f'{col}_slope'] = None
 
-        # rolling means last 24 samples
-        rm = self.df.rolling(window=24).mean().iloc[-1] if len(self.df) >= 24 else self.df.mean()
+        # rolling means last 24 samples - only on numeric columns
+        numeric_df = self.df.select_dtypes(include=[np.number])
+        rm = numeric_df.rolling(window=24).mean().iloc[-1] if len(numeric_df) >= 24 else numeric_df.mean()
         for col in ['motor_current', 'motor_temp', 'surface_pressure', 'oil_volume', 'gas_volume']:
             metrics[f'{col}_roll_mean'] = float(rm[col]) if col in rm and not pd.isna(rm[col]) else None
 
@@ -212,43 +215,81 @@ class TrendAnalyzer:
 class RuleEngine:
     """Apply deterministic rules to metrics and generate recommendations."""
 
-    def __init__(self, rules: dict = None):
-        """Initialize with optional rules dict of the form {field: {"min":..., "max":...}}"""
-        self.rules = rules or {}
+    def __init__(self, conn=None):
+        """Initialize with Snowflake connection for DB-based rules."""
+        self.conn = conn
+        self.rules = {}
 
-    def load_rules_from_excel(self, path: str):
-        """Load field ranges from an Excel file. Expects columns: 'field','min','max'."""
-        try:
-            df = pd.read_excel(path)
-        except Exception:
+    def load_rules_from_db(self, lift_type=None):
+        """Load field ranges from sensor_definitions table in DB.
+        
+        If lift_type specified, load for that type, else load all fields.
+        """
+        if not self.conn:
             return {}
-        rules = {}
-        for _, row in df.iterrows():
-            field = str(row.get('field') or row.get('Field') or '')
-            if not field:
-                continue
-            # support alternate column names that users might have
-            min_candidates = ['min', 'min_value', 'minimum', 'lower']
-            max_candidates = ['max', 'max_value', 'maximum', 'upper']
-            minv = None
-            maxv = None
-            for c in min_candidates:
-                if c in row and not pd.isna(row.get(c)):
-                    try:
-                        minv = float(row.get(c))
-                        break
-                    except Exception:
-                        minv = None
-            for c in max_candidates:
-                if c in row and not pd.isna(row.get(c)):
-                    try:
-                        maxv = float(row.get(c))
-                        break
-                    except Exception:
-                        maxv = None
-            rules[field] = {'min': minv, 'max': maxv}
-        self.rules = rules
-        return rules
+        
+        cur = self.conn.cursor()
+        try:
+            if lift_type:
+                # Get lift_type_id
+                cur.execute("SELECT id FROM lift_types WHERE lift_type_name = %s", (lift_type,))
+                lift_id_row = cur.fetchone()
+                if not lift_id_row:
+                    return {}
+                lift_id = lift_id_row[0]
+                cur.execute("SELECT field_name, min_value, max_value FROM sensor_definitions WHERE lift_type_id = %s", (lift_id,))
+            else:
+                cur.execute("SELECT field_name, min_value, max_value FROM sensor_definitions")
+            
+            rows = cur.fetchall()
+            rules = {}
+            for field, mn, mx in rows:
+                rules[field] = {'min': mn, 'max': mx}
+            self.rules = rules
+            return rules
+        finally:
+            cur.close()
+
+    def load_adaptive_rules(self, well_id):
+        """Load adaptive rules based on last 30 days data for the well."""
+        if not self.conn:
+            return {}
+        
+        cur = self.conn.cursor()
+        try:
+            # Get lift_type for the well
+            cur.execute("SELECT DISTINCT lift_type FROM well_sensor_readings WHERE well_id = %s LIMIT 1", (well_id,))
+            row = cur.fetchone()
+            if not row:
+                return {}
+            lift_type = row[0]
+            
+            # Get lift_type_id
+            cur.execute("SELECT id FROM lift_types WHERE lift_type_name = %s", (lift_type,))
+            lift_id_row = cur.fetchone()
+            if not lift_id_row:
+                return {}
+            lift_id = lift_id_row[0]
+            
+            # Get fields for this lift_type that have numeric min/max defined
+            cur.execute("SELECT field_name FROM sensor_definitions WHERE lift_type_id = %s AND min_value IS NOT NULL AND max_value IS NOT NULL", (lift_id,))
+            fields = [r[0] for r in cur.fetchall()]
+            
+            rules = {}
+            for field in fields:
+                # Compute min/max from last 30 days
+                try:
+                    cur.execute(f"SELECT MIN(TRY_CAST({field} AS FLOAT)), MAX(TRY_CAST({field} AS FLOAT)) FROM well_sensor_readings WHERE well_id = %s AND timestamp >= DATEADD(day, -30, CURRENT_DATE)", (well_id,))
+                    mn, mx = cur.fetchone()
+                    if mn is not None and mx is not None:
+                        rules[field] = {'min': float(mn), 'max': float(mx)}
+                except Exception as e:
+                    logger.warning(f"Skipping field {field} for well {well_id}: {e}")
+                    continue
+            self.rules = rules
+            return rules
+        finally:
+            cur.close()
 
     def check_ranges(self, readings: dict):
         """Return violations for readings according to loaded rules."""
@@ -268,20 +309,17 @@ class RuleEngine:
         return violations
 
     def apply(self, well_id: str, metrics: dict, last_reading: dict = None, trend_analyzer: TrendAnalyzer = None, adaptive_k: float = 2.0):
+        # Load adaptive rules based on last 30 days data
+        self.load_adaptive_rules(well_id)
+        
         recs = []
 
         # Rule: motor_current high and motor_temp rising -> Increase ESP frequency
         mc = metrics.get('motor_current_roll_mean')
         mt_slope = metrics.get('motor_temp_slope')
         mc_mt_corr = metrics.get('motor_current_motor_temp_corr')
-        # determine threshold: excel rule override, else adaptive
-        mc_thresh = None
-        if self.rules and 'motor_current' in self.rules and self.rules['motor_current'].get('max') is not None:
-            mc_thresh = self.rules['motor_current']['max']
-        elif trend_analyzer is not None:
-            stats = trend_analyzer.baseline_stats('motor_current')
-            if stats['mean'] is not None:
-                mc_thresh = stats['mean'] + adaptive_k * (stats['std'] or 0.0)
+        # determine threshold from adaptive rules
+        mc_thresh = self.rules.get('motor_current', {}).get('max')
 
         if mc is not None and mt_slope is not None and mc_thresh is not None:
             if mc > mc_thresh and mt_slope > 0.01:
@@ -300,12 +338,9 @@ class RuleEngine:
         # Rule: surface_pressure declining AND oil_volume dropping -> Pump adjustment
         sp_slope = metrics.get('surface_pressure_slope')
         oil_slope = metrics.get('oil_volume_slope')
-        # slope thresholds: use rule if provided, else compare to baseline slope
-        slope_thresh = None
-        if self.rules and 'surface_pressure' in self.rules:
-            # excel rules likely provide absolute min/max not slope; keep default small thresholds
-            slope_thresh = -0.01
-        elif trend_analyzer is not None:
+        # slope thresholds: use default since rules are absolute min/max
+        slope_thresh = -0.01
+        if trend_analyzer is not None:
             sp_stats = trend_analyzer.baseline_stats('surface_pressure')
             oil_stats = trend_analyzer.baseline_stats('oil_volume')
             # consider significant negative slope if below baseline slope minus k * slope_std
@@ -330,14 +365,8 @@ class RuleEngine:
 
         # Rule: gas volume low -> gas lift optimization
         gv = metrics.get('gas_volume_roll_mean')
-        # gas threshold from excel or adaptive
-        gv_thresh = None
-        if self.rules and 'gas_volume' in self.rules and self.rules['gas_volume'].get('min') is not None:
-            gv_thresh = self.rules['gas_volume']['min']
-        elif trend_analyzer is not None:
-            gv_stats = trend_analyzer.baseline_stats('gas_volume')
-            if gv_stats['mean'] is not None:
-                gv_thresh = gv_stats['mean'] - adaptive_k * (gv_stats['std'] or 0.0)
+        # gas threshold from adaptive rules
+        gv_thresh = self.rules.get('gas_volume', {}).get('min')
 
         if gv is not None and gv_thresh is not None and gv < gv_thresh:
             action = 'Optimize gas lift injection rate'
@@ -351,6 +380,41 @@ class RuleEngine:
                 'expected_impact': 'Estimate based on similar cases',
                 'confidence': 0.8,
             })
+
+        # General checks for all fields in sensor_definitions
+        if last_reading:
+            for field, bounds in self.rules.items():
+                val = last_reading.get(field)
+                if val is None:
+                    continue
+                mn = bounds.get('min')
+                mx = bounds.get('max')
+                if mn is not None and val < mn:
+                    action = ACTION_MAPPING.get(field, {}).get('class', 'Inspect Equipment')
+                    category = ACTION_MAPPING.get(field, {}).get('category', 'Maintenance')
+                    recs.append({
+                        'well_id': well_id,
+                        'action': action,
+                        'category': category,
+                        'priority': 'MEDIUM',
+                        'status': 'New',
+                        'reason': f'{field} {val:.2f} < {mn:.2f}',
+                        'expected_impact': 'Check sensor reading',
+                        'confidence': 0.7,
+                    })
+                if mx is not None and val > mx:
+                    action = ACTION_MAPPING.get(field, {}).get('class', 'Adjust Settings')
+                    category = ACTION_MAPPING.get(field, {}).get('category', 'Optimization')
+                    recs.append({
+                        'well_id': well_id,
+                        'action': action,
+                        'category': category,
+                        'priority': 'MEDIUM',
+                        'status': 'New',
+                        'reason': f'{field} {val:.2f} > {mx:.2f}',
+                        'expected_impact': 'Check sensor reading',
+                        'confidence': 0.7,
+                    })
 
         return recs
 
@@ -420,10 +484,7 @@ def save_recommendation_to_snowflake(conn, rec: dict, table_name: str = 'OPERATI
         metrics = metrics or rec.get('metrics', {})
         # ensure category present (may be added by rule engine or ML model)
         if not rec.get('category'):
-            try:
-                from sklearn.externals import joblib as _jb
-            except Exception:
-                _jb = joblib
+            _jb = joblib
             try:
                 model_path = os.path.join('models', 'category_classifier.joblib')
                 if os.path.exists(model_path) and joblib is not None:
@@ -670,13 +731,11 @@ def predict_category(metrics: dict, model_path: str = 'models/category_classifie
         mdl = joblib.load(model_path)
         if isinstance(mdl, dict):
             clf = mdl.get('model')
-            features = mdl.get('features', [])
+            features = mdl.get('features', CANONICAL_FEATURES)
             le = mdl.get('le')
         else:
             clf = mdl
-            features = ['oil_volume_roll_mean', 'gas_volume_roll_mean', 'motor_current_roll_mean',
-                        'motor_temp_roll_mean', 'surface_pressure_roll_mean', 'oil_volume_slope',
-                        'gas_volume_slope', 'motor_temp_slope', 'missing_rate', 'motor_current_motor_temp_corr']
+            features = CANONICAL_FEATURES
             le = None
 
         fv = []
@@ -697,526 +756,27 @@ def predict_category(metrics: dict, model_path: str = 'models/category_classifie
         return {}
 
 
-def train_category_model(snowflake_conn, model_path: str = 'models/category_classifier.joblib') -> dict:
-    """Train a category classifier using synthetic labels generated by the rule engine.
-
-    - Fetch recent sensor readings per well
-    - Compute metrics via TrendAnalyzer
-    - Use RuleEngine.apply to create synthetic recommendation labels and their categories
-    - Train a RandomForestClassifier and save via joblib
-    Returns training summary dict.
-    """
-    if RandomForestClassifier is None or joblib is None:
-        raise RuntimeError('Required sklearn or joblib not available')
-
-    cur = snowflake_conn.cursor()
-    X = []
-    y = []
-    wells = []
-    try:
-        cur.execute("SELECT DISTINCT well_id FROM well_sensor_readings")
-        wells = [r[0] for r in cur.fetchall()]
-    except Exception as e:
-        logger.error(f"Error fetching wells for training: {e}")
-        raise
-
-    re = RuleEngine()
-
-    for well in wells:
-        try:
-            cur.execute("SELECT timestamp, oil_volume, gas_volume, motor_current, motor_temp, surface_pressure FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
-            rows = cur.fetchall()
-            if not rows:
-                continue
-            cols = [d[0] for d in cur.description]
-            df = pd.DataFrame(rows, columns=cols)
-            # coerce numeric columns
-            for c in ['oil_volume', 'gas_volume', 'motor_current', 'motor_temp', 'surface_pressure']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-
-            ta = TrendAnalyzer(df.set_index('timestamp')) if 'timestamp' in df.columns else TrendAnalyzer(df)
-            metrics = ta.compute_metrics()
-            recs = re.apply(well, metrics, trend_analyzer=ta)
-            for rec in recs:
-                cat = rec.get('category')
-                if not cat:
-                    continue
-                feat = [
-                    metrics.get('oil_volume_roll_mean'),
-                    metrics.get('gas_volume_roll_mean'),
-                    metrics.get('motor_current_roll_mean'),
-                    metrics.get('motor_temp_roll_mean'),
-                    metrics.get('surface_pressure_roll_mean'),
-                    metrics.get('oil_volume_slope'),
-                    metrics.get('gas_volume_slope'),
-                    metrics.get('motor_temp_slope'),
-                    metrics.get('missing_rate'),
-                    metrics.get('motor_current_motor_temp_corr')
-                ]
-                X.append([0.0 if v is None else v for v in feat])
-                y.append(cat)
-        except Exception as e:
-            logger.warning(f"Error processing well {well} for category training: {e}")
-            continue
-
-    if not X:
-        raise RuntimeError('No training samples generated')
-
-    # encode labels
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y)
-
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
-    clf.fit(X, y_enc)
-
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    joblib.dump({'model': clf, 'features': ['oil_volume_roll_mean', 'gas_volume_roll_mean', 'motor_current_roll_mean', 'motor_temp_roll_mean', 'surface_pressure_roll_mean', 'oil_volume_slope', 'gas_volume_slope', 'motor_temp_slope', 'missing_rate', 'motor_current_motor_temp_corr'], 'le': le, 'classes_': le.classes_.tolist()}, model_path)
-
-    # basic report
-    preds = clf.predict(X)
-    from sklearn.metrics import classification_report
-    report = classification_report(y_enc, preds, target_names=le.classes_.tolist(), zero_division=0)
-    summary = {'n_samples': len(X), 'classes': le.classes_.tolist(), 'report': report, 'model_path': model_path}
-    logger.info(f"Trained category classifier: {summary}")
-    return summary
+# Training functions moved to train_operational_models.py
+# Use: python train_operational_models.py train_category
+#      python train_operational_models.py train_action
 
 
-def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decision_tree_synthetic.joblib'):
-    """Train a model using synthetic action labels based on metric variance.
-    
-    - Fetches metrics for all wells
-    - Assigns action labels based on how far metrics deviate from mean
-    - Trains DecisionTree to recognize these patterns
-    - Returns model report with accuracy and class distribution
-    """
-    if DecisionTreeClassifier is None:
-        raise RuntimeError('scikit-learn not available')
-    
-    cur = snowflake_conn.cursor()
-    try:
-        # get all wells
-        cur.execute("SELECT DISTINCT well_id FROM well_daily_production ORDER BY well_id")
-        wells = [r[0] for r in cur.fetchall()]
-        logger.info(f"Found {len(wells)} wells for training")
-        X = []
-        y = []
-        all_metrics = []
-        
-        # collect metrics for all wells
-        for well in wells:
-            try:
-                cur.execute("SELECT timestamp, surface_pressure, tubing_pressure, casing_pressure, motor_temp, wellhead_temp, motor_current FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
-                rows = cur.fetchall()
-                if not rows:
-                    continue
-                cols = [d[0].lower() for d in cur.description]
-                df = pd.DataFrame(rows, columns=cols)
-                ts_col = None
-                for c in df.columns:
-                    if 'timestamp' in c or c == 'time' or c.endswith('_ts') or 'date' in c:
-                        ts_col = c
-                        break
-                if ts_col is None:
-                    ts_col = df.columns[0]
-                df['timestamp'] = pd.to_datetime(df[ts_col])
-                df = df.set_index('timestamp')
-                ta = TrendAnalyzer(df)
-                metrics = ta.compute_metrics()
-
-                # production data - use last 60 days for better slope estimation
-                cur.execute("SELECT date, oil_volume, gas_volume FROM well_daily_production WHERE well_id = %s ORDER BY date DESC LIMIT 60", (well,))
-                prod_rows = cur.fetchall()
-                if prod_rows:
-                    prod_cols = [d[0].lower() for d in cur.description]
-                    prod_df = pd.DataFrame(prod_rows, columns=prod_cols)
-                    prod_df['date'] = pd.to_datetime(prod_df['date'])
-                    prod_df = prod_df.set_index('date')
-                    try:
-                        if 'oil_volume' in prod_df.columns and len(prod_df) >= 3:
-                            yv = prod_df['oil_volume'].dropna().values[::-1]
-                            x = np.arange(len(yv))
-                            metrics['oil_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                            metrics['oil_volume_roll_mean'] = float(prod_df['oil_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                    except Exception:
-                        metrics['oil_volume_slope'] = None
-                        metrics['oil_volume_roll_mean'] = None
-                    try:
-                        if 'gas_volume' in prod_df.columns and len(prod_df) >= 3:
-                            yv = prod_df['gas_volume'].dropna().values[::-1]
-                            x = np.arange(len(yv))
-                            metrics['gas_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                            metrics['gas_volume_roll_mean'] = float(prod_df['gas_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                    except Exception:
-                        metrics['gas_volume_slope'] = None
-                        metrics['gas_volume_roll_mean'] = None
-                
-                all_metrics.append((well, metrics))
-            except Exception as e:
-                logger.warning(f"Error processing well {well}: {e}")
-                pass
-        
-        if not all_metrics:
-            raise ValueError('No metrics collected from Snowflake')
-        
-        logger.info(f"Collected metrics for {len(all_metrics)} wells")
-        
-        # compute mean and std for each metric field
-        metric_keys = list(all_metrics[0][1].keys())
-        field_means = {}
-        field_stds = {}
-        for key in metric_keys:
-            vals = [metrics.get(key) for well, metrics in all_metrics if metrics.get(key) is not None]
-            if vals:
-                field_means[key] = np.mean(vals)
-                field_stds[key] = np.std(vals)
-            else:
-                field_means[key] = 0.0
-                field_stds[key] = 1.0
-        
-        # assign labels based on deviation from mean using z-scores
-        label_distribution = {}
-
-        import random
-
-        for well, metrics in all_metrics:
-            feats, _ = _features_from_metrics(metrics)
-            X.append(feats)
-
-            # compute z-scores for metric fields to pick candidate actions
-            candidates = []
-            for key, fmap in [('motor_current_roll_mean', 'motor_current'), ('motor_temp_slope', 'motor_temp'), ('surface_pressure_slope', 'surface_pressure'), ('oil_volume_slope', 'oil_volume'), ('gas_volume_slope', 'gas_volume')]:
-                val = metrics.get(key)
-                std = field_stds.get(key, 1.0)
-                mean = field_means.get(key, 0.0)
-                if val is not None and std and abs(std) > 1e-6:
-                    z_score = (val - mean) / (std + 1e-6)
-                    # positive or negative deviation matters for action type
-                    if abs(z_score) > 1.2:
-                        # pick action templates for the measured field
-                        amap = ACTION_MAPPING.get(fmap)
-                        if amap and isinstance(amap, dict):
-                            # use canonical class label for training, templates remain for downstream generation
-                            act_class = amap.get('class') or amap.get('category')
-                            cat = amap.get('category') or ACTION_CATEGORY_MAP.get(act_class, 'Production')
-                            candidates.append((act_class, cat, abs(z_score)))
-
-            # choose the strongest candidate by z-score magnitude
-            if candidates:
-                candidates.sort(key=lambda x: x[2], reverse=True)
-                chosen_action, chosen_cat, _ = candidates[0]
-                label = chosen_action
-            else:
-                label = 'NoAction'
-
-            y.append(label)
-            label_distribution[label] = label_distribution.get(label, 0) + 1
-        
-        logger.info(f"Label distribution: {label_distribution}")
-        
-        X = np.vstack(X)
-        y = np.array(y)
-        
-        # Handle imbalanced classes: use simple train/test split without stratification
-        # if some classes have only 1 sample
-        min_samples_per_class = min(label_distribution.values()) if label_distribution else 0
-        
-        if min_samples_per_class >= 2:
-            # Use stratified split if balanced enough
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        else:
-            # Use regular split for imbalanced data
-            logger.warning(f"Imbalanced classes detected: using non-stratified split")
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        # Train a stronger classifier (RandomForest) and calibrate probabilities
-        if RandomForestClassifier is None or CalibratedClassifierCV is None:
-            # fall back to DecisionTree if RandomForest / calibration unavailable
-            clf = DecisionTreeClassifier(
-                max_depth=5,
-                min_samples_split=3,
-                min_samples_leaf=2,
-                random_state=42,
-                class_weight='balanced'
-            )
-            clf.fit(X_train, y_train)
-            calibrated_clf = clf
-        else:
-            rf = RandomForestClassifier(
-                n_estimators=200,
-                max_depth=8,
-                min_samples_split=3,
-                min_samples_leaf=2,
-                random_state=42,
-                class_weight='balanced',
-                n_jobs=-1
-            )
-            # Use CalibratedClassifierCV to produce meaningful probabilities
-            try:
-                calibrated = CalibratedClassifierCV(rf, method='sigmoid', cv=3)
-                calibrated.fit(X_train, y_train)
-                calibrated_clf = calibrated
-            except Exception:
-                # If calibration fails (small data), fit RF directly
-                rf.fit(X_train, y_train)
-                calibrated_clf = rf
-
-        # evaluate
-        try:
-            y_pred = calibrated_clf.predict(X_test)
-            y_pred_train = calibrated_clf.predict(X_train)
-        except Exception:
-            # in unlikely case predict fails, fall back to naive predictions
-            y_pred = np.array(['NoAction'] * len(X_test))
-            y_pred_train = np.array(['NoAction'] * len(X_train))
-
-        from sklearn.metrics import accuracy_score
-        train_acc = accuracy_score(y_train, y_pred_train)
-        test_acc = accuracy_score(y_test, y_pred)
-        logger.info(f"Train Accuracy: {train_acc:.3f}, Test Accuracy: {test_acc:.3f}")
-
-        try:
-            report = classification_report(y_test, y_pred, output_dict=True)
-        except Exception:
-            report = {}
-
-        # save model (calibrated classifier or fallback)
-        Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(calibrated_clf, model_path)
-        logger.info(f"Model saved to {model_path}")
-        
-        return {
-            'model_path': model_path,
-            'train_accuracy': float(train_acc),
-            'test_accuracy': float(test_acc),
-            'trained_on': int(len(y)),
-            'label_distribution': label_distribution,
-            'report': report
-        }
-    finally:
-        cur.close()
+def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decision_tree_alldata.joblib'):
+    """Re-export: delegates to train_operational_models. Kept for backward compatibility."""
+    from train_operational_models import train_with_synthetic_labels as _train
+    return _train(snowflake_conn, model_path=model_path)
 
 
 def train_from_snowflake(snowflake_conn, lookback_days: int = 30, model_path: str = 'models/decision_tree.joblib', stricter: bool = False):
-    """Build a training set from Snowflake using Excel rules to label examples, then train a DecisionTree.
-
-    - Loads rules from 'data types and ranges.xlsx' if present.
-    - For each well, computes recent sensor + production metrics and uses rule violations as labels.
-    - If stricter=True, applies stricter thresholds (±20% adjustment) to detect more anomalies.
-    - Trains and saves a DecisionTreeClassifier to `model_path`.
-    Returns training report dict.
-    """
-    if DecisionTreeClassifier is None:
-        raise RuntimeError('scikit-learn not available')
-
-    re = RuleEngine()
-    try:
-        re.load_rules_from_excel('data types and ranges.xlsx')
-    except Exception:
-        pass
-    
-    # Apply stricter rules if requested
-    if stricter and re.rules:
-        for field in re.rules:
-            rule = re.rules[field]
-            if rule.get('min') is not None:
-                rule['min'] = rule['min'] * 0.8  # 20% lower threshold
-            if rule.get('max') is not None:
-                rule['max'] = rule['max'] * 1.2  # 20% higher threshold
-
-    cur = snowflake_conn.cursor()
-    try:
-        # get wells
-        cur.execute("SELECT DISTINCT well_id FROM well_daily_production ORDER BY well_id")
-        wells = [r[0] for r in cur.fetchall()]
-        X = []
-        y = []
-        for well in wells:
-            # fetch sensor recent (7 days hourly) and daily production (lookback_days)
-            cur.execute("SELECT timestamp, surface_pressure, tubing_pressure, casing_pressure, motor_temp, wellhead_temp, motor_current FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
-            rows = cur.fetchall()
-            if not rows:
-                continue
-            cols = [d[0].lower() for d in cur.description]
-            df = pd.DataFrame(rows, columns=cols)
-            ts_col = None
-            for c in df.columns:
-                if 'timestamp' in c or c == 'time' or c.endswith('_ts') or 'date' in c:
-                    ts_col = c
-                    break
-            if ts_col is None:
-                ts_col = df.columns[0]
-            df['timestamp'] = pd.to_datetime(df[ts_col])
-            df = df.set_index('timestamp')
-            ta = TrendAnalyzer(df)
-            metrics = ta.compute_metrics()
-
-            # production
-            cur.execute("SELECT date, oil_volume, gas_volume FROM well_daily_production WHERE well_id = %s ORDER BY date DESC LIMIT %s", (well, lookback_days))
-            prod_rows = cur.fetchall()
-            if prod_rows:
-                prod_cols = [d[0].lower() for d in cur.description]
-                prod_df = pd.DataFrame(prod_rows, columns=prod_cols)
-                prod_df['date'] = pd.to_datetime(prod_df['date'])
-                prod_df = prod_df.set_index('date')
-                try:
-                    if 'oil_volume' in prod_df.columns and len(prod_df) >= 3:
-                        yv = prod_df['oil_volume'].dropna().values[::-1]
-                        x = np.arange(len(yv))
-                        metrics['oil_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                        metrics['oil_volume_roll_mean'] = float(prod_df['oil_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                except Exception:
-                    metrics['oil_volume_slope'] = None
-                    metrics['oil_volume_roll_mean'] = None
-                try:
-                    if 'gas_volume' in prod_df.columns and len(prod_df) >= 3:
-                        yv = prod_df['gas_volume'].dropna().values[::-1]
-                        x = np.arange(len(yv))
-                        metrics['gas_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                        metrics['gas_volume_roll_mean'] = float(prod_df['gas_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                except Exception:
-                    metrics['gas_volume_slope'] = None
-                    metrics['gas_volume_roll_mean'] = None
-
-            # label by rule violations on last reading
-            last_reading = df.iloc[-1].to_dict() if len(df) else {}
-            violations = re.check_ranges(last_reading)
-            if not violations:
-                label = 'NoAction'
-            else:
-                # map field to action
-                mapping = {'motor_current': 'Increase ESP frequency', 'motor_temp': 'Increase ESP frequency', 'surface_pressure': 'Adjust pump/polish choke', 'oil_volume': 'Adjust pump/polish choke', 'gas_volume': 'Optimize gas lift injection rate'}
-                mapped = None
-                for v in violations:
-                    mapped = mapping.get(v['field']) or mapped
-                label = mapped or 'NoAction'
-
-            feats, _ = _features_from_metrics(metrics)
-            X.append(feats)
-            y.append(label)
-
-        if not X:
-            raise ValueError('No training data assembled from Snowflake')
-
-        X = np.vstack(X)
-        y = np.array(y)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        clf = DecisionTreeClassifier(max_depth=6, random_state=42)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-        report = classification_report(y_test, y_pred, output_dict=True)
-
-        Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(clf, model_path)
-        return {'model_path': model_path, 'report': report, 'trained_on': int(len(y))}
-    finally:
-        cur.close()
+    """Re-export: delegates to train_operational_models."""
+    from train_operational_models import train_from_snowflake as _train
+    return _train(snowflake_conn, lookback_days=lookback_days, model_path=model_path, stricter=stricter)
 
 
 def train_on_two_wells(snowflake_conn, well_ids: list, model_path: str = 'models/decision_tree_two_wells.joblib'):
-    """Train a DecisionTree on two wells using both sensor and production-derived metrics.
-
-    This helper is useful to quickly test if training on concrete wells produces detectable
-    candidates. Labels are derived from `data types and ranges.xlsx` via `RuleEngine`.
-    """
-    if DecisionTreeClassifier is None or joblib is None:
-        raise RuntimeError('scikit-learn and joblib required')
-
-    if not isinstance(well_ids, (list, tuple)) or len(well_ids) < 2:
-        raise ValueError('Provide at least two well ids')
-
-    re = RuleEngine()
-    try:
-        re.load_rules_from_excel('data types and ranges.xlsx')
-    except Exception:
-        pass
-
-    cur = snowflake_conn.cursor()
-    X = []
-    y = []
-    try:
-        for well in well_ids:
-            # fetch sensor readings
-            cur.execute("SELECT timestamp, surface_pressure, tubing_pressure, casing_pressure, motor_temp, wellhead_temp, motor_current FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
-            rows = cur.fetchall()
-            if not rows:
-                continue
-            cols = [d[0].lower() for d in cur.description]
-            df = pd.DataFrame(rows, columns=cols)
-            ts_col = None
-            for c in df.columns:
-                if 'timestamp' in c or c == 'time' or c.endswith('_ts') or 'date' in c:
-                    ts_col = c
-                    break
-            if ts_col is None:
-                ts_col = df.columns[0]
-            df['timestamp'] = pd.to_datetime(df[ts_col])
-            df = df.set_index('timestamp')
-            ta = TrendAnalyzer(df)
-            metrics = ta.compute_metrics()
-
-            # production-derived metrics
-            cur.execute("SELECT date, oil_volume, gas_volume FROM well_daily_production WHERE well_id = %s ORDER BY date DESC LIMIT 60", (well,))
-            prod_rows = cur.fetchall()
-            if prod_rows:
-                prod_cols = [d[0].lower() for d in cur.description]
-                prod_df = pd.DataFrame(prod_rows, columns=prod_cols)
-                prod_df['date'] = pd.to_datetime(prod_df['date'])
-                prod_df = prod_df.set_index('date')
-                try:
-                    if 'oil_volume' in prod_df.columns and len(prod_df) >= 3:
-                        yv = prod_df['oil_volume'].dropna().values[::-1]
-                        x = np.arange(len(yv))
-                        metrics['oil_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                        metrics['oil_volume_roll_mean'] = float(prod_df['oil_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                except Exception:
-                    metrics['oil_volume_slope'] = metrics.get('oil_volume_slope')
-                    metrics['oil_volume_roll_mean'] = metrics.get('oil_volume_roll_mean')
-                try:
-                    if 'gas_volume' in prod_df.columns and len(prod_df) >= 3:
-                        yv = prod_df['gas_volume'].dropna().values[::-1]
-                        x = np.arange(len(yv))
-                        metrics['gas_volume_slope'] = float(np.polyfit(x, yv, 1)[0])
-                        metrics['gas_volume_roll_mean'] = float(prod_df['gas_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                except Exception:
-                    metrics['gas_volume_slope'] = metrics.get('gas_volume_slope')
-                    metrics['gas_volume_roll_mean'] = metrics.get('gas_volume_roll_mean')
-
-            # label by rule violations on last available reading (use production ranges as fallback)
-            last_reading = df.iloc[-1].to_dict() if len(df) else {}
-            # merge production roll means into last_reading for rule checks
-            if metrics.get('oil_volume_roll_mean') is not None:
-                last_reading['oil_volume'] = last_reading.get('oil_volume') or metrics.get('oil_volume_roll_mean')
-            if metrics.get('gas_volume_roll_mean') is not None:
-                last_reading['gas_volume'] = last_reading.get('gas_volume') or metrics.get('gas_volume_roll_mean')
-
-            violations = re.check_ranges(last_reading)
-            if not violations:
-                label = 'NoAction'
-            else:
-                mapping = {'motor_current': 'Increase ESP frequency', 'motor_temp': 'Increase ESP frequency', 'surface_pressure': 'Adjust pump/polish choke', 'oil_volume': 'Adjust pump/polish choke', 'gas_volume': 'Optimize gas lift injection rate'}
-                mapped = None
-                for v in violations:
-                    mapped = mapping.get(v['field']) or mapped
-                label = mapped or 'NoAction'
-
-            feat, _ = _features_from_metrics(metrics)
-            X.append(feat)
-            y.append(label)
-
-        if not X:
-            raise RuntimeError('No training samples from provided wells')
-
-        X = np.vstack(X)
-        y = np.array(y)
-        clf = DecisionTreeClassifier(max_depth=6, random_state=42)
-        clf.fit(X, y)
-        Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(clf, model_path)
-        return {'model_path': model_path, 'trained_on': len(y), 'label_distribution': {k: int((y==k).sum()) for k in np.unique(y)}}
-    finally:
-        cur.close()
+    """Re-export: delegates to train_operational_models."""
+    from train_operational_models import train_on_two_wells as _train
+    return _train(snowflake_conn, well_ids, model_path=model_path)
 
 
 def predict_all_wells(snowflake_conn, model_path: str = 'models/decision_tree.joblib', table_name: str = 'OPERATION_RECOMMENDATION', 
@@ -1239,34 +799,47 @@ def predict_all_wells(snowflake_conn, model_path: str = 'models/decision_tree.jo
     Returns:
         List of dicts with detected recommendations
     """
-    clf = load_model(model_path)
     cur = snowflake_conn.cursor()
-    results = []
+    models_dir = os.path.dirname(model_path)
+    base_name = os.path.splitext(os.path.basename(model_path))[0]
+    model_cache = {}  # lift_type -> {'model': clf, 'features': [...]}
+
     try:
-        # fetch all wells
-        cur.execute("SELECT DISTINCT well_id FROM well_daily_production ORDER BY well_id")
-        wells = [r[0] for r in cur.fetchall()]
-        logger.info(f"predict_all_wells: Processing {len(wells)} wells")
-        
-        for well in wells:
+        cur.execute("""
+            SELECT DISTINCT wsr.well_id, COALESCE(wsr.lift_type, 'Unknown') as lift_type
+            FROM well_sensor_readings wsr
+            WHERE EXISTS (SELECT 1 FROM well_daily_production wdp WHERE wdp.well_id = wsr.well_id)
+            ORDER BY wsr.well_id
+        """)
+        well_lift_pairs = [(r[0], str(r[1]).strip() if r[1] else 'Unknown') for r in cur.fetchall()]
+        if not well_lift_pairs:
+            cur.execute("SELECT DISTINCT well_id FROM well_daily_production ORDER BY well_id")
+            well_lift_pairs = [(r[0], 'Unknown') for r in cur.fetchall()]
+        logger.info(f"predict_all_wells: Processing {len(well_lift_pairs)} wells")
+
+        results = []
+        for well, lift_type in well_lift_pairs:
             try:
-                # No anomaly pre-filter: use sensor and production data directly
+                # Load model for this lift type (cached)
+                if lift_type not in model_cache:
+                    try:
+                        model_cache[lift_type] = get_model_for_lift_type(lift_type, models_dir, base_name, model_path)
+                    except FileNotFoundError:
+                        model_cache[lift_type] = load_model(model_path)
+                mdl = model_cache[lift_type]
+                clf = mdl['model'] if isinstance(mdl, dict) else mdl
+
                 # STEP 2: Compute metrics
-                cur.execute("SELECT timestamp, surface_pressure, tubing_pressure, casing_pressure, motor_temp, wellhead_temp, motor_current FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
+                cur.execute("SELECT * FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 720", (well,))
                 rows = cur.fetchall()
                 if not rows:
                     continue
                 cols = [d[0].lower() for d in cur.description]
                 df = pd.DataFrame(rows, columns=cols)
-                ts_col = None
-                for c in df.columns:
-                    if 'timestamp' in c or c == 'time' or c.endswith('_ts') or 'date' in c:
-                        ts_col = c
-                        break
-                if ts_col is None:
-                    ts_col = df.columns[0]
-                df['timestamp'] = pd.to_datetime(df[ts_col])
-                df = df.set_index('timestamp')
+                ts_col = 'timestamp'
+                if ts_col in df.columns:
+                    df[ts_col] = pd.to_datetime(df[ts_col])
+                    df = df.set_index(ts_col)
                 ta = TrendAnalyzer(df)
                 metrics = ta.compute_metrics()
 
@@ -1324,21 +897,15 @@ def predict_all_wells(snowflake_conn, model_path: str = 'models/decision_tree.jo
                     if pred != 'NoAction':
                         candidates.append((pred, None))
 
-                # Require detection signals from BOTH sensor readings and production tables
-                # Treat production detection as presence of a computed oil/gas slope
-                prod_detect = False
-                if metrics.get('oil_volume_slope') is not None or metrics.get('gas_volume_slope') is not None:
-                    # simple threshold check: non-zero slope implies production signal available
-                    prod_detect = abs(float(metrics.get('oil_volume_slope') or 0.0)) > 0.0 or abs(float(metrics.get('gas_volume_slope') or 0.0)) > 0.0
-
-                # sensor detection: presence of non-null slopes in sensor-derived metrics
+                # Require at least one detection signal (production or sensor) - lift types have different sensors
+                prod_detect = (metrics.get('oil_volume_slope') is not None or metrics.get('gas_volume_slope') is not None) and (
+                    abs(float(metrics.get('oil_volume_slope') or 0.0)) > 1e-9 or abs(float(metrics.get('gas_volume_slope') or 0.0)) > 1e-9)
                 sensor_detect = any(
-                    (metrics.get(f'{c}_slope') is not None and abs(float(metrics.get(f'{c}_slope') or 0.0)) > 0.0)
-                    for c in ('motor_current', 'motor_temp', 'surface_pressure')
+                    k.endswith('_slope') and v is not None and abs(float(v)) > 1e-9
+                    for k, v in metrics.items()
                 )
-
-                if not prod_detect or not sensor_detect:
-                    logger.debug(f"Well {well}: skipping candidate actions because detection not present in both sensor and production data (prod_detect={prod_detect}, sensor_detect={sensor_detect})")
+                if not prod_detect and not sensor_detect:
+                    logger.debug(f"Well {well}: skipping - no production or sensor signal (prod_detect={prod_detect}, sensor_detect={sensor_detect})")
                     continue
 
                 if not candidates:
@@ -1424,16 +991,37 @@ def _features_from_metrics(metrics: dict):
 
 
 def load_model(model_path: str = 'models/decision_tree.joblib'):
+    """Load a single model from path. Returns dict with 'model' and 'features' or raw classifier."""
     if joblib is None:
         raise RuntimeError('joblib not available')
     if not os.path.exists(model_path):
         raise FileNotFoundError(model_path)
-    return joblib.load(model_path)
+    obj = joblib.load(model_path)
+    if isinstance(obj, dict) and 'model' in obj:
+        return obj
+    return {'model': obj, 'features': CANONICAL_FEATURES}
+
+
+def get_model_for_lift_type(lift_type: str, models_dir: str, base_name: str = 'decision_tree_alldata', fallback_path: str = None):
+    """Load model for lift type; fall back to combined model if lift-specific not found."""
+    if joblib is None:
+        raise RuntimeError('joblib not available')
+    lt_safe = (lift_type or 'unknown').strip().lower().replace(' ', '_').replace('-', '_')
+    lt_path = os.path.join(models_dir, f'{base_name}_{lt_safe}.joblib')
+    if os.path.exists(lt_path):
+        obj = joblib.load(lt_path)
+        return {'model': obj.get('model', obj) if isinstance(obj, dict) else obj, 'features': (obj.get('features') or CANONICAL_FEATURES) if isinstance(obj, dict) else CANONICAL_FEATURES}
+    fallback = fallback_path or os.path.join(models_dir, f'{base_name}.joblib')
+    if os.path.exists(fallback):
+        obj = joblib.load(fallback)
+        return {'model': obj.get('model', obj) if isinstance(obj, dict) else obj, 'features': (obj.get('features') or CANONICAL_FEATURES) if isinstance(obj, dict) else CANONICAL_FEATURES}
+    raise FileNotFoundError(f"No model found for lift_type={lift_type} or fallback at {fallback}")
 
 
 def predict_with_model(model_path: str, metrics: dict):
-    clf = load_model(model_path)
-    feats, feature_names = _features_from_metrics(metrics)
+    mdl = load_model(model_path)
+    clf = mdl['model'] if isinstance(mdl, dict) else mdl
+    feats, _ = _features_from_metrics(metrics)
     pred = clf.predict([feats])[0]
     proba = None
     try:
@@ -1528,12 +1116,7 @@ def generate_recommendations_for_well(snowflake_conn, well_id: str, start_ts: st
         except Exception:
             # if production fetch fails, continue with sensor-only metrics
             pass
-        re = RuleEngine()
-        # load excel rules if present
-        try:
-            re.load_rules_from_excel('data types and ranges.xlsx')
-        except Exception:
-            pass
+        re = RuleEngine(snowflake_conn)
         raw_recs = re.apply(well_id, metrics, last_reading=df.iloc[-1].to_dict(), trend_analyzer=ta)
 
         ie = ImpactEstimator()
@@ -1638,7 +1221,7 @@ def detect_and_persist(snowflake_conn, pg_conn=None, model_path: str = 'models/d
                 try:
                     # Import here to avoid circular imports at module load time
                     try:
-                        from operation import save_operation_suggestion
+                        from operation_suggestions import save_operation_suggestion
                     except Exception:
                         save_operation_suggestion = None
 
@@ -1659,9 +1242,9 @@ def detect_and_persist(snowflake_conn, pg_conn=None, model_path: str = 'models/d
                             expected_impact=rec.get('expected_impact') or ''
                         )
                         if not ok:
-                            logger.error(f"Failed to save operation suggestion via operation.save_operation_suggestion for well {rec.get('well_id')}")
+                            logger.error(f"Failed to save operation suggestion via operation_suggestions.save_operation_suggestion for well {rec.get('well_id')}")
                     else:
-                        logger.warning("operation.save_operation_suggestion not available; skipping Postgres insert")
+                        logger.warning("operation_suggestions.save_operation_suggestion not available; skipping Postgres insert")
                 except Exception as e:
                     logger.error(f"Failed to save to Postgres for well {rec.get('well_id')}: {e}")
 
@@ -1677,3 +1260,9 @@ def detect_and_persist(snowflake_conn, pg_conn=None, model_path: str = 'models/d
 
     logger.info(f"detect_and_persist: persisted {len(persisted_ids)} recommendations to Snowflake")
     return persisted_ids
+
+
+if __name__ == '__main__':
+    # Delegate to train_operational_models CLI
+    from train_operational_models import main
+    main()

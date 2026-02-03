@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 from datetime import datetime
+from typing import Dict, Optional, List
 import logging
 import os
 from uuid import uuid4
@@ -54,7 +55,7 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from operation import (
+from operation_suggestions import (
     create_operation_suggestion_table,
     save_operation_suggestion,
     get_operation_suggestions,
@@ -77,11 +78,11 @@ except ImportError:
     logging.warning("anomaly_detector module not available")
 
 try:
-    from dynamic_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields
+    from sensor_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields
     DYNAMIC_CONFIG_AVAILABLE = True
 except ImportError:
     DYNAMIC_CONFIG_AVAILABLE = False
-    logging.warning("dynamic_config module not available")
+    logging.warning("sensor_config module not available")
 
 load_dotenv()
 
@@ -370,7 +371,7 @@ def init_postgres():
 init_postgres()
 
 def check_anomaly(readings, well_id=None, lift_type=None):
-    return anomaly_detector.check_anomaly(readings, well_id, lift_type)
+    return anomaly_detector.check_anomaly(readings, historical_data=None, well_id=well_id, lift_type=lift_type)
 
 def calculate_severity(anomaly_details, anomaly_score, readings):
     violations = anomaly_details.get('violations', []) or []
@@ -410,6 +411,96 @@ def calculate_severity(anomaly_details, anomaly_score, readings):
     if a_score >= 0.75: return "HIGH"
     if a_score >= 0.35: return "MEDIUM"
     return "LOW"
+
+def determine_well_status(readings: Dict, anomaly_details: Dict, lift_type: str) -> str:
+    """
+    Determine well operational status based on sensor readings and anomaly results.
+    
+    Returns:
+        'RUNNING': Normal operation, optimal performance
+        'IDLE': Well not producing (intentional downtime or zero production)
+        'SHUTDOWN': Critical anomaly detected - equipment failure or unsafe condition
+    
+    Decision Logic:
+        SHUTDOWN: Anomaly score >= 0.75 with 3+ violations OR multiple high deviations > 60%
+        IDLE: Production metrics at zero/minimal (well not operating)
+        RUNNING: Default for normal conditions
+    """
+    try:
+        is_anomaly = anomaly_details.get('is_anomaly', False)
+        anomaly_score = float(anomaly_details.get('anomaly_score', 0.0))
+        violations = anomaly_details.get('violations', [])
+        severity = anomaly_details.get('severity', 'LOW')
+        
+        # ===== CONDITION 1: CHECK FOR SHUTDOWN (CRITICAL) =====
+        # Shutdown if: High anomaly score + multiple violations OR critical severity
+        if is_anomaly and anomaly_score >= 0.75:
+            if len(violations) >= 3:
+                logging.info(f"[WellStatus] Well status set to SHUTDOWN: anomaly_score={anomaly_score:.2f}, violations={len(violations)}")
+                return 'SHUTDOWN'
+            
+            high_deviation_count = sum(1 for v in violations if v.get('deviation_pct', 0) > 60)
+            if high_deviation_count >= 2:
+                logging.info(f"[WellStatus] Well status set to SHUTDOWN: anomaly_score={anomaly_score:.2f}, high_deviations={high_deviation_count}")
+                return 'SHUTDOWN'
+        
+        if severity == 'CRITICAL':
+            logging.info(f"[WellStatus] Well status set to SHUTDOWN: severity={severity}")
+            return 'SHUTDOWN'
+        
+        # ===== CONDITION 2: CHECK FOR IDLE (NO PRODUCTION) =====
+        # Idle if: Production metrics at zero or below minimal operating threshold
+        if lift_type and isinstance(lift_type, str):
+            lift_type_clean = lift_type.strip().lower()
+            
+            if 'rod pump' in lift_type_clean or 'rod_pump' in lift_type_clean:
+                spm = float(readings.get('strokes_per_minute') or 0)
+                if spm <= 2.0:  # Rod pump with minimal/zero strokes
+                    logging.info(f"[WellStatus] Well status set to IDLE: Rod Pump SPM={spm:.2f}")
+                    return 'IDLE'
+            
+            elif 'esp' in lift_type_clean:
+                motor_current = float(readings.get('motor_current') or 0)
+                if motor_current < 5.0:  # Below minimum operating current
+                    logging.info(f"[WellStatus] Well status set to IDLE: ESP motor_current={motor_current:.2f}A")
+                    return 'IDLE'
+            
+            elif 'gas lift' in lift_type_clean or 'gas_lift' in lift_type_clean:
+                injection_rate = float(readings.get('injection_rate') or 0)
+                if injection_rate <= 1.0:  # Zero or minimal injection
+                    logging.info(f"[WellStatus] Well status set to IDLE: Gas Lift injection_rate={injection_rate:.2f}")
+                    return 'IDLE'
+        
+        # ===== DEFAULT: RUNNING (NORMAL OPERATION) =====
+        logging.info(f"[WellStatus] Well status set to RUNNING: anomaly_score={anomaly_score:.2f}")
+        return 'RUNNING'
+        
+    except Exception as e:
+        logging.error(f"[WellStatus] Error determining well status: {e}")
+        return 'RUNNING'  # Default to RUNNING on error
+
+def format_violations_for_display(violations: List) -> List:
+    """Format violation numbers with comma delimiters for better readability in descriptions."""
+    if not violations:
+        return violations
+    
+    formatted = []
+    for v in violations:
+        formatted_v = v.copy()
+        
+        # Format numeric values with commas
+        for key in ['value', 'min', 'max']:
+            if key in formatted_v and formatted_v[key] is not None:
+                try:
+                    num = float(formatted_v[key])
+                    # Format with comma delimiter
+                    formatted_v[key] = f"{num:,.2f}" if '.' in str(num) else f"{int(num):,}"
+                except (ValueError, TypeError):
+                    pass
+        
+        formatted.append(formatted_v)
+    
+    return formatted
 
 def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, historical_anomalies=None, lift_type=None):
     try:
@@ -468,6 +559,9 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
                 sensor_ranges_str = json.dumps(sensor_ranges, indent=2, cls=CustomJSONEncoder, default=str)
         except Exception:
             sensor_ranges_str = "{}"
+        
+        # Format violations with comma-delimited numbers for display
+        formatted_violations = format_violations_for_display(anomaly_details.get('violations', []))
             
         # RESTORED FULL ORIGINAL PROMPT
         prompt = f"""
@@ -480,7 +574,7 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
         Current Sensor Readings:
         {json.dumps(readings, indent=2, cls=CustomJSONEncoder, default=str)}
         Violations Detected:
-        {json.dumps(anomaly_details['violations'], indent=2, cls=CustomJSONEncoder, default=str)}
+        {json.dumps(formatted_violations, indent=2, cls=CustomJSONEncoder, default=str)}
         
         Authoritative Sensor Ranges for lift type ({lift_type}):
         {sensor_ranges_str}
@@ -523,7 +617,10 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
         3. "status": "ACTIVE".
         4. "confidence": IMPORTANT - Single Percentage string (e.g., "78%") calculated from anomaly score. MUST be a single number. DO NOT return a range.
         5. "description": Write a concise, technical paragraph. Within this paragraph, you MUST clearly describe each parameter from 'Violations Detected' that is out of range.
-            For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.only mentiion viotions detected not all parameters.
+            For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.
+            CRITICAL FORMATTING REQUIREMENT: Use comma-delimited numbers (e.g., "1,234,567.89" NOT "1234567.89"). This applies to all numeric values in the description.
+            Use the exact formatted values provided in the 'Violations Detected' section above - they already have proper comma delimiters.
+            Only mention violations detected, not all parameters.
             For example: "The motor temperature reached 265 °F, exceeding the expected operational range of 100–250 °F." Use the 'unit' field from each violation object.
         6. "suggested_actions": A list of three clear,concise and actionable steps.
         7. "explanation": Detailed explanation of the new anomaly.
@@ -630,12 +727,29 @@ def get_form_config():
 def insert_reading():
     try:
         data = request.get_json()
+        
         if 'well_id' not in data or 'timestamp' not in data:
             return jsonify({"error": "Missing required field"}), 400
 
         well_id = data.get('well_id')
         timestamp_str = data.get('timestamp')
         lift_type = data.get('lift_type')
+        
+        # Validate lift_type is provided and not empty
+        if lift_type is None:
+            return jsonify({"error": "lift_type is required - must provide a valid well type (Rod Pump, ESP, or Gas Lift)"}), 400
+        
+        # Check for string 'None' or 'null'
+        if isinstance(lift_type, str) and lift_type.lower() in ['none', 'null', '']:
+            return jsonify({"error": "lift_type is required - must provide a valid well type (Rod Pump, ESP, or Gas Lift)"}), 400
+        
+        # Convert to string and strip whitespace
+        lift_type = str(lift_type).strip()
+        
+        if not lift_type or lift_type == '':
+            return jsonify({"error": "lift_type is required - must provide a valid well type (Rod Pump, ESP, or Gas Lift)"}), 400
+        
+        logging.info(f"DEBUG: ===== VALIDATION PASSED, lift_type={repr(lift_type)} =====")
         
         readings = {}
         if lift_type == 'Rod Pump':
@@ -661,6 +775,9 @@ def insert_reading():
         except Exception:
             pass
 
+        # ===== DETERMINE WELL STATUS =====
+        well_status = determine_well_status(readings, anomaly_details, lift_type)
+        
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -673,8 +790,8 @@ def insert_reading():
                 return val
             
             # --- 1. INSERT RAW READING ---
-            field_names = ['well_id', 'timestamp', 'lift_type'] + list(readings.keys())
-            field_values = [well_id, timestamp_str, lift_type] + [convert_for_db(v) for v in readings.values()]
+            field_names = ['well_id', 'timestamp', 'lift_type', 'well_status'] + list(readings.keys())
+            field_values = [well_id, timestamp_str, lift_type, well_status] + [convert_for_db(v) for v in readings.values()]
             placeholders = ', '.join(['%s'] * len(field_values))
             fields_str = ', '.join(field_names)
             
@@ -683,8 +800,8 @@ def insert_reading():
             try:
                 cursor.execute(query_readings, field_values)
             except Exception as e:
-                # If lift_type column is missing, retry without it
-                if "lift_type" in str(e).lower() or "invalid identifier" in str(e).lower():
+                # If lift_type or well_status column is missing, retry without them
+                if "lift_type" in str(e).lower() or "well_status" in str(e).lower() or "invalid identifier" in str(e).lower():
                     field_names = ['well_id', 'timestamp'] + list(readings.keys())
                     field_values = [well_id, timestamp_str] + [convert_for_db(v) for v in readings.values()]
                     placeholders = ', '.join(['%s'] * len(field_values))
@@ -831,11 +948,11 @@ def insert_reading():
                         with pg_conn_insert.cursor() as cur:
                             insert_query = """
                                 INSERT INTO anomaly_suggestions 
-                                (id, well_id, asset_id, lift_type, timestamp, alert_title, severity, status, confidence, description, suggested_actions, explanation, historical_context, risk_analysis, raw_anomaly_data)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                (id, well_id, asset_id, lift_type, timestamp, well_status, alert_title, severity, status, confidence, description, suggested_actions, explanation, historical_context, risk_analysis, raw_anomaly_data)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """
                             insert_values = (
-                                str(uuid4()), well_id, suggestion_result.get('asset_id'), lift_type, timestamp_str,
+                                str(uuid4()), well_id, suggestion_result.get('asset_id'), lift_type, timestamp_str, well_status,
                                 suggestion_result.get('alert_title'), suggestion_result.get('severity'),
                                 suggestion_result.get('status'), suggestion_result.get('confidence'),
                                 suggestion_result.get('description'),

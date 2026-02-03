@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -35,10 +35,8 @@
       body {
         font-family: "Rajdhani", sans-serif;
         background-color: var(--bg-dark);
-        background-image: linear-gradient(
-            rgba(0, 240, 255, 0.03) 1px,
-            transparent 1px
-          ),
+        background-image:
+          linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
           linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
         background-size: 30px 30px;
         color: var(--text-main);
@@ -676,7 +674,7 @@
                 color: var(--primary-cyan);
                 margin-bottom: 10px;
                 font-size: 0.9rem;
-                font-family: 'Orbitron', sans-serif;
+                font-family: &quot;Orbitron&quot;, sans-serif;
               "
             >
               📊 Operation Directives
@@ -707,7 +705,7 @@
                 margin-top: 8px;
                 font-size: 0.75rem;
                 color: var(--text-muted);
-                font-family: 'Fira Code', monospace;
+                font-family: &quot;Fira Code&quot;, monospace;
                 text-align: right;
               "
             ></div>
@@ -732,7 +730,7 @@
               style="
                 color: var(--primary-cyan);
                 font-size: 0.9rem;
-                font-family: 'Orbitron', sans-serif;
+                font-family: &quot;Orbitron&quot;, sans-serif;
                 margin-bottom: 6px;
               "
             >
@@ -748,7 +746,7 @@
                 max-height: 320px;
                 overflow: auto;
                 border: 1px solid #123;
-                font-family: 'Fira Code', monospace;
+                font-family: &quot;Fira Code&quot;, monospace;
                 font-size: 0.78rem;
               "
             >
@@ -859,7 +857,7 @@ Starting...</pre
           logPre.textContent = `Starting pipeline (confidence=${conf})...\n`;
 
           const es = new EventSource(
-            `/api/run-pipeline?confidence=${encodeURIComponent(conf)}`
+            `/api/run-pipeline?confidence=${encodeURIComponent(conf)}`,
           );
 
           es.onmessage = (e) => {
@@ -947,6 +945,24 @@ Starting...</pre
           resultDiv.classList.remove("show");
           errorDiv.style.display = "none";
           successDiv.classList.remove("show");
+
+          // Validate well_id and lift_type before submission
+          const wellId = document.getElementById("wellId").value.trim();
+          const liftType = document.getElementById("liftType").value.trim();
+
+          if (!wellId) {
+            errorDiv.textContent = "Error: Well ID is required";
+            errorDiv.style.display = "block";
+            return;
+          }
+
+          if (!liftType) {
+            errorDiv.textContent =
+              "Error: Well Type (lift_type) must be selected";
+            errorDiv.style.display = "block";
+            return;
+          }
+
           loading.style.display = "block";
 
           // Build form data based on selected well type
@@ -955,9 +971,8 @@ Starting...</pre
           now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
           const dynamicTimestamp = now.toISOString().slice(0, 16);
 
-          const liftType = document.getElementById("liftType").value;
           const formData = {
-            well_id: document.getElementById("wellId").value,
+            well_id: wellId,
             timestamp: dynamicTimestamp,
             lift_type: liftType,
           };
@@ -1040,7 +1055,7 @@ Starting...</pre
                     <pre style="background: #000; color: #00ff9d; padding: 8px; border-radius: 2px; border: 1px solid #333; font-size: 0.75rem; margin: 0; max-height: 300px; overflow-y: auto;">${JSON.stringify(
                       data,
                       null,
-                      2
+                      2,
                     )}</pre>
                 </div>`;
 
@@ -1154,15 +1169,15 @@ Starting...</pre
                           rec.priority === "high"
                             ? "rgba(255, 42, 42, 0.2)"
                             : rec.priority === "medium"
-                            ? "rgba(255, 193, 7, 0.2)"
-                            : "rgba(0, 255, 157, 0.2)"
+                              ? "rgba(255, 193, 7, 0.2)"
+                              : "rgba(0, 255, 157, 0.2)"
                         }; 
                         color: ${
                           rec.priority === "high"
                             ? "#ff2a2a"
                             : rec.priority === "medium"
-                            ? "#ffc107"
-                            : "#00ff9d"
+                              ? "#ffc107"
+                              : "#00ff9d"
                         };">
                       ${
                         rec.priority
@@ -1181,7 +1196,7 @@ Starting...</pre
                   <td style="color: var(--primary-cyan);">${
                     rec.confidence || rec.probability
                       ? Math.round(
-                          parseFloat(rec.confidence || rec.probability) * 100
+                          parseFloat(rec.confidence || rec.probability) * 100,
                         ) + "%"
                       : "-"
                   }</td>

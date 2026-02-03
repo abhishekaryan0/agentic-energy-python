@@ -13,4 +13,4 @@ MarkupSafe==3.0.3
 python-dateutil==2.9.0.post0
 scikit-learn>=1.2.0
 joblib>=1.2.0
-openpyxl>=3.1.0
+torch>=2.0.0

@@ -6,23 +6,23 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from snowflake.connector import connect as snowflake_connect
-
+ 
 # Import the service logic
 from anomaly_review_service import detect_anomalies
-
+ 
 # =====================================================
 # CONFIG
 # =====================================================
 TEST_MODE = True
 TEST_WELL_LIMIT = 1
-
+ 
 # 👉 Run batch for a specific well when testing (highest priority)
 # Set to None to disable
 TEST_WELL_ID = "Well_001_RodPump"  # e.g. "WELL_12345"
-
+ 
 MAX_WORKERS = 10
 # =====================================================
-
+ 
 # =====================================================
 # LOGGING SETUP
 # =====================================================
@@ -34,12 +34,12 @@ logging.basicConfig(
         logging.FileHandler("batch_execution.log"),
     ],
 )
-
+ 
 logger = logging.getLogger("BatchRunner")
-
+ 
 load_dotenv()
-
-
+ 
+ 
 # =====================================================
 # SNOWFLAKE CONNECTION
 # =====================================================
@@ -53,8 +53,8 @@ def get_snowflake_conn():
         schema=os.getenv("SNOWFLAKE_SCHEMA"),
         role=os.getenv("SNOWFLAKE_ROLE"),
     )
-
-
+ 
+ 
 # =====================================================
 # FETCH WELLS
 # =====================================================
@@ -63,27 +63,27 @@ def get_all_active_wells():
     try:
         conn = get_snowflake_conn()
         cursor = conn.cursor()
-
+ 
         query = """
             SELECT DISTINCT well_id
             FROM well_sensor_readings
             WHERE timestamp >= DATEADD(day, -7, CURRENT_DATE())
             ORDER BY well_id
         """
-
+ 
         cursor.execute(query)
         wells = [row[0] for row in cursor.fetchall()]
-
+ 
         cursor.close()
         conn.close()
-
+ 
         return wells
-
+ 
     except Exception as e:
         logger.error(f"Failed to fetch well list: {e}")
         return []
-
-
+ 
+ 
 # =====================================================
 # PROCESS SINGLE WELL
 # =====================================================
@@ -91,14 +91,14 @@ def process_single_well(well_id):
     """Wrapper function for parallel execution."""
     try:
         results = detect_anomalies(well_id)
-
+ 
         return {
             "well_id": well_id,
             "count": len(results),
             "titles": [r.get("title") for r in results],
             "status": "success",
         }
-
+ 
     except Exception as e:
         logger.error(f"Error processing {well_id}: {e}")
         return {
@@ -107,8 +107,8 @@ def process_single_well(well_id):
             "status": "failed",
             "error": str(e),
         }
-
-
+ 
+ 
 # =====================================================
 # RUN BATCH
 # =====================================================
@@ -116,24 +116,24 @@ def run_batch():
     logger.info("=" * 60)
     logger.info("STARTING ANOMALY REVIEW BATCH (PARALLEL)")
     logger.info("=" * 60)
-
+ 
     start_time = time.time()
-
+ 
     # -------------------------------------------------
     # FETCH WELLS
     # -------------------------------------------------
     wells = get_all_active_wells()
-
+ 
     if not wells:
         logger.error("No active wells found. Exiting.")
         return
-
+ 
     # -------------------------------------------------
     # TEST MODE LOGIC
     # -------------------------------------------------
     if TEST_MODE:
         logger.warning("⚠️  TEST MODE ENABLED")
-
+ 
         # 🎯 Highest priority: specific well
         if TEST_WELL_ID:
             logger.warning(f"Running for specific well_id: {TEST_WELL_ID}")
@@ -141,21 +141,21 @@ def run_batch():
         else:
             logger.warning(f"Processing only first {TEST_WELL_LIMIT} wells")
             wells = wells[:TEST_WELL_LIMIT]
-
+ 
     logger.info(f"Total wells to process: {len(wells)}")
-
+ 
     logger.info("-" * 30)
     logger.info("Target Wells:")
     for w in wells:
         logger.info(f" -> {w}")
     logger.info("-" * 30)
-
+ 
     stats = {
         "processed": 0,
         "failed": 0,
         "anomalies_found": 0,
     }
-
+ 
     # -------------------------------------------------
     # PARALLEL PROCESSING
     # -------------------------------------------------
@@ -164,17 +164,17 @@ def run_batch():
             executor.submit(process_single_well, well): well
             for well in wells
         }
-
+ 
         for i, future in enumerate(as_completed(future_to_well)):
             result = future.result()
-
+ 
             sys.stdout.write(f"\rProgress: {i + 1}/{len(wells)}")
             sys.stdout.flush()
-
+ 
             if result["status"] == "success":
                 stats["processed"] += 1
                 stats["anomalies_found"] += result["count"]
-
+ 
                 if result["count"] > 0:
                     sys.stdout.write("\n")
                     logger.info(
@@ -187,9 +187,9 @@ def run_batch():
                 logger.error(
                     f"[-] {result['well_id']} failed: {result.get('error')}"
                 )
-
+ 
     total_time = time.time() - start_time
-
+ 
     logger.info("\n" + "=" * 60)
     logger.info("BATCH COMPLETE")
     logger.info(f"Execution Time     : {total_time:.2f}s")
@@ -197,10 +197,11 @@ def run_batch():
     logger.info(f"Wells Failed      : {stats['failed']}")
     logger.info(f"Anomalies Saved   : {stats['anomalies_found']}")
     logger.info("=" * 60)
-
-
+ 
+ 
 # =====================================================
 # ENTRY POINT
 # =====================================================
 if __name__ == "__main__":
     run_batch()
+ 

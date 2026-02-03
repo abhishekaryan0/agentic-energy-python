@@ -6,7 +6,7 @@ import sys
 import time
 from dotenv import load_dotenv
 from snowflake.connector import connect as snowflake_connect
-from operation import get_pg_connection
+from operation_suggestions import get_pg_connection
 from psycopg2.extras import execute_values
 
 load_dotenv()

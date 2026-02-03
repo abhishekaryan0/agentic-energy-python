@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+from pathlib import Path
 import shlex
 import re
 from datetime import datetime
@@ -791,8 +792,9 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
         if not os.path.exists(venv_py):
             venv_py = 'python'
 
-        script_path = os.path.join(os.getcwd(), 'run_operational_pipeline.py')
-        cmd = [venv_py, script_path, '--confidence', str(confidence)]
+        _script_dir = Path(__file__).resolve().parent
+        script_path = _script_dir / 'run_recommendations_pipeline.py'
+        cmd = [venv_py, str(script_path), '--confidence', str(confidence)]
 
         process = subprocess.Popen(
             cmd,
