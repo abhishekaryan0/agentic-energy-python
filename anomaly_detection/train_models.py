@@ -54,11 +54,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from anomaly_detector import CONTAMINATION_RATIO, SEQ_LEN, LSTM_EPOCHS, LSTM_LR, LSTMAutoencoder
+from anomaly_detection.detector import (
+    CONTAMINATION_RATIO, SEQ_LEN, LSTM_EPOCHS, LSTM_LR, LSTMAutoencoder
+)
 
 # Load well types and features from sensor_config (database)
 try:
-    from sensor_config import get_lift_types, get_features_for_lift_type
+    from config.sensor_config import get_lift_types, get_features_for_lift_type
     _lift_types = list(get_lift_types().keys())
     WELL_TYPES = _lift_types if _lift_types else ['Rod Pump', 'ESP', 'Gas Lift']
 except ImportError:
@@ -110,7 +112,7 @@ def _get_sensor_columns():
     """Get all sensor columns from sensor_config (DB) or fallback static list."""
     if get_features_for_lift_type:
         try:
-            from sensor_config import get_all_sensor_columns
+            from config.sensor_config import get_all_sensor_columns
             return get_all_sensor_columns()
         except Exception:
             pass

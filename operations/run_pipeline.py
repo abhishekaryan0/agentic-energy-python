@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Integrated Operational Recommendations Pipeline
+================================================
+
+This script runs the complete operational recommendations pipeline:
 
 1. Trains models (via train_operational_models) on all well data
 2. Runs predictions on all wells (via operational_recommendations)
@@ -9,7 +12,10 @@ Integrated Operational Recommendations Pipeline
    - Stores in PostgreSQL (operation_suggestion table with OpenAI details)
 4. Generates a comprehensive report
 
-Bridges: train_operational_models, operational_recommendations, operation_suggestions
+Usage:
+    python -m operations.run_pipeline
+    python -m operations.run_pipeline --skip-training
+    python -m operations.run_pipeline --confidence 0.8
 """
 
 import sys
@@ -17,21 +23,31 @@ import os
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 # Ensure project root is on path
-_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from operational_recommendations import (
+# Import shared utilities
+from operations.utils import get_project_root, get_models_dir, get_model_path
+
+MODELS_DIR = get_models_dir()
+
+from operations.recommendations.persistence import (
     train_with_synthetic_labels,
     predict_all_wells,
     load_model,
     generate_recommendations_for_well,
-    ACTION_CATEGORY_MAP
 )
+from operations.recommendations.rules import ACTION_CATEGORY_MAP
 
-from operation_suggestions import (
+# Use shared get_model_path
+_get_model_path = get_model_path
+
+from operations.suggestions import (
     save_operation_suggestion,
     get_operation_suggestions,
     create_operation_suggestion_table,
@@ -166,18 +182,39 @@ def process_recommendations(predictions, snowflake_conn):
             inferred_category = inferred.get('category')
             inferred_priority = inferred.get('priority')
 
+            # Data-driven priority based on confidence
+            # Thresholds calibrated to actual model performance
+            if probability > 0.55:
+                data_priority = 'HIGH'
+            elif probability > 0.40:
+                data_priority = 'MEDIUM'
+            else:
+                data_priority = 'LOW'
+            
+            # Get detection metrics from the prediction if available
+            detection_metrics = pred.get('detection_metrics', {})
+            
+            # Build data-driven sensor metrics with current vs optimal
+            data_driven_metrics = {
+                **sensor_metrics,
+                'detection': detection_metrics,
+                'confidence': probability,
+                'model_action': action,
+                'inferred_action': inferred_action
+            }
+            
             logger.info(f"  ↓ Generating OpenAI analysis for PostgreSQL with inferred action/category...")
             success = save_operation_suggestion(
                 well_id=well_id,
                 action=inferred_action,
                 category=inferred_category,
                 status="New",
-                priority=inferred_priority or ("HIGH" if probability > 0.85 else "MEDIUM"),
+                priority=inferred_priority or pred.get('priority') or data_priority,
                 confidence=probability * 100,  # Convert to percentage
                 production_data=production_data,
-                sensor_metrics=sensor_metrics,
-                reason=f"ML model prediction with {probability:.0%} confidence",
-                expected_impact=f"Recommendation based on trend analysis and historical patterns"
+                sensor_metrics=data_driven_metrics,
+                reason=pred.get('reason') or f"ML model prediction with {probability:.0%} confidence",
+                expected_impact=pred.get('expected_impact') or f"Recommendation based on trend analysis and historical patterns"
             )
             
             if success:
@@ -208,6 +245,15 @@ def process_recommendations(predictions, snowflake_conn):
                     rcat = rr.get('category') or ACTION_CATEGORY_MAP.get(ra, 'Production')
                     rprio = rr.get('priority') or 'MEDIUM'
                     rconf = rr.get('confidence') or rr.get('probability') or 0.0
+                    
+                    # Include detection metrics from rule-based detection
+                    rule_detection_metrics = rr.get('detection_metrics', {})
+                    rule_sensor_metrics = {
+                        **sensor_metrics,
+                        'detection': rule_detection_metrics,
+                        'source': 'rule_based'
+                    }
+                    
                     saved = save_operation_suggestion(
                         well_id=well_id,
                         action=ra,
@@ -216,8 +262,8 @@ def process_recommendations(predictions, snowflake_conn):
                         priority=rprio,
                         confidence=(rconf * 100) if rconf and rconf <= 1 else rconf,
                         production_data=production_data,
-                        sensor_metrics=sensor_metrics,
-                        reason='Rule-based recommendation',
+                        sensor_metrics=rule_sensor_metrics,
+                        reason=rr.get('reason') or 'Rule-based recommendation',
                         expected_impact=rr.get('expected_impact', '')
                     )
                     if saved:
@@ -267,7 +313,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         train_result = None
         if not skip_training:
             logger.info("\n3. Training Operational Recommendation Models (per lift-type + fallback)...")
-            model_path = 'models/decision_tree_alldata.joblib'
+            model_path = _get_model_path('models/decision_tree_alldata.joblib')
             train_result = train_with_synthetic_labels(snowflake_conn, model_path=model_path)
             logger.info(f"✓ Models trained")
             logger.info(f"  - Samples: {train_result.get('trained_on', 0)}")
@@ -280,7 +326,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
                     logger.info(f"  - {k}: acc={v.get('test_accuracy', 0):.1%}, n={v.get('trained_on', 0)}")
         else:
             logger.info("\n3. Skipping training (--skip-training)")
-            model_path = 'models/decision_tree_alldata.joblib'
+            model_path = _get_model_path('models/decision_tree_alldata.joblib')
         
         # Run predictions
         logger.info("\n4. Running Predictions on All Wells...")

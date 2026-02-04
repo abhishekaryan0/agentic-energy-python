@@ -1,81 +1,74 @@
+"""
+Anomaly Review Service
+======================
+
+Core service for detecting and processing anomalies in well data.
+
+Orchestrates:
+- Data fetching and preprocessing
+- ML model training and prediction
+- Checker execution
+- Anomaly filtering and suppression
+- Content generation and persistence
+"""
+
 import sys
 import json
 import logging
-import pandas as pd
-import numpy as np
 from datetime import datetime, timezone
 from collections import defaultdict
+from typing import Dict, List, Optional
+
+import pandas as pd
+import numpy as np
 import psycopg2
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Import shared utilities and checkers
-from anomaly_review_utils import (
-    fetch_well_data, 
-    calculate_rolling_baseline, 
-    get_or_train_model, 
-    get_recent_anomaly_history, 
-    generate_llm_content, 
-    generate_chart_config, 
-    determine_severity, 
-    get_snowflake_conn, 
-    get_db_url,
-    # Specific Checkers
-    check_ghost_production, 
-    check_mechanical_failure, 
-    check_fluid_pound, 
-    check_gas_injection_inefficiency,
-    check_pump_wear, 
-    check_efficiency_degradation, 
-    check_sustained_production_change,
-    check_pressure_instability, 
-    check_operational_pattern_shift, 
-    check_monthly_production_decline,
-    DETECTION_WINDOW_DAYS
+# Import from anomaly_review submodules
+from anomaly_review.config import (
+    DETECTION_WINDOW_DAYS,
+    SUPPRESSION_RULES,
+    ANOMALY_PRIORITY,
 )
+
+from anomaly_review.data import (
+    fetch_well_data,
+    fetch_all_active_wells,
+    calculate_rolling_baseline,
+    get_recent_anomaly_history,
+    get_snowflake_conn,
+    get_db_url,
+)
+
+from anomaly_review.checkers import (
+    check_ghost_production,
+    check_mechanical_failure,
+    check_fluid_pound,
+    check_gas_injection_inefficiency,
+    check_pump_wear,
+    check_efficiency_degradation,
+    check_pressure_instability,
+    check_monthly_production_decline,
+    check_ml_anomaly,
+    determine_severity,
+)
+
+from anomaly_review.models import (
+    get_or_train_model,
+    predict_with_lstm,
+    detect_autoencoder_anomalies,
+)
+
+from anomaly_review.charts import generate_chart_config
+from anomaly_review.llm import generate_llm_content
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('AnomalyReviewService')
 
-# =============================================================================
-# HIERARCHY OF TRUTH (Anomaly Suppression Logic)
-# =============================================================================
-# This system prevents alert fatigue by suppressing "Symptom" anomalies 
-# when a specific "Root Cause" anomaly is detected on the same day.
 
-SUPPRESSION_RULES = {
-    # --- NEW TOP-LEVEL RULE ---
-    'MECHANICAL_FAILURE': ['FLUID_POUND', 'PUMP_WEAR', 'EFFICIENCY_DEGRADATION', 'NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'PRESSURE_INSTABILITY', 'PATTERN_SHIFT'],
-    
-    # --- EXISTING RULES ---
-    'FLUID_POUND': ['EFFICIENCY_DEGRADATION', 'NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'PRESSURE_INSTABILITY', 'PATTERN_SHIFT'],
-    'PUMP_WEAR': ['EFFICIENCY_DEGRADATION', 'NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'PATTERN_SHIFT'],
-    'GAS_HOG': ['EFFICIENCY_DEGRADATION', 'NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'PRESSURE_INSTABILITY'],
-    
-    # --- UPDATED RULES ---
-    'PRESSURE_INSTABILITY': ['NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'EFFICIENCY_DEGRADATION'],
-    'PATTERN_SHIFT': ['NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE', 'EFFICIENCY_DEGRADATION'],
-    'EFFICIENCY_DEGRADATION': ['NEW_PRODUCTION_BASELINE', 'MONTHLY_DECLINE'],
-    'NEW_PRODUCTION_BASELINE': ['MONTHLY_DECLINE']
-}
-
-# Priority Ranking (1 = Highest Priority / Most Specific)
-ANOMALY_PRIORITY = {
-    'GHOST_PROD': 1,
-    'MECHANICAL_FAILURE': 1,     # <--- TOP PRIORITY
-    'FLUID_POUND': 2,
-    'PUMP_WEAR': 2,
-    'GAS_HOG': 2, 
-    'EFFICIENCY_DEGRADATION': 3,
-    'PRESSURE_INSTABILITY': 3,
-    'PATTERN_SHIFT': 3,
-    'NEW_PRODUCTION_BASELINE': 4,
-    'MONTHLY_DECLINE': 5
-}
-
-def select_top_anomalies_per_well(anomalies: list[dict]) -> list[dict]:
+def select_top_anomalies_per_well(anomalies: List[Dict]) -> List[Dict]:
     """
     Filters anomalies based on hierarchy to prevent redundant alerts.
     Example: If 'Fluid Pound' and 'Efficiency Drop' are detected, only return 'Fluid Pound'.
@@ -121,11 +114,15 @@ def select_top_anomalies_per_well(anomalies: list[dict]) -> list[dict]:
                 
     return final_list
 
-def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS) -> list[dict]:
+def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS) -> List[Dict]:
     logger.info(f"Starting anomaly detection for {well_id}...")
     
     # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
-    full_df = fetch_well_data(well_id, days=180)
+    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
+    if df is not None:
+        full_df = df
+    else:
+        full_df = fetch_well_data(well_id, days=180)
     
     if full_df.empty or len(full_df) < 30:
         logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df)})")
@@ -148,31 +145,67 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     
     if model_art:
         try:
-            # Prepare features for prediction
-            features = model_art['features']
-            predict_df = full_df[features].fillna(method='ffill').fillna(0)
+            # 3a. Random Forest Baseline (Always run if available)
+            if 'rf_model' in model_art.get('models', {}):
+                 features = model_art['features']
+                 predict_df = full_df[features].fillna(method='ffill').fillna(0)
+                 X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
+                 full_df['predicted_oil'] = model_art['models']['rf_model'].predict(X)
+            elif 'model' in model_art: # Legacy/Fallback support
+                 features = model_art['features']
+                 predict_df = full_df[features].fillna(method='ffill').fillna(0)
+                 X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
+                 full_df['predicted_oil'] = model_art['model'].predict(X)
+
+            # 3b. LSTM Forecasting (Override if available)
+            if 'lstm_regressor' in model_art.get('models', {}):
+                try:
+                    logger.info("Using LSTM Regressor for forecasting...")
+                    lstm_preds = predict_with_lstm(
+                        model_art['models']['lstm_regressor'], 
+                        full_df, 
+                        model_art['features'], 
+                        model_art['scaler'], 
+                        model_art['imputer']
+                    )
+                    # Merge predictions: Use LSTM where valid, fallback to RF/Null
+                    full_df['predicted_oil'] = lstm_preds.combine_first(full_df['predicted_oil'])
+                except Exception as e:
+                    logger.error(f"LSTM Forecasting failed: {e}")
+
+            # 3c. Autoencoder Anomaly Detection
+            full_df['reconstruction_error'] = 0.0
+            autoencoder_threshold = 999.0
             
-            # Predict
-            X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
-            full_df['predicted_oil'] = model_art['model'].predict(X)
-            
-            # Calculate Efficiency (Safe Division)
+            if 'autoencoder' in model_art.get('models', {}):
+                try:
+                    ae_model = model_art['models']['autoencoder']
+                    ae_results = detect_autoencoder_anomalies(
+                        ae_model, 
+                        full_df, 
+                        model_art['features'], 
+                        model_art['scaler'], 
+                        model_art['imputer'],
+                        model_art.get('threshold', 0.5)
+                    )
+                    if not ae_results.empty:
+                         full_df['reconstruction_error'] = ae_results['reconstruction_error']
+                         autoencoder_threshold = model_art.get('threshold', 0.5)
+                except Exception as e:
+                    logger.error(f"Autoencoder detection failed: {e}")
+
+            # Recalculate Efficiency with BEST prediction
             safe_pred = full_df['predicted_oil'].replace(0, 0.001)
             full_df['efficiency'] = (full_df['oil_volume'] / safe_pred) * 100
-
-            # Clip outlier values (e.g., 5000% efficiency)
             full_df['efficiency'] = full_df['efficiency'].clip(0, 120)
 
-            # Calculate rolling average (requires DatetimeIndex or on='timestamp')
-            # Since calculate_rolling_baseline resets index, we must handle this.
+            # Rolling avg recalculation
             if 'timestamp' in full_df.columns:
-                # rolling() on a column with 'on' param is only supported in newer pandas, 
-                # safer to set index temporarily.
                 temp_df = full_df.set_index('timestamp').sort_index()
                 full_df['efficiency_avg_30d'] = temp_df['efficiency'].rolling('30D', min_periods=7).mean().values
             else:
-                # Fallback if no timestamp
                 full_df['efficiency_avg_30d'] = full_df['efficiency'].rolling(30, min_periods=7).mean()
+                
         except Exception as e:
             logger.error(f"ML Prediction failed for {well_id}: {e}")
 
@@ -188,9 +221,7 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         check_gas_injection_inefficiency,
         check_pump_wear,
         check_efficiency_degradation,
-        check_sustained_production_change,
         check_pressure_instability,
-        check_operational_pattern_shift, # Runs on full DF inside
         check_monthly_production_decline # Runs on full DF inside
     ]
     
@@ -207,7 +238,6 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         for check in all_checkers:
             res = None
             try:
-                # Optimized execution: Heavy trend checks only run on the most recent data point
                 if check.__name__ in ['check_operational_pattern_shift', 'check_monthly_production_decline']:
                     if row['timestamp'] == window_df['timestamp'].max():
                         res = check(ctx, full_df)
@@ -235,6 +265,27 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "lift_type": str(current_lift_type),
                     "diagnosis": res.get('diagnosis'),
                     "severity_metrics": res.get('severity_metrics', {})
+                })
+
+        # --- SPECIAL CHECK: ML ANOMALY (Autoencoder) ---
+        if 'reconstruction_error' in ctx and ctx['reconstruction_error'] > 0:
+            res_ml = check_ml_anomaly(ctx, ctx['reconstruction_error'], autoencoder_threshold)
+            if res_ml:
+                 raw_findings.append({
+                    "well_id": well_id,
+                    "event_date": str(row['timestamp'].date()),
+                    "timestamp": row['timestamp'],
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                    "anomaly_code": res_ml['code'],
+                    "category": res_ml['category'],
+                    "severity":  determine_severity(res_ml['code'], res_ml.get('severity_metrics', {})),
+                    "raw_data": res_ml['raw_data'],
+                    "chart_metric": res_ml['chart_metric'],
+                    "impact_value": res_ml['impact_value'],
+                    "impact_payload": res_ml['impact_payload'],
+                    "lift_type": str(current_lift_type),
+                    "diagnosis": res_ml.get('diagnosis'),
+                    "severity_metrics": res_ml.get('severity_metrics', {})
                 })
 
     # 5. Filter & Deduplicate (The Truth Hierarchy)

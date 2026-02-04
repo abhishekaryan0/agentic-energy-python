@@ -793,7 +793,7 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
             venv_py = 'python'
 
         _script_dir = Path(__file__).resolve().parent
-        script_path = _script_dir / 'run_recommendations_pipeline.py'
+        script_path = _script_dir / 'run_pipeline.py'
         cmd = [venv_py, str(script_path), '--confidence', str(confidence)]
 
         process = subprocess.Popen(

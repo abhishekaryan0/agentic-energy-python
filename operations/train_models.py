@@ -7,9 +7,14 @@ Trains:
 - Category classifier: predicts Production/Optimization/Maintenance from metrics
 
 Run:
-  python train_operational_models.py train_category
-  python train_operational_models.py train_action
-  python train_operational_models.py train_action --model-path models/decision_tree.joblib
+    python -m operations.train_models train_category
+    python -m operations.train_models train_action
+    python -m operations.train_models train_action --model-path models/decision_tree.joblib
+
+Example:
+    >>> from operations.train_models import train_category_model
+    >>> result = train_category_model(snowflake_conn)
+    >>> print(f"Trained on {result['n_samples']} samples")
 """
 
 import os
@@ -17,6 +22,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,19 +31,41 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Add project root for imports
-_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Import shared components from operational_recommendations
-from operational_recommendations import (
-    TrendAnalyzer,
-    RuleEngine,
+# Import shared utilities
+from operations.utils import (
+    get_project_root,
+    get_models_dir,
+    get_model_path as _get_model_path,
+    features_from_metrics,
+)
+
+# Import configuration
+from operations.config import (
     CANONICAL_FEATURES,
+    LIFT_TYPE_SENSORS,
+    PRODUCTION_FIELDS,
+    get_features_for_lift_type,
+    get_sensors_for_lift_type,
+    TrainingConfig,
+    DEFAULT_TRAINING_CONFIG,
+)
+
+MODELS_DIR = get_models_dir()
+
+# Import components from operations.recommendations subpackage
+from operations.recommendations.analyzer import TrendAnalyzer
+from operations.recommendations.rules import (
+    RuleEngine,
     ACTION_MAPPING,
     ACTION_CATEGORY_MAP,
-    _features_from_metrics,
+    load_sensor_config_from_db,
 )
+from operations.recommendations.persistence import _features_from_metrics
 
 try:
     from sklearn.tree import DecisionTreeClassifier
@@ -64,6 +92,10 @@ def train_category_model(snowflake_conn, model_path: str = 'models/category_clas
     """
     if not SKLEARN_AVAILABLE or RandomForestClassifier is None or joblib is None:
         raise RuntimeError('Required sklearn/joblib not available')
+
+    # Resolve model path
+    resolved_path = _get_model_path(model_path)
+    model_path = resolved_path
 
     cur = snowflake_conn.cursor()
     X, y = [], []
@@ -153,12 +185,29 @@ def train_category_model(snowflake_conn, model_path: str = 'models/category_clas
 
 
 def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decision_tree_alldata.joblib') -> dict:
-    """Train action models (per lift-type + fallback) using synthetic labels from z-score deviations."""
+    """Train action models (per lift-type + fallback) using data-driven synthetic labels.
+    
+    This function:
+    1. Loads sensor definitions from database to know which sensors apply to each lift type
+    2. Queries ALL sensor columns for each well based on its lift type
+    3. Computes metrics for ALL available sensors
+    4. Generates labels based on z-score deviations using ACTION_MAPPING
+    5. Trains separate models for each lift type + a fallback combined model
+    """
     if not SKLEARN_AVAILABLE or DecisionTreeClassifier is None:
         raise RuntimeError('scikit-learn not available')
 
+    # Resolve model path
+    resolved_path = _get_model_path(model_path)
+    model_path = resolved_path
+
     cur = snowflake_conn.cursor()
     try:
+        # Load sensor definitions from database
+        sensor_config = load_sensor_config_from_db(snowflake_conn)
+        logger.info(f"Loaded sensor config for lift types: {list(sensor_config.keys())}")
+        
+        # Get all wells with their lift types
         cur.execute("""
             SELECT DISTINCT wsr.well_id, COALESCE(wsr.lift_type, 'Unknown') as lift_type
             FROM well_sensor_readings wsr
@@ -174,41 +223,43 @@ def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decisi
         all_metrics = []
         for well, lift_type in well_lift_pairs:
             try:
-                cur.execute("SELECT timestamp, surface_pressure, tubing_pressure, casing_pressure, motor_temp, wellhead_temp, motor_current FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 720", (well,))
+                # Query ALL sensor columns for this well (data-driven approach)
+                cur.execute("SELECT * FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 720", (well,))
                 rows = cur.fetchall()
                 if not rows:
                     continue
                 cols = [str(d[0]).lower() for d in cur.description]
                 df = pd.DataFrame(rows, columns=cols)
+                
+                # Find timestamp column
                 ts_col = next((c for c in df.columns if 'timestamp' in c or c == 'time' or c.endswith('_ts')), df.columns[0])
                 df['timestamp'] = pd.to_datetime(df[ts_col])
                 df = df.set_index('timestamp')
-                ta = TrendAnalyzer(df)
-                metrics = ta.compute_metrics()
+                
+                # Create TrendAnalyzer with lift type for context-aware metrics
+                ta = TrendAnalyzer(df, lift_type=lift_type)
+                metrics = ta.compute_metrics(include_all_sensors=True)
 
-                cur.execute("SELECT date, oil_volume, gas_volume FROM well_daily_production WHERE well_id = %s ORDER BY date DESC LIMIT 60", (well,))
+                # Add production metrics
+                cur.execute("SELECT date, oil_volume, gas_volume, water_volume FROM well_daily_production WHERE well_id = %s ORDER BY date DESC LIMIT 60", (well,))
                 prod_rows = cur.fetchall()
                 if prod_rows:
                     prod_cols = [str(d[0]).lower() for d in cur.description]
                     prod_df = pd.DataFrame(prod_rows, columns=prod_cols)
                     prod_df['date'] = pd.to_datetime(prod_df['date'])
                     prod_df = prod_df.set_index('date')
-                    try:
-                        if 'oil_volume' in prod_df.columns and len(prod_df) >= 3:
-                            yv = prod_df['oil_volume'].dropna().values[::-1]
-                            metrics['oil_volume_slope'] = float(np.polyfit(np.arange(len(yv)), yv, 1)[0])
-                            metrics['oil_volume_roll_mean'] = float(prod_df['oil_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                    except Exception:
-                        metrics['oil_volume_slope'] = None
-                        metrics['oil_volume_roll_mean'] = None
-                    try:
-                        if 'gas_volume' in prod_df.columns and len(prod_df) >= 3:
-                            yv = prod_df['gas_volume'].dropna().values[::-1]
-                            metrics['gas_volume_slope'] = float(np.polyfit(np.arange(len(yv)), yv, 1)[0])
-                            metrics['gas_volume_roll_mean'] = float(prod_df['gas_volume'].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
-                    except Exception:
-                        metrics['gas_volume_slope'] = None
-                        metrics['gas_volume_roll_mean'] = None
+                    
+                    # Compute production metrics for all production fields
+                    for prod_field in ['oil_volume', 'gas_volume', 'water_volume']:
+                        try:
+                            if prod_field in prod_df.columns and len(prod_df) >= 3:
+                                yv = prod_df[prod_field].dropna().values[::-1]
+                                if len(yv) >= 3:
+                                    metrics[f'{prod_field}_slope'] = float(np.polyfit(np.arange(len(yv)), yv, 1)[0])
+                                    metrics[f'{prod_field}_roll_mean'] = float(prod_df[prod_field].rolling(window=min(7, len(prod_df))).mean().iloc[-1])
+                        except Exception:
+                            metrics[f'{prod_field}_slope'] = None
+                            metrics[f'{prod_field}_roll_mean'] = None
 
                 all_metrics.append((well, lift_type, metrics))
             except Exception as e:
@@ -219,43 +270,106 @@ def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decisi
 
         logger.info(f"Collected metrics for {len(all_metrics)} wells")
 
-        metric_keys = list(all_metrics[0][2].keys())
-        field_means = {k: np.mean([m.get(k) for _, _, m in all_metrics if m.get(k) is not None]) or 0.0 for k in metric_keys}
-        field_stds = {k: (np.std([m.get(k) for _, _, m in all_metrics if m.get(k) is not None]) or 1.0) for k in metric_keys}
+        # Compute field statistics across all wells for z-score normalization
+        metric_keys = set()
+        for _, _, m in all_metrics:
+            metric_keys.update(m.keys())
+        metric_keys = list(metric_keys)
+        
+        field_means = {}
+        field_stds = {}
+        for k in metric_keys:
+            values = [m.get(k) for _, _, m in all_metrics if m.get(k) is not None]
+            if values:
+                field_means[k] = float(np.mean(values))
+                field_stds[k] = float(np.std(values)) if len(values) > 1 else 1.0
+            else:
+                field_means[k] = 0.0
+                field_stds[k] = 1.0
 
+        # Determine consistent feature set for each lift type
+        # This ensures all samples of the same lift type have the same feature vector length
+        lift_type_feature_sets = {}
+        for well, lift_type, metrics in all_metrics:
+            lt_key = str(lift_type).strip() or 'Unknown'
+            if lt_key not in lift_type_feature_sets:
+                # Use lift-type specific features from the defined sensor list
+                lift_type_feature_sets[lt_key] = get_features_for_lift_type(lt_key if lt_key != 'Unknown' else 'ESP')
+        
+        # Generate labels based on data-driven z-score deviations
         samples_by_lift = {}
         for well, lift_type, metrics in all_metrics:
-            feats, _ = _features_from_metrics(metrics)
+            lt_key = str(lift_type).strip() or 'Unknown'
+            
+            # Use consistent feature set for this lift type
+            feat_names = lift_type_feature_sets[lt_key]
+            feats, _ = _features_from_metrics(metrics, feature_list=feat_names)
+            
+            # Generate label based on ALL sensors in ACTION_MAPPING
             candidates = []
-            for key, fmap in [('motor_current_roll_mean', 'motor_current'), ('motor_temp_slope', 'motor_temp'),
-                              ('surface_pressure_slope', 'surface_pressure'), ('oil_volume_slope', 'oil_volume'),
-                              ('gas_volume_slope', 'gas_volume')]:
-                val = metrics.get(key)
-                std, mean = field_stds.get(key, 1.0), field_means.get(key, 0.0)
-                if val is not None and std and abs(std) > 1e-6:
-                    z = (val - mean) / (std + 1e-6)
-                    if abs(z) > 1.2:
-                        amap = ACTION_MAPPING.get(fmap)
-                        if amap and isinstance(amap, dict):
-                            act = amap.get('class') or amap.get('category')
-                            cat = amap.get('category') or ACTION_CATEGORY_MAP.get(act, 'Production')
-                            candidates.append((act, cat, abs(z)))
+            for sensor_field, action_config in ACTION_MAPPING.items():
+                # Check both slope and roll_mean for this sensor
+                for suffix in ['_slope', '_roll_mean', '_latest']:
+                    metric_key = f'{sensor_field}{suffix}'
+                    val = metrics.get(metric_key)
+                    std = field_stds.get(metric_key, 1.0)
+                    mean = field_means.get(metric_key, 0.0)
+                    
+                    if val is not None and std and abs(std) > 1e-6:
+                        z = (val - mean) / (std + 1e-6)
+                        if abs(z) > 1.2:  # Significant deviation
+                            action_class = action_config.get('class', f'Investigate {sensor_field}')
+                            category = action_config.get('category', 'Optimization')
+                            # Higher z-score = more confident label
+                            candidates.append((action_class, category, abs(z), sensor_field))
 
+            # Select the action with highest z-score deviation
             if candidates:
                 candidates.sort(key=lambda x: x[2], reverse=True)
                 label = candidates[0][0]
             else:
                 label = 'NoAction'
 
-            lt_key = str(lift_type).strip() or 'Unknown'
-            samples_by_lift.setdefault(lt_key, []).append((feats, label))
+            samples_by_lift.setdefault(lt_key, []).append((feats, label, feat_names))
 
-        X_all = np.vstack([s[0] for samples in samples_by_lift.values() for s in samples])
-        y_all = np.array([s[1] for samples in samples_by_lift.values() for s in samples])
+        # For the combined model, we need consistent features across all lift types
+        # Use a common feature set (production + common sensors)
+        common_features = [
+            'oil_volume_slope', 'oil_volume_roll_mean',
+            'gas_volume_slope', 'gas_volume_roll_mean',
+            'water_volume_slope', 'water_volume_roll_mean',
+            'surface_pressure_slope', 'surface_pressure_roll_mean',
+            'tubing_pressure_slope', 'tubing_pressure_roll_mean',
+            'casing_pressure_slope', 'casing_pressure_roll_mean',
+            'wellhead_temp_slope', 'wellhead_temp_roll_mean',
+            'missing_rate'
+        ]
+        
+        # Re-extract features with common feature set for combined model
+        # Also track labels from lift-type specific samples
+        X_all_list = []
+        y_all_list = []
+        sample_idx = {lt: 0 for lt in samples_by_lift}
+        
+        for well, lift_type, metrics in all_metrics:
+            lt_key = str(lift_type).strip() or 'Unknown'
+            feats, _ = _features_from_metrics(metrics, feature_list=common_features)
+            X_all_list.append(feats)
+            
+            # Get label from the corresponding lift-type sample
+            if lt_key in samples_by_lift and sample_idx[lt_key] < len(samples_by_lift[lt_key]):
+                _, label, _ = samples_by_lift[lt_key][sample_idx[lt_key]]
+                sample_idx[lt_key] += 1
+            else:
+                label = 'NoAction'
+            y_all_list.append(label)
+        
+        X_all = np.vstack(X_all_list)
+        y_all = np.array(y_all_list)
         label_dist = {k: int((y_all == k).sum()) for k in np.unique(y_all)}
         logger.info(f"Label distribution: {label_dist}")
 
-        def _train_and_save(X, y, save_path, lift_label='combined'):
+        def _train_and_save(X, y, save_path, lift_label='combined', feature_names=None):
             if len(X) < 3:
                 logger.warning(f"Insufficient samples ({len(X)}) for {lift_label}")
                 return None
@@ -282,7 +396,13 @@ def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decisi
             logger.info(f"  {lift_label}: acc={te_acc:.3f}, prec={prec:.3f}, rec={rec:.3f}")
 
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump({'model': clf, 'features': CANONICAL_FEATURES}, save_path)
+            # Save model with the actual feature names used for training
+            joblib.dump({
+                'model': clf, 
+                'features': feature_names or CANONICAL_FEATURES,
+                'lift_type': lift_label,
+                'classes': list(np.unique(y))
+            }, save_path)
             return {'train_accuracy': tr_acc, 'test_accuracy': te_acc, 'precision': prec, 'recall': rec, 'trained_on': len(y)}
 
         results = {}
@@ -294,19 +414,22 @@ def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decisi
                 logger.info(f"Skipping lift_type '{lt_key}': {len(samples)} samples (min 5)")
                 continue
             X_lt = np.vstack([s[0] for s in samples])
+            # Get feature names from the first sample (they should all be the same for this lift type)
+            lt_feature_names = samples[0][2] if len(samples[0]) > 2 else None
             y_lt = np.array([s[1] for s in samples])
             lt_safe = lt_key.lower().replace(' ', '_').replace('-', '_')
             lt_path = str(models_dir / f"{base_name}_{lt_safe}.joblib")
-            logger.info(f"Training model for lift_type: {lt_key} ({len(samples)} samples)")
-            res = _train_and_save(X_lt, y_lt, lt_path, lt_key)
+            logger.info(f"Training model for lift_type: {lt_key} ({len(samples)} samples, {len(lt_feature_names) if lt_feature_names else 0} features)")
+            res = _train_and_save(X_lt, y_lt, lt_path, lt_key, feature_names=lt_feature_names)
             if res:
-                results[lt_key] = {**res, 'model_path': lt_path}
+                results[lt_key] = {**res, 'model_path': lt_path, 'features': lt_feature_names}
 
+        # For combined model, use common features that work across all lift types
         if len(X_all) >= 3:
-            logger.info(f"Training combined fallback model ({len(X_all)} samples)")
-            res = _train_and_save(X_all, y_all, model_path, 'combined')
+            logger.info(f"Training combined fallback model ({len(X_all)} samples, {len(common_features)} common features)")
+            res = _train_and_save(X_all, y_all, model_path, 'combined', feature_names=common_features)
             if res:
-                results['_fallback'] = {**res, 'model_path': model_path}
+                results['_fallback'] = {**res, 'model_path': model_path, 'features': common_features}
 
         fallback = results.get('_fallback') or (list(results.values())[0] if results else {})
         return {
@@ -325,6 +448,10 @@ def train_from_snowflake(snowflake_conn, lookback_days: int = 30, model_path: st
     """Train from Snowflake using rule violations as labels."""
     if not SKLEARN_AVAILABLE or DecisionTreeClassifier is None:
         raise RuntimeError('scikit-learn not available')
+
+    # Resolve model path
+    resolved_path = _get_model_path(model_path)
+    model_path = resolved_path
 
     re = RuleEngine(snowflake_conn)
     try:
@@ -415,6 +542,10 @@ def train_on_two_wells(snowflake_conn, well_ids: list, model_path: str = 'models
     if not SKLEARN_AVAILABLE or not well_ids or len(well_ids) < 2:
         raise ValueError('Provide at least two well ids and sklearn')
 
+    # Resolve model path
+    resolved_path = _get_model_path(model_path)
+    model_path = resolved_path
+
     re = RuleEngine(snowflake_conn)
     try:
         re.load_rules_from_db()
@@ -488,7 +619,11 @@ def train_on_two_wells(snowflake_conn, well_ids: list, model_path: str = 'models
 
 def _get_snowflake_conn(args=None):
     from dotenv import load_dotenv
-    load_dotenv(_PROJECT_ROOT / '.env')
+    env_path = _PROJECT_ROOT / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        load_dotenv()  # Try default locations
     try:
         import snowflake.connector
         kw = {

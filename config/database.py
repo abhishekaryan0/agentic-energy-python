@@ -264,6 +264,23 @@ def setup_snowflake():
                 LIFT_TYPE VARCHAR(50),
                 CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )""", "PRODUCTION_FORECASTING"),
+
+            (f"""CREATE TABLE IF NOT EXISTS {qual}.WELL_STATUS (
+                ID INT AUTOINCREMENT PRIMARY KEY,
+                WELL_ID VARCHAR(100) NOT NULL UNIQUE,
+                LIFT_TYPE VARCHAR(50),
+                STATUS VARCHAR(50) NOT NULL DEFAULT 'UNKNOWN',
+                LAST_READING_TIMESTAMP TIMESTAMP_NTZ,
+                LAST_READING_AGE_HOURS FLOAT,
+                STROKES_PER_MINUTE FLOAT,
+                MOTOR_CURRENT FLOAT,
+                INJECTION_RATE FLOAT,
+                ANOMALY_COUNT_24H INT DEFAULT 0,
+                CRITICAL_ANOMALY_COUNT_24H INT DEFAULT 0,
+                STATUS_REASON VARCHAR(500),
+                UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )""", "WELL_STATUS"),
         ]
 
         for sql, name in tables_sql:
