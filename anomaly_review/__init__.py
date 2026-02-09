@@ -96,11 +96,12 @@ from anomaly_review.checkers import (
     check_fluid_pound,
     check_pump_wear,
     check_gas_injection_inefficiency,
-    check_mechanical_failure,
+    check_energy_efficiency_drift,
     check_efficiency_degradation,
     check_pressure_instability,
-    check_ghost_production,
+    check_model_divergence,
     check_monthly_production_decline,
+    check_event_frequency,
     
     # ML checker
     check_ml_anomaly,
@@ -220,11 +221,12 @@ __all__ = [
     'check_fluid_pound',
     'check_pump_wear',
     'check_gas_injection_inefficiency',
-    'check_mechanical_failure',
+    'check_energy_efficiency_drift',
     'check_efficiency_degradation',
     'check_pressure_instability',
-    'check_ghost_production',
+    'check_model_divergence',
     'check_monthly_production_decline',
+    'check_event_frequency',
     'check_ml_anomaly',
     
     # ML models

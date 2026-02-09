@@ -32,25 +32,28 @@ from anomaly_review.config import (
     SUPPRESSION_RULES,
     ANOMALY_PRIORITY,
 )
+from anomaly_review.utils import safe_divide
 
 from anomaly_review.data import (
     fetch_well_data,
     fetch_all_active_wells,
     calculate_rolling_baseline,
     get_recent_anomaly_history,
+    fetch_sensor_metadata,
     get_snowflake_conn,
     get_db_url,
 )
 
 from anomaly_review.checkers import (
-    check_ghost_production,
-    check_mechanical_failure,
+    check_model_divergence,
+    check_energy_efficiency_drift,
     check_fluid_pound,
     check_gas_injection_inefficiency,
     check_pump_wear,
     check_efficiency_degradation,
     check_pressure_instability,
     check_monthly_production_decline,
+    check_event_frequency,
     check_ml_anomaly,
     determine_severity,
 )
@@ -83,14 +86,7 @@ def select_top_anomalies_per_well(anomalies: List[Dict]) -> List[Dict]:
     final_list = []
     
     for well_id, well_anomalies in grouped.items():
-        # 1. FATAL OVERRIDE: Ghost Production usually implies sensor failure or critical break.
-        # If this exists, it invalidates physics checks like Fluid Pound.
-        ghost = next((a for a in well_anomalies if a['anomaly_code'] == 'GHOST_PROD'), None)
-        if ghost:
-            final_list.append(ghost)
-            continue
-
-        # 2. Sort: Most recent date first, then by Priority (lower number is better)
+        # 1. Sort: Most recent date first, then by Priority (lower number is better)
         well_anomalies.sort(key=lambda x: (x['event_date'], -ANOMALY_PRIORITY.get(x['anomaly_code'], 99)), reverse=True)
 
         # 3. Apply Suppression Rules
@@ -114,58 +110,117 @@ def select_top_anomalies_per_well(anomalies: List[Dict]) -> List[Dict]:
                 
     return final_list
 
-def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS) -> List[Dict]:
-    logger.info(f"Starting anomaly detection for {well_id}...")
-    
-    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
-    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
-    if df is not None:
-        full_df = df
-    else:
-        full_df = fetch_well_data(well_id, days=180)
-    
-    if full_df.empty or len(full_df) < 30:
-        logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df)})")
-        return []
 
-    # Ensure lift_type exists (Forward fill to handle intermittent metadata)
+def _apply_alarm_gatekeeper(well_id: str, full_df: pd.DataFrame) -> None:
+    """
+    Filter out-of-range sensor values using metadata limits.
+    Mutates full_df in-place; behavior matches original inline logic.
+    """
+    try:
+        meta_df = fetch_sensor_metadata()
+        if not meta_df.empty:
+            # Iterate through defined sensors and apply limits
+            # meta_df columns: field_name, min_value, max_value
+            for _, row_meta in meta_df.iterrows():
+                col = row_meta['field_name']
+                min_val = row_meta['min_value']
+                max_val = row_meta['max_value']
+
+                if col in full_df.columns:
+                    # Identify out-of-range indices
+                    # We use mask to replace values where condition is True
+                    mask = (full_df[col] < min_val) | (full_df[col] > max_val)
+                    if mask.any():
+                        # Replace with NaN (effectively deleting the specific data point)
+                        full_df.loc[mask, col] = np.nan
+    except Exception as e:
+        logger.error(f"Alarm Gatekeeper failed for {well_id}: {e}")
+
+
+def _apply_flatline_detection(well_id: str, full_df: pd.DataFrame) -> None:
+    """
+    Detect flatlined sensors over the last 24h and mask them.
+    Mutates full_df in-place; behavior matches original inline logic.
+    """
+    # Detect sensors stuck at a single value (Variance = 0) over last 24 hours
+    try:
+        # Define sensors to check
+        flatline_sensors = ['tubing_pressure', 'casing_pressure', 'motor_current', 'pump_fillage', 'strokes_per_minute']
+
+        # Get data for last 24 hours
+        if not full_df.empty and 'timestamp' in full_df.columns:
+            last_ts = full_df['timestamp'].max()
+            start_ts = last_ts - pd.Timedelta(hours=24)
+
+            # Mask for recent data
+            recent_mask = full_df['timestamp'] >= start_ts
+            recent_data = full_df.loc[recent_mask]
+
+            if len(recent_data) > 2:  # Need at least a few points to compute std
+                for sensor in flatline_sensors:
+                    if sensor in recent_data.columns:
+                        std_dev = recent_data[sensor].std()
+
+                        # Check strictly for 0.0 (or extremely close)
+                        if pd.notna(std_dev) and std_dev == 0.0:
+                            logger.warning(f"Flatline detected for {sensor} on {well_id} (StdDev=0). Masking recent values.")
+                            # Mask values in the main dataframe for the recent period
+                            full_df.loc[recent_mask, sensor] = np.nan
+    except Exception as e:
+        logger.error(f"Flatline detection failed for {well_id}: {e}")
+
+
+def _prepare_lift_type(full_df: pd.DataFrame) -> str:
+    """
+    Ensure lift_type exists and is forward/backward filled.
+    Returns the current (latest) lift_type string.
+    """
     if 'lift_type' not in full_df.columns:
         full_df['lift_type'] = 'Unknown'
     full_df['lift_type'] = full_df['lift_type'].ffill().bfill().fillna('Unknown')
-    current_lift_type = full_df['lift_type'].iloc[-1]
+    return full_df['lift_type'].iloc[-1]
 
-    # 2. Pre-Processing & Rolling Baselines
-    full_df = calculate_rolling_baseline(full_df)
-    
+
+def _run_ml_models(well_id: str, full_df: pd.DataFrame) -> (pd.DataFrame, float):
+    """
+    Run model training / loading and all ML-based predictions.
+    Returns the mutated DataFrame and the autoencoder threshold.
+    Keeps behavior identical to the original inline block.
+    """
     # 3. Model Training (Predictive Efficiency)
     full_df['predicted_oil'] = np.nan
     full_df['efficiency'] = 100.0
-    
+
     model_art = get_or_train_model(well_id, full_df)
-    
+
+    autoencoder_threshold = 999.0
+
     if model_art:
         try:
             # 3a. Random Forest Baseline (Always run if available)
             if 'rf_model' in model_art.get('models', {}):
-                 features = model_art['features']
-                 predict_df = full_df[features].fillna(method='ffill').fillna(0)
-                 X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
-                 full_df['predicted_oil'] = model_art['models']['rf_model'].predict(X)
-            elif 'model' in model_art: # Legacy/Fallback support
-                 features = model_art['features']
-                 predict_df = full_df[features].fillna(method='ffill').fillna(0)
-                 X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
-                 full_df['predicted_oil'] = model_art['model'].predict(X)
+                features = model_art['features']
+                from anomaly_review.models import safe_prepare_data
+                # Only ffill; leave NaNs for the Imputer to handle (Mean Imputation)
+                predict_df = safe_prepare_data(full_df, features).fillna(method='ffill')
+                X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
+                full_df['predicted_oil'] = model_art['models']['rf_model'].predict(X)
+            elif 'model' in model_art:  # Legacy/Fallback support
+                features = model_art['features']
+                from anomaly_review.models import safe_prepare_data
+                predict_df = safe_prepare_data(full_df, features).fillna(method='ffill')
+                X = model_art['scaler'].transform(model_art['imputer'].transform(predict_df))
+                full_df['predicted_oil'] = model_art['model'].predict(X)
 
             # 3b. LSTM Forecasting (Override if available)
             if 'lstm_regressor' in model_art.get('models', {}):
                 try:
                     logger.info("Using LSTM Regressor for forecasting...")
                     lstm_preds = predict_with_lstm(
-                        model_art['models']['lstm_regressor'], 
-                        full_df, 
-                        model_art['features'], 
-                        model_art['scaler'], 
+                        model_art['models']['lstm_regressor'],
+                        full_df,
+                        model_art['features'],
+                        model_art['scaler'],
                         model_art['imputer']
                     )
                     # Merge predictions: Use LSTM where valid, fallback to RF/Null
@@ -176,27 +231,27 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             # 3c. Autoencoder Anomaly Detection
             full_df['reconstruction_error'] = 0.0
             autoencoder_threshold = 999.0
-            
+
             if 'autoencoder' in model_art.get('models', {}):
                 try:
                     ae_model = model_art['models']['autoencoder']
                     ae_results = detect_autoencoder_anomalies(
-                        ae_model, 
-                        full_df, 
-                        model_art['features'], 
-                        model_art['scaler'], 
+                        ae_model,
+                        full_df,
+                        model_art['features'],
+                        model_art['scaler'],
                         model_art['imputer'],
                         model_art.get('threshold', 0.5)
                     )
                     if not ae_results.empty:
-                         full_df['reconstruction_error'] = ae_results['reconstruction_error']
-                         autoencoder_threshold = model_art.get('threshold', 0.5)
+                        full_df['reconstruction_error'] = ae_results['reconstruction_error']
+                        autoencoder_threshold = model_art.get('threshold', 0.5)
                 except Exception as e:
                     logger.error(f"Autoencoder detection failed: {e}")
 
             # Recalculate Efficiency with BEST prediction
             safe_pred = full_df['predicted_oil'].replace(0, 0.001)
-            full_df['efficiency'] = (full_df['oil_volume'] / safe_pred) * 100
+            full_df['efficiency'] = safe_divide(full_df['oil_volume'], safe_pred) * 100
             full_df['efficiency'] = full_df['efficiency'].clip(0, 120)
 
             # Rolling avg recalculation
@@ -205,9 +260,36 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                 full_df['efficiency_avg_30d'] = temp_df['efficiency'].rolling('30D', min_periods=7).mean().values
             else:
                 full_df['efficiency_avg_30d'] = full_df['efficiency'].rolling(30, min_periods=7).mean()
-                
+
         except Exception as e:
             logger.error(f"ML Prediction failed for {well_id}: {e}")
+
+    return full_df, autoencoder_threshold
+
+
+def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS) -> List[Dict]:
+    logger.info(f"Starting anomaly detection for {well_id}...")
+    
+    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
+    if df is not None:
+        full_df = df
+    else:
+        full_df = fetch_well_data(well_id, days=180)
+    
+    if full_df.empty or len(full_df) < 30:
+        logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df)})")
+        return []
+
+    _apply_alarm_gatekeeper(well_id, full_df)
+    _apply_flatline_detection(well_id, full_df)
+
+    # Ensure lift_type exists (Forward fill to handle intermittent metadata)
+    current_lift_type = _prepare_lift_type(full_df)
+
+    # 2. Pre-Processing & Rolling Baselines
+    full_df = calculate_rolling_baseline(full_df)
+    
+    full_df, autoencoder_threshold = _run_ml_models(well_id, full_df)
 
     # 4. Run Checkers on the Detection Window
     # We fetch 180 days for context, but only scan the last `lookback_days` for new alerts.
@@ -215,14 +297,15 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     window_df = full_df[full_df['timestamp'] >= check_window_start].copy()
     
     all_checkers = [
-        check_ghost_production,
-        check_mechanical_failure, 
+        check_model_divergence,     # Replaces ghost_production
+        check_energy_efficiency_drift, # Replaces mechanical_failure
         check_fluid_pound,
         check_gas_injection_inefficiency,
         check_pump_wear,
         check_efficiency_degradation,
         check_pressure_instability,
-        check_monthly_production_decline # Runs on full DF inside
+        check_monthly_production_decline, # Runs on full DF
+        check_event_frequency # Runs on full DF
     ]
     
     raw_findings = []
@@ -238,13 +321,31 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         for check in all_checkers:
             res = None
             try:
-                if check.__name__ in ['check_operational_pattern_shift', 'check_monthly_production_decline']:
+                # Checkers that require full dataframe context
+                if check.__name__ in ['check_monthly_production_decline', 'check_event_frequency']:
+                    # Only run these once per window (e.g. on the last day) to avoid duplicates
                     if row['timestamp'] == window_df['timestamp'].max():
                         res = check(ctx, full_df)
                 else:
                     res = check(ctx)
             except Exception as e:
                 logger.error(f"Checker '{check.__name__}' failed: {e}")
+            
+            # ML Anomaly Check (Special case - requires reconstruction error)
+            if res is None and 'reconstruction_error' in ctx:
+                try:
+                    from anomaly_review.checkers import check_ml_anomaly
+                    rec_error = ctx.get('reconstruction_error', 0.0)
+                    logger.info(f"[ML_CHECK] Row {idx}: recon_error={rec_error:.4f}, threshold={autoencoder_threshold:.4f}")
+                    res = check_ml_anomaly(
+                        ctx, 
+                        rec_error, 
+                        autoencoder_threshold
+                    )
+                    if res:
+                        logger.info(f"[ML_CHECK] ANOMALY DETECTED at row {idx}")
+                except Exception as e:
+                    logger.error(f"ML Anomaly checker failed: {e}")
 
             if res:
                 # Calculate severity based on specific metric thresholds
@@ -264,7 +365,8 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "impact_payload": res['impact_payload'],
                     "lift_type": str(current_lift_type),
                     "diagnosis": res.get('diagnosis'),
-                    "severity_metrics": res.get('severity_metrics', {})
+                    "severity_metrics": res.get('severity_metrics', {}),
+                    "chart_payload": res.get('chart_payload', {})
                 })
 
         # --- SPECIAL CHECK: ML ANOMALY (Autoencoder) ---
@@ -285,7 +387,8 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "impact_payload": res_ml['impact_payload'],
                     "lift_type": str(current_lift_type),
                     "diagnosis": res_ml.get('diagnosis'),
-                    "severity_metrics": res_ml.get('severity_metrics', {})
+                    "severity_metrics": res_ml.get('severity_metrics', {}),
+                    "chart_payload": res_ml.get('chart_payload', {})
                 })
 
     # 5. Filter & Deduplicate (The Truth Hierarchy)
@@ -305,8 +408,14 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             history_str, 
             finding['detected_at'],
             diagnosis=finding.get('diagnosis'),
-            impact_metrics=finding['impact_payload']
+            impact_metrics=finding['impact_payload'],
+            anomaly_code=finding['anomaly_code']
         )
+        
+        # Check validation result (New Feature)
+        if not llm_content.get('is_valid_anomaly', True):
+             logger.info(f"LLM Validation Rejected: {finding['anomaly_code']} on {finding['event_date']} for {well_id}")
+             continue
         
         # Generate Chart Configuration
         chart_config = generate_chart_config(
@@ -314,7 +423,8 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             finding['chart_metric'], 
             full_df,
             anomaly_code=finding['anomaly_code'],
-            severity_metrics=finding.get('severity_metrics', {})
+            severity_metrics=finding.get('severity_metrics', {}),
+            chart_payload=finding.get('chart_payload', {})
         )
         
         enriched_results.append({

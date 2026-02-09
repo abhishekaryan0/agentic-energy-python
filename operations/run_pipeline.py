@@ -58,6 +58,7 @@ from dotenv import load_dotenv
 try:
     from snowflake.connector import connect as snowflake_connect
 except Exception:
+    # Keep import failure explicit so downstream connection code can surface a clear error
     snowflake_connect = None
 
 load_dotenv()
@@ -70,7 +71,15 @@ logger = logging.getLogger(__name__)
 
 
 def get_snowflake_connection():
-    """Create Snowflake connection."""
+    """
+    Create Snowflake connection.
+
+    Raises:
+        RuntimeError: if the Snowflake connector is unavailable.
+        ValueError: if required configuration values are missing.
+    """
+    if snowflake_connect is None:
+        raise RuntimeError("Snowflake connector is not installed or failed to import.")
     SNOWFLAKE_CONFIG = {
         'user': os.getenv('SNOWFLAKE_USER'),
         'password': os.getenv('SNOWFLAKE_PASSWORD'),

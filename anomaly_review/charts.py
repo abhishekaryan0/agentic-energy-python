@@ -29,7 +29,8 @@ def generate_chart_config(
     chart_metric: str,
     df: pd.DataFrame,
     anomaly_code: str = None,
-    severity_metrics: Dict = None
+    severity_metrics: Dict = None,
+    chart_payload: Dict = None
 ) -> Dict:
     """
     Generate Chart.js configuration for anomaly visualization.
@@ -40,36 +41,41 @@ def generate_chart_config(
         df: DataFrame with well data
         anomaly_code: Anomaly type code
         severity_metrics: Severity metrics for annotations
+        chart_payload: Structured data from checkers (replaces regex)
         
     Returns:
         Chart.js configuration dict
     """
     if df.empty:
         return create_fallback_chart(df, "No Data")
+    
+    if chart_payload is None:
+        chart_payload = {}
 
     try:
         df = df.copy()
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df['date_only'] = df['timestamp'].dt.date
         
+        # Prefer payload date, fallback to extract
         detection_date = extract_detection_date(anomaly_data)
         
         # Route to anomaly-specific chart generators
         if anomaly_code == "MECHANICAL_FAILURE":
-            return generate_mechanical_failure_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_mechanical_failure_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
 
         if chart_metric == "monthly_production":
-            return generate_monthly_decline_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_monthly_decline_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         elif chart_metric == "baseline_shift":
-            return generate_baseline_shift_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_baseline_shift_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         elif chart_metric == "efficiency_trend":
-            return generate_efficiency_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_efficiency_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         elif chart_metric == "tubing_pressure" or chart_metric == "pressure_trend":
-            return generate_pressure_instability_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_pressure_instability_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         elif chart_metric == "sensor_violations":
-            return generate_pattern_shift_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_pattern_shift_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         elif chart_metric == "production_bar":
-            return generate_ghost_production_chart(df, anomaly_data, detection_date, severity_metrics)
+            return generate_ghost_production_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
         else:
             return generate_default_enhanced_chart(df, anomaly_data, detection_date)
             
@@ -88,13 +94,14 @@ def extract_detection_date(anomaly_data: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60) -> Tuple[pd.DataFrame, List[str]]:
+def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Aggregate data to daily level for charting.
     
     Args:
         df: Input DataFrame
         days: Number of days to include
+        custom_agg: Optional dictionary to override default aggregation (e.g., {'pump_fillage': 'min'})
         
     Returns:
         Tuple of (aggregated DataFrame, labels list)
@@ -102,16 +109,21 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60) -> Tuple[pd.Data
     start_date = df['timestamp'].max() - pd.Timedelta(days=days)
     recent_df = df[df['timestamp'] >= start_date].copy()
     
-    agg_dict = {
-        'oil_volume': 'mean',
-        'water_volume': 'mean',
-        'gas_volume': 'mean'
-    }
-    
-    for col in ['tubing_pressure', 'motor_current', 'strokes_per_minute', 
-                'pump_fillage', 'injection_rate', 'casing_pressure', 'predicted_oil']:
+    agg_dict = {}
+    for col in ['oil_volume', 'water_volume', 'gas_volume']:
         if col in df.columns:
             agg_dict[col] = 'mean'
+    
+    for col in ['tubing_pressure', 'motor_current', 'strokes_per_minute', 
+                'pump_fillage', 'injection_rate', 'casing_pressure', 'predicted_oil', 'tp_std']:
+        if col in df.columns:
+            agg_dict[col] = 'mean'
+            
+    # Apply custom overrides
+    if custom_agg:
+        for col, method in custom_agg.items():
+            if col in df.columns:
+                agg_dict[col] = method
     
     daily_df = recent_df.groupby('date_only').agg(agg_dict).reset_index()
     daily_df.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in daily_df.columns]
@@ -119,6 +131,20 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60) -> Tuple[pd.Data
     for col in daily_df.columns:
         if col.endswith('_mean'):
             daily_df.rename(columns={col: col.replace('_mean', '')}, inplace=True)
+
+    # Smart renaming for min/max: Only rename to base if no other variant exists
+    for col in daily_df.columns:
+        if col.endswith('_min'):
+            base = col[:-4] # strip _min
+            # Only rename if base doesn't exist and no siblings (like _max) exist
+            siblings = [c for c in daily_df.columns if c.startswith(base) and c != col]
+            if base not in daily_df.columns and not any(c.startswith(base) for c in siblings):
+                daily_df.rename(columns={col: base}, inplace=True)
+        elif col.endswith('_max'):
+            base = col[:-4] # strip _max
+            siblings = [c for c in daily_df.columns if c.startswith(base) and c != col]
+            if base not in daily_df.columns and not any(c.startswith(base) for c in siblings):
+                daily_df.rename(columns={col: base}, inplace=True)
 
     labels = [d.strftime('%Y-%m-%d') for d in daily_df['date_only']]
     
@@ -239,20 +265,27 @@ def generate_mechanical_failure_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate chart showing divergence between energy input and production output."""
-    daily_df, labels = prepare_daily_aggregation(df, days=30)
+    # Use MAX for energy input (to show effort) and MEAN for production
+    custom_agg = {
+        'motor_current': 'max',
+        'tubing_pressure': 'max', 
+        'strokes_per_minute': 'max'
+    }
+    daily_df, labels = prepare_daily_aggregation(df, days=30, custom_agg=custom_agg)
     
     oil_data = daily_df['oil_volume'].fillna(0).round(1).tolist()
     
     if 'motor_current' in daily_df.columns:
         sensor_data = daily_df['motor_current'].fillna(0).round(1).tolist()
-        sensor_label = "Motor Current (Amps)"
+        sensor_label = "Peak Motor Current (Amps)"
         sensor_color = "#ef4444"
     else:
         sensor_data = daily_df.get('tubing_pressure', [0] * len(labels)).tolist()
-        sensor_label = "Tubing Pressure (PSI)"
+        sensor_label = "Peak Tubing Pressure (PSI)"
         sensor_color = "#f59e0b"
 
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
@@ -260,7 +293,7 @@ def generate_mechanical_failure_chart(
     options = get_common_options()
     options['plugins']['annotation'] = {'annotations': annotations}
     options['plugins']['title'] = {'display': True, 'text': 'Critical Failure Analysis: Input vs Output', 'font': {'size': 16, 'weight': 'bold'}}
-    options['plugins']['subtitle'] = {'display': True, 'text': 'High energy input with collapsed production indicates mechanical seizure.', 'font': {'size': 12}, 'color': '#ef4444'}
+    options['plugins']['subtitle'] = {'display': True, 'text': 'High energy input (Peak) with collapsed production indicates mechanical seizure.', 'font': {'size': 12}, 'color': '#ef4444'}
     
     options['scales']['y'] = {
         'type': 'linear', 'position': 'left',
@@ -290,10 +323,13 @@ def generate_efficiency_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate efficiency trend chart."""
-    daily_df, labels = prepare_daily_aggregation(df, days=45)
+    # Use MIN aggregation for pump fillage to show the drop clearly
+    custom_agg = {'pump_fillage': 'min'}
+    daily_df, labels = prepare_daily_aggregation(df, days=45, custom_agg=custom_agg)
     
     if 'efficiency' not in daily_df.columns and 'predicted_oil' in daily_df.columns and 'oil_volume' in daily_df.columns:
         daily_df['efficiency'] = (daily_df['oil_volume'] / daily_df['predicted_oil'].replace(0, 1)) * 100
@@ -303,24 +339,37 @@ def generate_efficiency_chart(
     predicted_oil = daily_df.get('predicted_oil', daily_df['oil_volume']).fillna(0).round(1).tolist()
     efficiency = daily_df.get('efficiency', [100] * len(labels)).fillna(100).round(1).tolist()
     
-    if 'FLUID POUND' in anomaly_data.upper() and 'pump_fillage' in daily_df.columns:
-        efficiency = daily_df['pump_fillage'].fillna(0).round(1).tolist()
+    if 'FLUID POUND' in anomaly_data.upper() or chart_payload.get('baseline_fillage') is not None:
+        if 'pump_fillage' in daily_df.columns:
+            efficiency = daily_df['pump_fillage'].fillna(0).round(1).tolist()
         title_text = 'Pump Fillage & Production Analysis'
         y_axis_text = 'Pump Fillage (%)'
     else:
         title_text = 'Pump Efficiency Degradation Analysis'
         y_axis_text = 'Efficiency (%)'
 
+    # Get baseline from payload OR regex fallback
     baseline_efficiency = 100
-    match = re.search(r"HISTORICAL EFFICIENCY.*?:.*?([\d\.]+)", anomaly_data)
-    if match:
-        try:
-            baseline_efficiency = float(match.group(1))
-        except:
-            pass
+    if chart_payload and chart_payload.get('baseline_fillage'):
+         baseline_efficiency = chart_payload['baseline_fillage']
+    elif chart_payload and chart_payload.get('baseline_intensity'):
+         # For intensity, we might chart intensity instead of efficiency?
+         # The current 'efficiency' variable holds efficiency/fillage.
+         # The check_energy_efficiency_drift sets chart_metric=efficiency_trend.
+         # So maybe we should plot intensity? 
+         # Stick to efficiency for now as 'Inverse of Intensity' roughly.
+         pass
+    else:
+        # Fallback regex
+        match = re.search(r"HISTORICAL EFFICIENCY.*?:.*?([\d\.]+)", anomaly_data)
+        if match:
+            try:
+                baseline_efficiency = float(match.group(1))
+            except:
+                pass
     
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
-    if baseline_efficiency > 0:
+    if baseline_efficiency > 0 and baseline_efficiency < 900: # Sanity check
         annotations.append(create_threshold_band(labels, baseline_efficiency, f'Normal ({baseline_efficiency:.0f}%)', '#10b981'))
     
     options = get_common_options()
@@ -348,19 +397,34 @@ def generate_baseline_shift_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate baseline shift chart."""
-    daily_df, labels = prepare_daily_aggregation(df, days=90)
+    # Get min/max range to show volatility of the decline
+    custom_agg = {
+        'oil_volume': ['mean', 'min', 'max']
+    }
+    daily_df, labels = prepare_daily_aggregation(df, days=90, custom_agg=custom_agg)
+    
     actual_data = daily_df['oil_volume'].round(1).fillna(0).tolist()
+    min_data = daily_df.get('oil_volume_min', actual_data).fillna(0).round(1).tolist()
+    max_data = daily_df.get('oil_volume_max', actual_data).fillna(0).round(1).tolist()
     
     baseline_val = None
-    match = re.search(r"90-DAY HISTORICAL AVG.*?:.*?([\d\.]+)", anomaly_data)
-    if match:
-        try:
-            baseline_val = float(match.group(1))
-        except:
-            pass
+    
+    # Use payload if available
+    # No checker currently explicitly sends 'baseline_oil' in 'chart_payload' for 'baseline_shift'
+    # But usually this metric is used by checkers that might do so later.
+    # Fallback to regex or quantile
+    if not baseline_val:
+        match = re.search(r"90-DAY HISTORICAL AVG.*?:.*?([\d\.]+)", anomaly_data)
+        if match:
+            try:
+                baseline_val = float(match.group(1))
+            except:
+                pass
+                
     if baseline_val is None or baseline_val == 0:
         baseline_val = daily_df['oil_volume'].quantile(0.75)
     
@@ -387,7 +451,27 @@ def generate_baseline_shift_chart(
         "data": {
             "labels": labels,
             "datasets": [
-                {"label": "Daily Production", "data": actual_data, "borderColor": "#3b82f6", "backgroundColor": "rgba(59, 130, 246, 0.1)", "borderWidth": 2, "fill": True},
+                # Min/Max Range (Shaded)
+                {
+                    "label": "Production Range (Max)", 
+                    "data": max_data, 
+                    "backgroundColor": "rgba(59, 130, 246, 0.1)",
+                    "borderColor": "rgba(59, 130, 246, 0.0)",
+                    "borderWidth": 0, 
+                    "fill": "+1",
+                    "pointRadius": 0
+                },
+                {
+                    "label": "Production Range (Min)", 
+                    "data": min_data, 
+                    "backgroundColor": "rgba(59, 130, 246, 0.0)",
+                    "borderColor": "rgba(59, 130, 246, 0.0)",
+                    "borderWidth": 0, 
+                    "fill": False,
+                    "pointRadius": 0
+                },
+                # Main Lines
+                {"label": "Daily Production", "data": actual_data, "borderColor": "#3b82f6", "backgroundColor": "rgba(59, 130, 246, 0.2)", "borderWidth": 2, "fill": False},
                 {"label": "7-Day Trend", "data": rolling_avg, "borderColor": "#0ea5e9", "borderWidth": 3, "pointRadius": 0},
                 {"label": "Historical Baseline", "data": baseline_line, "borderColor": "#10b981", "borderWidth": 2, "borderDash": [8, 4], "pointRadius": 0}
             ]
@@ -400,26 +484,43 @@ def generate_pressure_instability_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate pressure instability chart."""
-    daily_df, labels = prepare_daily_aggregation(df, days=45)
+    # Capture max volatility (std dev) for the day to show the worst-case swings
+    daily_df, labels = prepare_daily_aggregation(df, days=45, custom_agg={'tp_std': 'max'})
     
     if 'discharge_pressure' in daily_df.columns:
         pressure_avg = daily_df['discharge_pressure'].fillna(0).round(1).tolist()
         label_text = "Discharge Pressure"
+        # If we don't have explicit std for discharge, estimate it or use tubing std
+        pressure_std = daily_df.get('tp_std', [0]*len(labels)).fillna(0).tolist()
     else:
         pressure_avg = daily_df.get('tubing_pressure', [0] * len(labels)).fillna(0).round(1).tolist()
         label_text = "Tubing Pressure"
+        pressure_std = daily_df.get('tp_std', [0]*len(labels)).fillna(0).tolist()
+
+    # Create volatility bands (Avg +/- 2*STD) to show the "slug" range
+    upper_band = [(avg + 2*std) for avg, std in zip(pressure_avg, pressure_std)]
+    lower_band = [(avg - 2*std) for avg, std in zip(pressure_avg, pressure_std)]
+    
+    # Clip lower band to 0
+    lower_band = [max(0, val) for val in lower_band]
 
     oil_production = daily_df['oil_volume'].fillna(0).round(1).tolist()
     
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
     
+    # Use payload for subtitle accuracy
+    volatility_pct = severity_metrics.get('volatility_pct', 0)
+    if not volatility_pct and chart_payload:
+        volatility_pct = chart_payload.get('volatility_pct', 0)
+
     options = get_common_options()
     options['plugins']['annotation'] = {'annotations': annotations}
     options['plugins']['title'] = {'display': True, 'text': f'{label_text} Instability & Production Correlation', 'font': {'size': 16, 'weight': 'bold'}}
-    options['plugins']['subtitle'] = {'display': True, 'text': f"Volatility: {severity_metrics.get('volatility_pct', 0):.1f}%", 'font': {'size': 12}, 'color': '#ef4444'}
+    options['plugins']['subtitle'] = {'display': True, 'text': f"Volatility: {volatility_pct:.1f}% (Shaded area shows pressure swings)", 'font': {'size': 12}, 'color': '#ef4444'}
     
     options['scales']['y'] = {'type': 'linear', 'position': 'left', 'title': {'display': True, 'text': 'Pressure (PSI)'}, 'grid': {'color': 'rgba(200, 200, 200, 0.1)'}}
     options['scales']['y1'] = {'type': 'linear', 'position': 'right', 'title': {'display': True, 'text': 'Oil Production (bbl/day)'}, 'grid': {'drawOnChartArea': False}}
@@ -429,7 +530,29 @@ def generate_pressure_instability_chart(
         "data": {
             "labels": labels,
             "datasets": [
-                {"label": f"Avg {label_text}", "data": pressure_avg, "borderColor": "#ef4444", "borderWidth": 3, "yAxisID": "y"},
+                # Volatility Band (Filled Area)
+                {
+                    "label": "Volatility Range", 
+                    "data": upper_band, 
+                    "backgroundColor": "rgba(239, 68, 68, 0.15)",  # Light Red
+                    "borderColor": "rgba(239, 68, 68, 0.0)",      # Invisible border
+                    "borderWidth": 0, 
+                    "fill": "+1",                                 # Fill to next dataset (Lower Band)
+                    "pointRadius": 0,
+                    "yAxisID": "y"
+                },
+                {
+                    "label": "Lower Band", 
+                    "data": lower_band, 
+                    "backgroundColor": "rgba(239, 68, 68, 0.0)",  # Transparent
+                    "borderColor": "rgba(239, 68, 68, 0.0)",      # Invisible border
+                    "borderWidth": 0, 
+                    "fill": False, 
+                    "pointRadius": 0,
+                    "yAxisID": "y"
+                },
+                # Main Lines
+                {"label": f"Avg {label_text}", "data": pressure_avg, "borderColor": "#ef4444", "borderWidth": 2, "yAxisID": "y", "tension": 0.4},
                 {"label": "Oil Production", "data": oil_production, "borderColor": "#3b82f6", "backgroundColor": "rgba(59, 130, 246, 0.1)", "borderWidth": 2, "fill": True, "yAxisID": "y1"}
             ]
         },
@@ -441,7 +564,8 @@ def generate_monthly_decline_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate monthly production decline chart."""
     start_date = df['timestamp'].max() - pd.Timedelta(days=180)
@@ -464,18 +588,32 @@ def generate_monthly_decline_chart(
     rates = monthly_df['rate'].tolist()
     changes = monthly_df['change_pct'].fillna(0).round(1).tolist()
     
+    # Calculate linear trend line
+    if len(rates) >= 3:
+        x_vals = np.arange(len(rates))
+        coeffs = np.polyfit(x_vals, rates, 1)
+        trend_line = [coeffs[0] * x + coeffs[1] for x in x_vals]
+    else:
+        trend_line = rates
+    
     bar_colors = ['#ef4444' if c < -15 else '#f59e0b' if c < 0 else '#10b981' for c in changes]
     
+    # Use payload for exact decline if available
+    overall_decline = severity_metrics.get('decline_pct', 0)
+    if not overall_decline and chart_payload:
+        overall_decline = chart_payload.get('decline_pct', 0)
+
     options = get_common_options()
     options['plugins']['title'] = {'display': True, 'text': 'Monthly Production Decline Analysis', 'font': {'size': 16, 'weight': 'bold'}}
-    options['plugins']['subtitle'] = {'display': True, 'text': f"Overall Decline: {severity_metrics.get('decline_pct', 0):.1f}%", 'font': {'size': 12}, 'color': '#ef4444'}
+    options['plugins']['subtitle'] = {'display': True, 'text': f"Overall Decline: {overall_decline:.1f}% (Trend line shows rate)", 'font': {'size': 12}, 'color': '#ef4444'}
     
     return {
         "type": "bar",
         "data": {
             "labels": labels,
             "datasets": [
-                {"label": "Avg Daily Rate (bbl/d)", "data": rates, "backgroundColor": bar_colors, "borderRadius": 6, "borderWidth": 2, "borderColor": "#ffffff"}
+                {"label": "Avg Daily Rate (bbl/d)", "data": rates, "backgroundColor": bar_colors, "borderRadius": 6, "borderWidth": 2, "borderColor": "#ffffff"},
+                {"label": "Decline Trend", "data": trend_line, "type": "line", "borderColor": "#ef4444", "borderWidth": 3, "borderDash": [5, 5], "pointRadius": 0, "fill": False}
             ]
         },
         "options": options
@@ -486,18 +624,24 @@ def generate_pattern_shift_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate pattern shift chart."""
-    daily_df, labels = prepare_daily_aggregation(df, days=90)
+    # Use MAX to catch the spikes that triggered the pattern shift
+    custom_agg = {
+        'motor_current': 'max',
+        'tubing_pressure': 'max'
+    }
+    daily_df, labels = prepare_daily_aggregation(df, days=90, custom_agg=custom_agg)
     
     sensor_col = 'motor_current'
-    sensor_label = 'Motor Current (Amps)'
+    sensor_label = 'Peak Motor Current (Amps)'
     violation_label = 'Current Anomalies'
     
     if 'tubing' in anomaly_data.lower() or 'pressure' in anomaly_data.lower():
         sensor_col = 'tubing_pressure'
-        sensor_label = 'Tubing Pressure (PSI)'
+        sensor_label = 'Peak Tubing Pressure (PSI)'
         violation_label = 'Pressure Spikes'
     
     sensor_data = daily_df.get(sensor_col, [0] * len(labels)).fillna(0).round(1).tolist()
@@ -505,10 +649,14 @@ def generate_pattern_shift_chart(
     
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
     
+    freq_increase = severity_metrics.get('frequency_increase_pct', 0)
+    if not freq_increase and chart_payload:
+        freq_increase = chart_payload.get('increase_pct', 0)
+
     options = get_common_options()
     options['plugins']['annotation'] = {'annotations': annotations}
     options['plugins']['title'] = {'display': True, 'text': f'Operational Pattern Shift - {violation_label}', 'font': {'size': 16, 'weight': 'bold'}}
-    options['plugins']['subtitle'] = {'display': True, 'text': f"Violation Frequency Increase: {severity_metrics.get('frequency_increase_pct', 0):.0f}%", 'font': {'size': 12}, 'color': '#ef4444'}
+    options['plugins']['subtitle'] = {'display': True, 'text': f"Violation Frequency Increase: {freq_increase:.0f}% (Plotting Peak Values)", 'font': {'size': 12}, 'color': '#ef4444'}
     
     options['scales']['y'] = {'type': 'linear', 'position': 'left', 'title': {'display': True, 'text': sensor_label}, 'grid': {'color': 'rgba(200, 200, 200, 0.1)'}}
     options['scales']['y1'] = {'type': 'linear', 'position': 'right', 'title': {'display': True, 'text': 'Violation Rate (%)'}, 'min': 0, 'max': 100, 'grid': {'drawOnChartArea': False}}
@@ -530,10 +678,16 @@ def generate_ghost_production_chart(
     df: pd.DataFrame, 
     anomaly_data: str, 
     detection_date: str, 
-    severity_metrics: Dict
+    severity_metrics: Dict,
+    chart_payload: Dict = None
 ) -> Dict:
     """Generate ghost production chart."""
-    daily_df, labels = prepare_daily_aggregation(df, days=30)
+    # Use MAX for pump activity to see if it EVER ran
+    custom_agg = {
+        'motor_current': 'max',
+        'strokes_per_minute': 'max'
+    }
+    daily_df, labels = prepare_daily_aggregation(df, days=30, custom_agg=custom_agg)
     
     oil_data = daily_df['oil_volume'].fillna(0).round(1).tolist()
     water_data = daily_df.get('water_volume', [0] * len(labels)).fillna(0).round(1).tolist()
@@ -542,15 +696,19 @@ def generate_ghost_production_chart(
     motor_current = daily_df.get('motor_current', [0] * len(labels)).fillna(0).round(1).tolist()
     spm = daily_df.get('strokes_per_minute', [0] * len(labels)).fillna(0).round(1).tolist()
     
+    # Check if pump was running meaningfully (Max Amps > 5)
     pump_running = [1 if (mc > 5 or s > 0.1) else 0 for mc, s in zip(motor_current, spm)]
-    pump_running_scaled = [pr * max(oil_data + water_data + gas_data + [10]) * 0.1 for pr in pump_running]
+    
+    # Scale indicator to be visible on chart (10% of max volume)
+    max_vol = max(sum([oil_data, water_data, gas_data], []) + [10])
+    pump_running_scaled = [pr * max_vol * 0.15 for pr in pump_running]
     
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
     
     options = get_common_options()
     options['plugins']['annotation'] = {'annotations': annotations}
     options['plugins']['title'] = {'display': True, 'text': 'Ghost Production Analysis - Equipment vs Output', 'font': {'size': 16, 'weight': 'bold'}}
-    options['plugins']['subtitle'] = {'display': True, 'text': 'Pump running but zero production - potential SCADA/meter failure', 'font': {'size': 12}, 'color': '#ef4444'}
+    options['plugins']['subtitle'] = {'display': True, 'text': 'Pump running (Max Activity Detected) but zero production - potential SCADA/meter failure', 'font': {'size': 12}, 'color': '#ef4444'}
     
     options['scales']['y'] = {'stacked': True, 'title': {'display': True, 'text': 'Production Volume'}, 'grid': {'color': 'rgba(200, 200, 200, 0.1)'}}
     

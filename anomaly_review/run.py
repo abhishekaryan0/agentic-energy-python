@@ -108,6 +108,7 @@ def process_single_well(well_id: str) -> Dict:
 # RUN BATCH
 # =============================================================================
 
+def run_batch(config=None):
     """
     Run batch anomaly detection on all active wells.
     

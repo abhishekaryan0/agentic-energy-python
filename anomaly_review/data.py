@@ -192,6 +192,46 @@ def get_recent_anomaly_history(
         return "History check unavailable."
 
 
+# Global cache for sensor metadata
+_SENSOR_METADATA_CACHE = None
+
+def fetch_sensor_metadata() -> pd.DataFrame:
+    """
+    Fetch sensor definitions (Min/Max limits) from SENSOR_DEFINITIONS table.
+    Caches result to avoid repeated DB hits.
+    
+    Returns:
+        DataFrame with columns [FIELD_NAME, MIN_VALUE, MAX_VALUE]
+    """
+    global _SENSOR_METADATA_CACHE
+    
+    if _SENSOR_METADATA_CACHE is not None:
+        return _SENSOR_METADATA_CACHE
+
+    query = """
+    SELECT FIELD_NAME, MIN_VALUE, MAX_VALUE 
+    FROM SENSOR_DEFINITIONS 
+    WHERE MIN_VALUE IS NOT NULL AND MAX_VALUE IS NOT NULL
+    """
+    
+    try:
+        with get_snowflake_conn() as conn:
+            df = pd.read_sql(query, conn)
+            
+        # Normalize to lowercase to match well data columns
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+            # field_name also needs to be lowercased for matching
+            df['field_name'] = df['field_name'].str.lower()
+            
+        _SENSOR_METADATA_CACHE = df
+        return df
+    except Exception as e:
+        logger.error(f"Failed to fetch sensor metadata: {e}")
+        # Return empty DF so flow doesn't break, just won't filter
+        return pd.DataFrame(columns=['field_name', 'min_value', 'max_value'])
+
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================

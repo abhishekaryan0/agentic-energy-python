@@ -116,6 +116,28 @@ ANOMALY_PRIORITY: Dict[str, int] = {
 }
 
 # =============================================================================
+# FEATURE CONFIGURATION
+# =============================================================================
+
+LIFT_TYPE_FEATURES: Dict[str, List[str]] = {
+    "Rod Pump": [
+        "strokes_per_minute", "pump_fillage", "motor_current", 
+        "tubing_pressure", "casing_pressure", "torque",
+        "polish_rod_load", "surface_stroke_length", "pump_intake_pressure",
+        "wellhead_temp"
+    ],
+    "ESP": [
+        "drive_frequency", "motor_current", "motor_temp", "motor_voltage",
+        "pump_intake_pressure", "discharge_pressure", "vibration_x", "vibration_y",
+        "intake_fluid_temp", "wellhead_temp", "surface_pressure"
+    ],
+    "Gas Lift": [
+        "injection_rate", "tubing_pressure", "casing_pressure",
+        "injection_pressure", "surface_pressure", "bottomhole_pressure"
+    ]
+}
+
+# =============================================================================
 # BATCH PROCESSING CONFIGURATION
 # =============================================================================
 
