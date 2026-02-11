@@ -118,7 +118,7 @@ def fetch_well_data(well_id: str, days: int = None) -> pd.DataFrame:
         ]
         for c in operational_cols:
             if c in df.columns:
-                df[c] = df[c].ffill().fillna(0)
+                df[c] = df[c].ffill()
         
         # Production data defaults to 0 if missing
         for prod_col in ['oil_volume', 'water_volume', 'gas_volume']:
@@ -192,6 +192,46 @@ def get_recent_anomaly_history(
         return "History check unavailable."
 
 
+# Global cache for sensor metadata
+_SENSOR_METADATA_CACHE = None
+
+def fetch_sensor_metadata() -> pd.DataFrame:
+    """
+    Fetch sensor definitions (Min/Max limits) from SENSOR_DEFINITIONS table.
+    Caches result to avoid repeated DB hits.
+    
+    Returns:
+        DataFrame with columns [FIELD_NAME, MIN_VALUE, MAX_VALUE]
+    """
+    global _SENSOR_METADATA_CACHE
+    
+    if _SENSOR_METADATA_CACHE is not None:
+        return _SENSOR_METADATA_CACHE
+
+    query = """
+    SELECT FIELD_NAME, MIN_VALUE, MAX_VALUE 
+    FROM SENSOR_DEFINITIONS 
+    WHERE MIN_VALUE IS NOT NULL AND MAX_VALUE IS NOT NULL
+    """
+    
+    try:
+        with get_snowflake_conn() as conn:
+            df = pd.read_sql(query, conn)
+            
+        # Normalize to lowercase to match well data columns
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+            # field_name also needs to be lowercased for matching
+            df['field_name'] = df['field_name'].str.lower()
+            
+        _SENSOR_METADATA_CACHE = df
+        return df
+    except Exception as e:
+        logger.error(f"Failed to fetch sensor metadata: {e}")
+        # Return empty DF so flow doesn't break, just won't filter
+        return pd.DataFrame(columns=['field_name', 'min_value', 'max_value'])
+
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================
@@ -230,6 +270,7 @@ def calculate_rolling_baseline(df: pd.DataFrame) -> pd.DataFrame:
     # Physics baselines
     if 'pump_fillage' in df.columns:
         df['fillage_avg_24h'] = df['pump_fillage'].rolling('24h', min_periods=1).mean()
+        df['fillage_avg_3d'] = df['pump_fillage'].rolling('3D', min_periods=3).mean()
     
     if 'injection_rate' in df.columns:
         df['injection_avg_7d'] = df['injection_rate'].rolling('7D', min_periods=MIN_PERIODS).mean()
@@ -238,8 +279,20 @@ def calculate_rolling_baseline(df: pd.DataFrame) -> pd.DataFrame:
         df['tp_avg'] = df['tubing_pressure'].rolling('30D', min_periods=MIN_PERIODS).mean()
         df['tp_std'] = df['tubing_pressure'].rolling('3D', min_periods=3).std()
 
+    if 'discharge_pressure' in df.columns:
+        df['dp_avg'] = df['discharge_pressure'].rolling('30D', min_periods=MIN_PERIODS).mean()
+
     if 'motor_current' in df.columns:
         df['amps_avg'] = df['motor_current'].rolling('30D', min_periods=MIN_PERIODS).mean()
+
+    # Lagged baselines for ENERGY_DIV: at time t use baseline as of t-1 day so the
+    # current (possibly anomalous) day does not dilute the baseline.
+    if 'oil_volume' in df.columns:
+        roll_oil = df['oil_volume'].rolling('90D', min_periods=MIN_PERIODS).mean()
+        df['oil_baseline_90d_1d_ago'] = roll_oil.reindex(roll_oil.index - pd.Timedelta(days=1)).set_axis(roll_oil.index)
+    if 'motor_current' in df.columns:
+        roll_amps = df['motor_current'].rolling('30D', min_periods=MIN_PERIODS).mean()
+        df['amps_avg_1d_ago'] = roll_amps.reindex(roll_amps.index - pd.Timedelta(days=1)).set_axis(roll_amps.index)
     
     if 'strokes_per_minute' in df.columns:
         df['spm_avg'] = df['strokes_per_minute'].rolling('30D', min_periods=MIN_PERIODS).mean()

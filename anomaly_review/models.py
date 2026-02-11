@@ -22,7 +22,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS
+from anomaly_review.utils import safe_divide
+from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES
 
 logger = logging.getLogger('AnomalyReviewModels')
 
@@ -138,6 +139,87 @@ def prepare_sequences(
 
 
 # =============================================================================
+# FEATURE ENGINEERING & SELECTION
+# =============================================================================
+
+def engineer_physics_features(df: pd.DataFrame, lift_type: str = "Unknown") -> pd.DataFrame:
+    """
+    Enrich DataFrame with physics-based engineered features.
+    
+    Uses safe_divide to avoid crashes.
+    """
+    df = df.copy()
+    
+    # 1. Energy Intensity (Amps per Barrel)
+    # Only if we have liquid production
+    total_liquid = df['oil_volume'] + df['water_volume']
+    df['energy_intensity'] = safe_divide(df['motor_current'], total_liquid)
+    
+    # 2. Water Cut (Water / Total Liquid)
+    df['water_cut'] = safe_divide(df['water_volume'], total_liquid)
+    
+    # 3. Gas-Oil Ratio
+    df['gas_oil_ratio'] = safe_divide(df['gas_volume'], df['oil_volume'])
+    
+    # 4. Pressure Differential (Casing - Tubing)
+    if 'casing_pressure' in df.columns and 'tubing_pressure' in df.columns:
+        df['pressure_diff'] = df['casing_pressure'] - df['tubing_pressure']
+        
+    return df
+
+
+def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], target_col: str = 'oil_volume', top_n: int = 10) -> List[str]:
+    """
+    Select top features using Random Forest importance.
+    """
+    if df.empty or len(df) < 50:
+        return candidate_features[:top_n]
+        
+    try:
+        # Prepare data
+        valid_feats = [f for f in candidate_features if f in df.columns]
+        if not valid_feats:
+            return []
+            
+        X = df[valid_feats].fillna(0)
+        y = df[target_col].fillna(0)
+        
+        # Train lightweight RF
+        rf = RandomForestRegressor(n_estimators=50, max_depth=5, n_jobs=-1, random_state=42)
+        rf.fit(X, y)
+        
+        # Get importance
+        importances = pd.Series(rf.feature_importances_, index=valid_feats)
+        top_features = importances.nlargest(top_n).index.tolist()
+        
+        logger.info(f"Auto-Selected Top {top_n} Features: {top_features}")
+        return top_features
+        
+    except Exception as e:
+        logger.warning(f"Feature selection failed, using defaults: {e}")
+        return candidate_features[:top_n]
+
+
+def safe_prepare_data(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+    """
+    Prepare DataFrame for prediction by ensuring all required features exist.
+    
+    If features are missing (e.g., failed sensor), they are created with 0 values
+    to prevent model crash.
+    """
+    df_safe = df.copy()
+    missing = [f for f in features if f not in df_safe.columns]
+    
+    if missing:
+        logger.warning(f"Missing features for prediction: {missing}. Imputing with Mean (via NaNs).")
+        for f in missing:
+            df_safe[f] = np.nan
+            
+    # Return features in exact order expected by model/scaler
+    return df_safe[features]
+
+
+# =============================================================================
 # MODEL TRAINING
 # =============================================================================
 
@@ -228,12 +310,20 @@ def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[D
             loss.backward()
             optimizer.step()
     
-    # Calculate threshold (Mean + 3 Sigma on training data)
+    # Calculate threshold (Mean + 2 Sigma on training data for better sensitivity)
     model.eval()
     with torch.no_grad():
         reconstructions = model(X_tensor)
         train_loss = torch.mean((X_tensor - reconstructions) ** 2, dim=[1, 2])
-        threshold = torch.mean(train_loss) + 3 * torch.std(train_loss)
+        threshold = torch.mean(train_loss) + 2 * torch.std(train_loss)
+        
+        # Safety: If threshold is NaN (e.g., from constant input), use default
+        if torch.isnan(threshold) or threshold == 0:
+            threshold = 0.5
+            logger.warning(f"Autoencoder threshold was NaN/Zero. Defaulting to {threshold}")
+        else:
+            # Ensure minimum threshold to avoid noise sensititivity
+            threshold = max(float(threshold), 0.05)
     
     return {
         'model': model,
@@ -255,6 +345,11 @@ def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
     Returns:
         Dict with models, scaler, imputer, and features
     """
+    # Crash Prevention: Sparse data
+    if len(df) < 60:
+        logger.info(f"Skipping model training for {well_id}: insufficient data ({len(df)} rows)")
+        return {}
+
     # Try loading cached model first
     cached_art = load_models_from_disk(well_id)
     if cached_art:
@@ -262,79 +357,93 @@ def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
 
     logger.info(f"Training new models for {well_id}...")
     
-    # Dynamic feature selection
-    exclude_cols = [
-        'id', 'well_id', 'timestamp', 'created_at', 'event_ts',
-        'oil_volume', 'water_volume', 'gas_volume', 'lift_type',
-        'well_status', 'predicted_oil', 'efficiency',
-        'reconstruction_error', 'is_ml_anomaly'
-    ]
-    
-    candidates = [c for c in df.columns if c not in exclude_cols]
-    numeric_candidates = df[candidates].select_dtypes(include=[np.number]).columns.tolist()
-    
-    # Filter for data validity
-    available = []
-    for f in numeric_candidates:
-        if df[f].notna().sum() > 30 and df[f].std() > 0:
-            available.append(f)
+    # Determine lift type for feature selection
+    latest_lift_type = df['lift_type'].mode()[0] if 'lift_type' in df.columns and not df['lift_type'].empty else "Rod Pump"
 
-    logger.info(f"Dynamic Feature Selection found {len(available)} features for {well_id}: {available}")
+    # 1. Physics Feature Engineering
+    df = engineer_physics_features(df, lift_type=latest_lift_type)
     
-    if len(df) < 30 or len(available) < 2:
-        return {}
-    if 'oil_volume' not in df.columns:
-        return {}
+    # 2. Candidate Selection based on Lift Type
+    base_features = LIFT_TYPE_FEATURES.get(latest_lift_type, LIFT_TYPE_FEATURES.get("Rod Pump")) # Default to Rod Pump if unknown
     
-    # Data preprocessing
-    imputer = SimpleImputer(strategy='median')
+    # Add engineered features to candidates if they exist
+    engineered = ['energy_intensity', 'water_cut', 'gas_oil_ratio', 'pressure_diff']
+    base_features += [f for f in engineered if f in df.columns]
+
+    # Filter for columns that actually exist in DF
+    candidate_features = [c for c in base_features if c in df.columns]
+    
+    # 3. Automated Feature Selection (The "Smart" Filter)
+    # Refine the list to the top 10 most predictive features
+    selected_features = select_top_features_rf(df, candidate_features, target_col='oil_volume', top_n=10)
+    
+    if not selected_features:
+        logger.warning(f"No valid features found for {well_id}. Using basic fallback.")
+        selected_features = ['motor_current', 'tubing_pressure'] # Minimal fallback
+        
+    logger.info(f"Training model for {well_id} ({latest_lift_type}) using {len(selected_features)} features.")
+    
+    # Prepare training data with SELECTED features
+    # Ensure 'oil_volume' is available for target, even if not a feature
+    required_cols = list(set(selected_features + ['oil_volume']))
+    train_df = df[required_cols].copy()
+    
+    # Handle missing values for training
+    train_df = train_df.ffill().bfill().fillna(0)  # Fill NaNs before scaling
+
+    # Filter for valid training data (e.g., positive oil volume)
+    train_df_filtered = train_df[train_df['oil_volume'] > 0.1].copy()
+    
+    if len(train_df_filtered) < 30:
+        logger.warning(f"Insufficient valid training data for {well_id} after filtering. ({len(train_df_filtered)} rows)")
+        return {}
+
     scaler = StandardScaler()
+    imputer = SimpleImputer(strategy='mean')
     
-    # Prepare training data
-    cutoff_date = df['timestamp'].max() - pd.Timedelta(days=7)
-    train_df = df[(df['oil_volume'] > 0.1) & (df['timestamp'] < cutoff_date)].copy()
-    if len(train_df) < 30:
-        train_df = df[df['oil_volume'] > 0.1].copy()
-    if len(train_df) < 30:
-        return {}
-
+    # Transform
+    X = scaler.fit_transform(imputer.fit_transform(train_df_filtered[selected_features]))
+    
+    models = {}
+    
+    # A. Random Forest Regressor (For Production Prediction)
     try:
-        train_data_scaled = scaler.fit_transform(imputer.fit_transform(train_df[available]))
-        train_df_scaled = pd.DataFrame(train_data_scaled, columns=available)
-        
-        models = {}
-        
-        # 1. Train Random Forest (baseline)
-        rf_model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        rf_model.fit(train_data_scaled, train_df['oil_volume'])
-        models['rf_model'] = rf_model
-        
-        # 2. Train LSTM Regressor
-        train_df_scaled['oil_volume'] = train_df['oil_volume'].values
-        lstm_reg = train_lstm_model(train_df_scaled, available, 'oil_volume')
-        if lstm_reg:
-            models['lstm_regressor'] = lstm_reg['model']
-        
-        # 3. Train LSTM Autoencoder
-        autoencoder = train_autoencoder_model(train_df_scaled, available)
-        if autoencoder:
-            models['autoencoder'] = autoencoder['model']
-            models['threshold'] = autoencoder['threshold']
-        
-        artifacts = {
-            'models': models,
-            'scaler': scaler,
-            'imputer': imputer,
-            'features': available
-        }
-        
-        save_models_to_disk(well_id, artifacts)
-        
-        return artifacts
-        
+        rf = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=42)
+        rf.fit(X, train_df_filtered['oil_volume'].values) 
+        models['rf_model'] = rf
     except Exception as e:
-        logger.error(f"Model training failed: {e}")
-        return {}
+        logger.error(f"RF training failed: {e}")
+
+    # B. LSTM Autoencoder (For Anomaly Detection)
+    try:
+        # Train Autoencoder on the same filtered/imputed data
+        # We re-use 'train_df_filtered' but need to pass the full original DF pattern for sequences
+        # ideally. However, train_autoencoder_model takes (df, features).
+        ae_artifact = train_autoencoder_model(df, selected_features)
+        
+        if ae_artifact:
+            models['autoencoder'] = ae_artifact['model']
+            models['threshold'] = ae_artifact['threshold']
+            logger.info(f"Autoencoder trained. Threshold: {ae_artifact['threshold']:.4f}")
+
+    except Exception as e:
+        logger.error(f"Autoencoder training failed: {e}")
+
+    # Save artifacts (threshold from autoencoder when available)
+    artifacts = {
+        'models': models,
+        'scaler': scaler,
+        'imputer': imputer,
+        'features': selected_features,
+        'threshold': models.get('threshold', 0.5),
+        'trained_date': datetime.now().isoformat()
+    }
+
+    save_models_to_disk(well_id, artifacts)
+
+    return artifacts
+        
+
 
 
 # =============================================================================
@@ -359,10 +468,10 @@ def save_models_to_disk(well_id: str, artifacts: Dict) -> None:
     try:
         model_dir = get_model_dir(well_id)
         
-        # Save metadata
+        # Save metadata (threshold is at top level in artifacts from get_or_train_model)
         metadata = {
             'features': artifacts['features'],
-            'threshold': artifacts['models'].get('threshold'),
+            'threshold': artifacts.get('threshold'),
             'timestamp': datetime.now().isoformat()
         }
         with open(os.path.join(model_dir, 'metadata.json'), 'w') as f:
@@ -451,7 +560,13 @@ def load_models_from_disk(well_id: str) -> Optional[Dict]:
                 models['autoencoder'] = ae
         
         logger.info(f"Loaded cached models for {well_id} from disk.")
-        return {'models': models, 'scaler': scaler, 'imputer': imputer, 'features': features}
+        return {
+            'models': models,
+            'scaler': scaler,
+            'imputer': imputer,
+            'features': features,
+            'threshold': metadata.get('threshold', 0.5),
+        }
         
     except Exception as e:
         logger.warning(f"Failed to load cached models for {well_id}: {e}")
@@ -490,7 +605,9 @@ def predict_with_lstm(
         return pd.Series(index=df.index, data=np.nan)
     
     try:
-        scaled_data = scaler.transform(imputer.transform(df[features]))
+        # Create missing columns if needed
+        safe_df = safe_prepare_data(df, features)
+        scaled_data = scaler.transform(imputer.transform(safe_df))
         
         predictions = pd.Series(index=df.index, data=np.nan, dtype=float)
         X_list = []
@@ -549,7 +666,9 @@ def detect_autoencoder_anomalies(
         return pd.DataFrame()
     
     try:
-        scaled_data = scaler.transform(imputer.transform(df[features]))
+        # Create missing columns if needed
+        safe_df = safe_prepare_data(df, features)
+        scaled_data = scaler.transform(imputer.transform(safe_df))
         X_list = []
         indices = []
         

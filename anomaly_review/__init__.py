@@ -96,11 +96,14 @@ from anomaly_review.checkers import (
     check_fluid_pound,
     check_pump_wear,
     check_gas_injection_inefficiency,
-    check_mechanical_failure,
+    check_energy_efficiency_drift,
     check_efficiency_degradation,
     check_pressure_instability,
-    check_ghost_production,
+    check_model_divergence,
     check_monthly_production_decline,
+    check_event_frequency,
+    check_energy_production_divergence,
+    check_sensor_state_mismatch,
     
     # ML checker
     check_ml_anomaly,
@@ -172,11 +175,11 @@ from anomaly_review.service import (
 # BATCH RUNNER
 # =============================================================================
 
-from anomaly_review.run import (
-    run_batch,
-    process_single_well,
-    get_all_active_wells,
-)
+# from anomaly_review.run import (
+#     run_batch,
+#     process_single_well,
+#     get_all_active_wells,
+# )
 
 # =============================================================================
 # PUBLIC API
@@ -220,12 +223,15 @@ __all__ = [
     'check_fluid_pound',
     'check_pump_wear',
     'check_gas_injection_inefficiency',
-    'check_mechanical_failure',
+    'check_energy_efficiency_drift',
     'check_efficiency_degradation',
     'check_pressure_instability',
-    'check_ghost_production',
+    'check_model_divergence',
     'check_monthly_production_decline',
+    'check_event_frequency',
     'check_ml_anomaly',
+    'check_energy_production_divergence',
+    'check_sensor_state_mismatch',
     
     # ML models
     'LSTMRegressor',
@@ -261,7 +267,7 @@ __all__ = [
     'save_reviews',
     
     # Batch runner
-    'run_batch',
-    'process_single_well',
-    'get_all_active_wells',
+    # 'run_batch',
+    # 'process_single_well',
+    # 'get_all_active_wells',
 ]

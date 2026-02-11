@@ -27,6 +27,39 @@ MODEL_CACHE_DAYS = 7
 MODEL_DIR = "models"
 
 # =============================================================================
+# DETECTION THRESHOLDS (What counts as "unusual")
+# =============================================================================
+# Narrow these so we only flag clear deviations from normal. If ranges are too
+# wide, everything falls "in range" and anomalies never trigger.
+
+# Model divergence: trigger when actual production is this far below predicted (%).
+MODEL_DIVERGENCE_MIN_PCT = 25.0
+
+# Energy/Production divergence: high amps + low oil vs baseline.
+# Trigger when amps > (AMPS_RATIO * baseline) AND oil < (OIL_MAX_RATIO * baseline).
+ENERGY_DIV_AMPS_RATIO = 1.35
+ENERGY_DIV_OIL_MAX_RATIO = 0.28
+
+# Fluid pound: trigger when fillage < (FILLAGE_BELOW_BASELINE * baseline) and < FILLAGE_ABSOLUTE_MAX.
+FLUID_POUND_FILLAGE_BELOW_BASELINE = 0.72
+FLUID_POUND_FILLAGE_ABSOLUTE_MAX = 82.0
+
+# Pressure instability: trigger when coefficient of variation (std/mean) > this %.
+PRESSURE_INSTABILITY_CV_MIN_PCT = 18.0
+
+# Monthly decline: trigger when recent vs previous decline exceeds this %.
+MONTHLY_DECLINE_MIN_PCT = 15.0
+
+# Pattern shift: trigger when recent event count > (PATTERN_SHIFT_MULTIPLIER * baseline).
+PATTERN_SHIFT_MULTIPLIER = 2.0
+PATTERN_SHIFT_MIN_EVENTS = 2
+
+# Sensor state mismatch: "active" if amps > this or SPM > 1; "zero flow" if total_vol < this.
+DATA_MISMATCH_AMPS_ACTIVE_MIN = 5.0
+DATA_MISMATCH_ZERO_VOL_MAX = 0.05
+DATA_MISMATCH_BASELINE_VOL_MIN = 0.5
+
+# =============================================================================
 # SENSOR METADATA
 # =============================================================================
 
@@ -116,6 +149,28 @@ ANOMALY_PRIORITY: Dict[str, int] = {
 }
 
 # =============================================================================
+# FEATURE CONFIGURATION
+# =============================================================================
+
+LIFT_TYPE_FEATURES: Dict[str, List[str]] = {
+    "Rod Pump": [
+        "strokes_per_minute", "pump_fillage", "motor_current", 
+        "tubing_pressure", "casing_pressure", "torque",
+        "polish_rod_load", "surface_stroke_length", "pump_intake_pressure",
+        "wellhead_temp"
+    ],
+    "ESP": [
+        "drive_frequency", "motor_current", "motor_temp", "motor_voltage",
+        "pump_intake_pressure", "discharge_pressure", "vibration_x", "vibration_y",
+        "intake_fluid_temp", "wellhead_temp", "surface_pressure"
+    ],
+    "Gas Lift": [
+        "injection_rate", "tubing_pressure", "casing_pressure",
+        "injection_pressure", "surface_pressure", "bottomhole_pressure"
+    ]
+}
+
+# =============================================================================
 # BATCH PROCESSING CONFIGURATION
 # =============================================================================
 
@@ -124,7 +179,7 @@ class BatchConfig:
     """Configuration for batch processing."""
     test_mode: bool = True
     test_well_limit: int = 1
-    test_well_id: str = "Well_001_RodPump"
+    test_well_id: str = "Well_AnomalyTest_RodPump"
     max_workers: int = 10
     
     def validate(self) -> None:
