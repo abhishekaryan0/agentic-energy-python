@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 import shlex
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -158,46 +158,54 @@ def generate_operation_suggestion_with_openai(well_id: str, action: str,
 
 {context}
 
-Provide a comprehensive analysis in the following JSON format:
+Provide a comprehensive analysis as a single JSON object matching the schema below.
+
+CRITICAL: alternative_models must be CONTENT ONLY—no section headers (no "CONSERVATIVE APPROACH:", "AGGRESSIVE OPTIMIZATION:", "HYBRID MODEL:"). No "RECOMMENDED:" prefix on recommended_model. Start each approach with bullets (•) only.
+
+Use the client example below only as a STYLE guide (incremental vs immediate, risk/return, expected uplift + timeframe). Do NOT copy it exactly—tailor all content, numbers, and specifics to the given well and action.
+
+conservative_approach: 3–4 bullets—incremental/safe change, risk, expected uplift % and timeframe (vary for this well).
+aggressive_optimization: 3–4 bullets—immediate/bold change, higher return + monitoring, expected uplift % and timeframe (vary for this well).
+hybrid_model: 3–4 bullets—phased + real-time/AI, expected uplift % and timeframe (vary for this well).
+recommended_model: One sentence picking the best option and why—specific to this well, not generic.
+
+Style reference only (do not repeat this text; generate fresh content for the well/action):
+conservative_approach: • Adjust ESP frequency incrementally (+2Hz per week)\\n• Lower risk, slower results\\n• Expected uplift: 8-12% over 4 weeks
+aggressive_optimization: • Immediate adjustment to 55Hz + additional parameters\\n• Higher potential return, increased monitoring required\\n• Expected uplift: 18-22% within 1 week
+hybrid_model: • Phased approach with real-time optimization\\n• AI-driven parameter adjustments based on live data\\n• Expected uplift: 15-20% over 2 weeks
+recommended_model: Hybrid model provides optimal risk-return balance.
+
+CITATIONS: Use ONLY AUTHENTIC, NON-FABRICATED data. Do NOT invent SPE paper numbers, fake report names (e.g. "Q2 2024 Well Performance Review"), or fake vendor manual titles. Only reference sources that are generic and truthful.
+- referenced_data: Array of 2–4 strings. Use ONLY generic, authentic sources such as: "Company internal analysis", "Historical well and sensor data", "Agentic Energy proprietary ML model", "Field data from analogous wells", "Real-time sensor and production data". Do NOT make up specific paper numbers, report titles, or vendor document names.
+- supporting_analysis: One paragraph of technical analysis specific to this well. Reference only the generic sources above (e.g. "Internal analysis indicates...", "Historical data shows..."). Do NOT cite specific SPE papers, report names, or vendor manuals. Vary the analysis content per well.
+- data_quality: One line with confidence and basis, using only real or generic wording (e.g. "High confidence based on historical data and real-time sensor readings" or "Medium confidence based on available well data"). Do not invent specific percentages or document names.
+
+Authentic citations example (structure only—vary wording per well):
+referenced_data: ["Company internal analysis", "Historical well and sensor data", "Agentic Energy proprietary ML model"]
+supporting_analysis: "Internal analysis indicates this intervention aligns with observed well behavior. Historical data from analogous wells supports the expected impact. The recommendation is consistent with current operating conditions and sensor readings."
+data_quality: "High confidence based on historical data and real-time sensor readings."
+
+Schema (JSON):
 {{
-    "production_impact": {{
-        "increase_bbl_day": <number>,
-        "increase_percent": <number>,
-        "confidence_percent": <number>
-    }},
-    "financial_impact": {{
-        "daily_expense_benefit_usd": <number>,
-        "implementation_cost_usd": <number>,
-        "net_daily_benefit_usd": <number>,
-        "asset_value_increase_usd": <number>
-    }},
-    "operational_details": {{
-        "time_reduced_hours": <number>,
-        "current_performance": "<description>",
-        "optimal_performance": "<description>",
-        "detailed_analysis": "<detailed technical analysis>"
-    }},
+    "production_impact": {{ "increase_bbl_day": <number>, "increase_percent": <number>, "confidence_percent": <number> }},
+    "financial_impact": {{ "daily_expense_benefit_usd": <number>, "implementation_cost_usd": <number>, "net_daily_benefit_usd": <number>, "asset_value_increase_usd": <number> }},
+    "operational_details": {{ "time_reduced_hours": <number>, "current_performance": "<description>", "optimal_performance": "<description>", "detailed_analysis": "<text>" }},
     "alternative_models": {{
-        "conservative_approach": "{{approach description, expected uplift}}",
-        "aggressive_optimization": "{{approach description, expected uplift}}",
-        "hybrid_model": "{{approach description, expected uplift}}",
-        "recommended_model": "hybrid_model|conservative_approach|aggressive_optimization"
+        "conservative_approach": "<bullets only>",
+        "aggressive_optimization": "<bullets only>",
+        "hybrid_model": "<bullets only>",
+        "recommended_model": "<one sentence only>"
     }},
     "citations": {{
-        "referenced_data": [
-            "SPE Paper reference",
-            "Company Internal Report",
-            "Vendor Technical Manual",
-            "Proprietary ML Model"
-        ],
-        "supporting_analysis": "<detailed supporting analysis with references>",
-        "data_quality": "<High/Medium/Low confidence description>"
-    }}
-    ,
+        "referenced_data": ["<string>", "<string>", ...],
+        "supporting_analysis": "<paragraph specific to this well>",
+        "data_quality": "<e.g. High confidence (X%) based on Y days...>"
+    }},
     "category": "Production|Optimization|Maintenance"
 }}
 
-Ensure all fields are present and the output is valid JSON."""
+Return valid JSON only. Preserve newlines and bullet characters (•). Output content only—no headers. Citations must be authentic only—no fabricated SPE papers, report names, or vendor manual titles.
+"""
 
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -527,6 +535,32 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         alt_models = suggestion.get('alternative_models', {})
         citations = suggestion.get('citations', {})
 
+        def _strip_alternative_headers(text):
+            """Remove section titles and RECOMMENDED: prefix so we store only content."""
+            if not text or not isinstance(text, str):
+                return (text or "").strip()
+            lines = text.strip().split("\n")
+            out = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    out.append("")
+                    continue
+                if re.match(r"^[A-Z0-9][A-Z0-9\s\-\.]+:\s*$", stripped) and len(stripped) < 60:
+                    continue
+                if stripped.upper().startswith("RECOMMENDED:"):
+                    stripped = stripped[12:].strip()
+                out.append(line)
+            return "\n".join(out).strip()
+
+        # Sanitize alternative_models: store only content, no section titles
+        alt_models = dict(alt_models) if alt_models else {}
+        for key in ("conservative_approach", "aggressive_optimization", "hybrid_model"):
+            if key in alt_models and alt_models[key]:
+                alt_models[key] = _strip_alternative_headers(alt_models[key])
+        if alt_models.get("recommended_model"):
+            alt_models["recommended_model"] = _strip_alternative_headers(alt_models["recommended_model"])
+
         # Prepare insert statement
         insert_sql = """
         INSERT INTO operation_suggestion (
@@ -587,7 +621,7 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
             _t(reason, 2000),
             _t(expected_impact, 500),
             json.dumps({'production': production_data or {}, 'sensors': sensor_metrics or {}}),
-            datetime.utcnow()
+            datetime.now(timezone.utc)
         )
 
         cur.execute(insert_sql, values)
@@ -632,7 +666,7 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
                         reason,
                         expected_impact,
                         json.dumps({'production': production_data or {}, 'sensors': sensor_metrics or {}}),
-                        datetime.utcnow()
+                        datetime.now(timezone.utc)
                     )
                     cur.execute(insert_sql, alt_values)
                 conn.commit()
@@ -731,7 +765,7 @@ def update_operation_suggestion_status(suggestion_id: str, status: str) -> bool:
         SET status = %s, updated_at = %s
         WHERE id = %s
         """
-        cur.execute(update_sql, (status, datetime.utcnow(), suggestion_id))
+        cur.execute(update_sql, (status, datetime.now(timezone.utc), suggestion_id))
         conn.commit()
         logger.info(f"✓ Updated suggestion {suggestion_id} status to {status}")
         return True

@@ -21,7 +21,7 @@ Usage:
 import sys
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -305,7 +305,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         logger.info("=" * 80)
         logger.info("OPERATIONAL RECOMMENDATIONS PIPELINE")
         logger.info("=" * 80)
-        logger.info(f"Start Time: {datetime.utcnow().isoformat()}Z")
+        logger.info(f"Start Time: {datetime.now(timezone.utc).isoformat()}")
         logger.info(f"Confidence Threshold: {confidence_threshold:.0%}")
         
         # Initialize PostgreSQL table
@@ -380,7 +380,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         logger.info("\n" + "=" * 80)
         logger.info("PIPELINE SUMMARY")
         logger.info("=" * 80)
-        logger.info(f"Timestamp: {datetime.utcnow().isoformat()}Z")
+        logger.info(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
         logger.info(f"Status: SUCCESS")
         logger.info(f"\nRecommendations Processed: {stats['total_processed']}")
         logger.info(f"Saved to Snowflake: {stats['saved_snowflake']}")
@@ -401,7 +401,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         logger.info("\n✓ Pipeline completed successfully")
         return {
             'status': 'success',
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'train_result': train_result,
             'predictions_count': len(predictions),
             'stats': stats
@@ -412,7 +412,7 @@ def run_pipeline(skip_training=False, confidence_threshold=0.75):
         return {
             'status': 'error',
             'message': str(e),
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
 

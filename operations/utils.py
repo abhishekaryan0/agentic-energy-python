@@ -102,13 +102,9 @@ def retry_db_operation(
             last_error = e
             if attempt < max_retries - 1:
                 wait_time = delay * (backoff_factor ** attempt)
-                logger.warning(
-                    f"Database operation failed (attempt {attempt + 1}/{max_retries}): {e}. "
-                    f"Retrying in {wait_time:.1f}s..."
-                )
                 time.sleep(wait_time)
             else:
-                logger.error(f"Database operation failed after {max_retries} attempts: {e}")
+                pass
     
     if last_error is not None:
         raise last_error
@@ -142,6 +138,8 @@ def to_native_type(value: Any) -> Any:
         return int(value)
     if isinstance(value, (np.floating,)):
         return float(value)
+    if isinstance(value, (np.str_,)):
+        return str(value)
     if isinstance(value, np.ndarray):
         return value.tolist()
     

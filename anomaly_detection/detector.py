@@ -332,12 +332,13 @@ class AnomalyDetector:
                     meta = joblib.load(lstm_meta_file)
                     input_dim = meta['input_dim']
                     features = meta.get('features', [])
+                    seq_len_saved = meta.get('seq_len', SEQ_LEN)  # use training-time seq_len
                     scaler = joblib.load(os.path.join(models_dir, f'lstm_scaler_{well_type}.joblib'))
                     model = LSTMAutoencoder(input_dim=input_dim)
                     model.load_state_dict(torch.load(lstm_file, map_location='cpu'))
                     model.eval()
                     trained_models[f'lstm_{well_type}'] = {
-                        'model': model, 'scaler': scaler, 'seq_len': SEQ_LEN,
+                        'model': model, 'scaler': scaler, 'seq_len': seq_len_saved,
                         'features': features
                     }
                     logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
