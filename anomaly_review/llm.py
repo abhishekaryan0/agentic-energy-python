@@ -57,28 +57,57 @@ def generate_llm_content(
             else:
                 dt_obj = datetime.strptime(str(detected_at_str), '%Y-%m-%d %H:%M:%S.%f')
             formatted_date = dt_obj.strftime('%m/%d/%Y %H:%M:%S')
-        except:
+        except Exception:
             formatted_date = str(detected_at_str)
 
         # Handle confidence levels in prompt
         confidence_instruction = ""
         diagnosis_context = ""
+
+        # Production-only anomalies: we detected a drop vs model/baseline but NO sensor pattern
+        # (e.g. fillage, amps, pressure) that points to a single mechanical cause. Do NOT invent one.
+        root_cause_unknown_codes = ("MODEL_DIVERGENCE", "MONTHLY_DECLINE")
+        symptom_only_diagnosis_types = (
+            "Model Performance Divergence",
+            "Monthly Production Decline",
+            "Operational Volatility / Data Variance",
+        )
+        diagnosis_type = (diagnosis or {}).get("type") or ""
+        root_cause_unknown = (
+            anomaly_code in root_cause_unknown_codes
+            or diagnosis_type in symptom_only_diagnosis_types
+        )
+        if root_cause_unknown:
+            confidence_instruction = """
+            ROOT CAUSE UNKNOWN (CRITICAL): This detection is based ONLY on production being below expectation/model.
+            No specific sensor pattern (e.g. pump fillage, motor amps, tubing pressure) in the data indicates a single mechanical cause.
+            - In 'suspected_root_cause' you MUST state clearly that the root cause CANNOT be determined from available data.
+            - Do NOT invent sensor-based causes (e.g. "high amperage and low flow", "reduction in fillage efficiency", "friction in tubing", "standing valve") unless the ANOMALY DATA section above explicitly contains those metrics and supports that interpretation.
+            - Instead write: "Root cause cannot be determined from available data. Production is below expected levels; possible causes include mechanical issues, inflow restriction, or surface equipment—field investigation recommended to identify the cause."
+            - You may add 1 short sentence listing 2-3 possible causes that would require field verification (e.g. "Possible causes to verify: pump wear, fluid level decline, or flowline restriction.").
+            """
+            if diagnosis:
+                diagnosis_context = f"DETECTED PATTERN: {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
         
-        if diagnosis:
+        if diagnosis and not root_cause_unknown:
             if diagnosis.get('confidence') == 'Low':
                 diagnosis_context = f"POTENTIAL ISSUE (LOW CONFIDENCE): {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
-                confidence_instruction = """
-                NOTE: The diagnosis is PRELIMINARY. 
-                - In 'suspected_root_cause', provide a detailed technical hypothesis: "Preliminary analysis suggests [Mechanism], evidenced by [Data Points], though validation is required."
-                - DO NOT use the word "Unconfirmed" in the title. Treat the anomaly as a valid lead.
-                """
+                if not confidence_instruction:
+                    confidence_instruction = """
+                    NOTE: The diagnosis is PRELIMINARY. 
+                    - In 'suspected_root_cause', provide a detailed technical hypothesis: "Preliminary analysis suggests [Mechanism], evidenced by [Data Points], though validation is required."
+                    - DO NOT use the word "Unconfirmed" in the title. Treat the anomaly as a valid lead.
+                    """
             else:
                 diagnosis_context = f"DETECTED PATTERN: {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
-                confidence_instruction = """
-                - Use professional, objective language ("Data indicates...", "Pattern suggests...").
-                - Avoid alarmist terms like "Catastrophic" unless explicitly in the data.
-                - Focus on the DEVIATION from normal dynamics.
-                """
+                if not confidence_instruction:
+                    confidence_instruction = """
+                    - Use professional, objective language ("Data indicates...", "Pattern suggests...").
+                    - Avoid alarmist terms like "Catastrophic" unless explicitly in the data.
+                    - Focus on the DEVIATION from normal dynamics.
+                    """
+        elif diagnosis:
+            diagnosis_context = f"DETECTED PATTERN: {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
         
         # Construct Impact Context
         impact_context = ""
@@ -111,6 +140,10 @@ def generate_llm_content(
 ROLE: Senior Production Engineer / Optimization Specialist with deep expertise in rod pumping and anomaly diagnostics.
 TASK: Generate a COMPREHENSIVE technical investigation report for a well performance deviation. The output must be rich in engineering detail, explaining the *mechanics* of the issue, not just stating the metrics.
 TONE: Investigative, highly analytical, professional.
+
+ANOMALY REVIEW CONTEXT: This is an Anomaly Review item—the middle layer between normal operations and At-Risk events. Purpose is to flag "this is unusual / we didn't expect this" for human investigation—NOT to declare a failure or trigger an automatic At-Risk alarm. Something is not normal but not necessarily bad or broken; frame everything as "recommend review" and "worth investigating" rather than "failure" or "critical alarm".
+
+PLAIN LANGUAGE (CRITICAL): Users see this report—avoid internal or ML jargon. Never use phrases like "Model Divergence", "Model Performance Divergence", "divergence detected", or "model vs actual" in the title or as the main way you describe the issue. Instead describe the REAL problem in operational terms: e.g. "Production Below Expected", "Well Underperforming vs Forecast", "Oil Output Lower Than Predicted". Same for other types: use what the engineer cares about (e.g. "Pump Not Filling Fully" not "Fluid Pound Detected"; "High Amps With Low Flow" not "Energy/Production Divergence"). Keep titles and descriptions clear and problem-focused.
 
 {validation_instruction}
 
@@ -149,9 +182,9 @@ Generate a JSON response with these EXACT keys and STRICT formats:
 
 1. "is_valid_anomaly": (boolean) - See critical verification task above.
 2. "title": 
-   - Max 6 words. No $ symbols.
-   - Example: "Energy Efficiency Drift Detected" instead of "Pump Failure".
-   - Example: "Pressure Volatility Increase" instead of "Flowline Blockage".
+   - Max 6 words. No $ symbols. Use plain operational language (see PLAIN LANGUAGE above).
+   - Good: "Production Below Expected", "High Amps With Low Flow", "Pump Not Filling Fully", "Pressure Swings Increasing".
+   - Avoid: "Model Divergence", "Model Performance Divergence", "Energy Efficiency Drift Detected", or other jargon.
 
 3. "description": 
    - A detailed, 3-5 sentence paragraph.
@@ -164,10 +197,10 @@ Generate a JSON response with these EXACT keys and STRICT formats:
    - "The current [Metric] of [Value] represents a [X]% deviation from the expected model/baseline."
 
 5. "suspected_root_cause": 
-   - **IMPORTANT**: Provide a DETAILED technical assessment (2-3 sentences, 40-70 words).
-   - Explain the likely physical mechanism. 
-   - Example: "Data suggests gas interference is reducing pump fillage, as evidenced by the 25% volatility in tubing pressure. This creates a gas lock condition that prevents the standing valve from opening, leading to the observed drop in fluid load."
-   - Connect the sensors: "High Amps (Val) paired with Low Flow (Val) indicates..."
+   - If the ROOT CAUSE UNKNOWN instruction above applies: state that root cause cannot be determined from available data and recommend field investigation; do NOT invent sensor-based causes.
+   - Otherwise: Provide a DETAILED technical assessment (2-3 sentences, 40-70 words). Explain the likely physical mechanism using ONLY evidence present in ANOMALY DATA.
+   - Example (when sensor evidence exists): "Data suggests gas interference is reducing pump fillage, as evidenced by the 25% volatility in tubing pressure..."
+   - Do NOT invent sensor correlations (e.g. "high amperage and low flow") unless the ANOMALY DATA explicitly includes and supports those metrics.
 
 6. "economic_impact": 
    ONE sentence: "This deviation represents an opportunity cost of estimated $[X]/day due to [inefficiency/production gap]."
@@ -211,7 +244,15 @@ Return ONLY valid JSON. Ensure all fields are populated based on data provided.
                 response_format={"type": "json_object"},
                 timeout=15  # 15-second timeout
             )
-            content = json.loads(response.choices[0].message.content)
+            
+            raw_content = response.choices[0].message.content
+            # Cleanup Markdown code blocks if present
+            if "```json" in raw_content:
+                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_content:
+                raw_content = raw_content.split("```")[1].split("```")[0].strip()
+                
+            content = json.loads(raw_content)
             
         except Exception as e:
             # Handle Timeout or API Error by returning structured fallback
@@ -223,9 +264,14 @@ Return ONLY valid JSON. Ensure all fields are populated based on data provided.
                 "suspected_root_cause": "Pending automated investigation.",
                 "economic_impact": "Impact calculation pending.",
                 "risk_analysis": "Please conduct manual review of the attached charts.",
+                "recommended_actions": "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence.",
                 "historical_context": {"recurrence_status": "Unknown", "history_timeline": []},
                 "is_valid_anomaly": True
             }
+        
+        # Default recommended_actions if missing
+        if "recommended_actions" not in content:
+            content["recommended_actions"] = "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence."
 
         # Default is_valid to True if not present (legacy support)
         if "is_valid_anomaly" not in content:

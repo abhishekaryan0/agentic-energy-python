@@ -24,6 +24,18 @@ from anomaly_review.config import (
     GAS_PRICE,
     SEVERITY_THRESHOLDS,
     format_number,
+    MODEL_DIVERGENCE_MIN_PCT,
+    ENERGY_DIV_AMPS_RATIO,
+    ENERGY_DIV_OIL_MAX_RATIO,
+    FLUID_POUND_FILLAGE_BELOW_BASELINE,
+    FLUID_POUND_FILLAGE_ABSOLUTE_MAX,
+    PRESSURE_INSTABILITY_CV_MIN_PCT,
+    MONTHLY_DECLINE_MIN_PCT,
+    PATTERN_SHIFT_MULTIPLIER,
+    PATTERN_SHIFT_MIN_EVENTS,
+    DATA_MISMATCH_AMPS_ACTIVE_MIN,
+    DATA_MISMATCH_ZERO_VOL_MAX,
+    DATA_MISMATCH_BASELINE_VOL_MIN,
 )
 from anomaly_review.utils import safe_divide
 
@@ -80,8 +92,14 @@ def diagnose_mechanics(ctx: Dict) -> Dict:
     """
     amps = ctx.get('motor_current', 0)
     amps_avg = ctx.get('amps_avg', 0)
-    pressure = ctx.get('tubing_pressure', 0)
-    pressure_avg = ctx.get('tp_avg', 0)
+    discharge_pressure = ctx.get('discharge_pressure', 0)
+    
+    if discharge_pressure > 10:
+        pressure = discharge_pressure
+        pressure_avg = ctx.get('dp_avg', 0)
+    else:
+        pressure = ctx.get('tubing_pressure', 0)
+        pressure_avg = ctx.get('tp_avg', 0)
     oil = ctx.get('oil_volume', 0)
     pred_oil = ctx.get('predicted_oil', 1)
     
@@ -155,14 +173,28 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     if pd.isna(ctx.get('pump_fillage')) or pd.isna(ctx.get('strokes_per_minute')):
         return None
     
-    fillage = ctx['pump_fillage']
+    # Use rolling average fillage to avoid false positives from transient sensor noise
+    # If 24h average is available, use it; otherwise fall back to instantaneous value
+    fillage = ctx.get('fillage_avg_24h', ctx.get('pump_fillage'))
     spm = ctx['strokes_per_minute']
-    baseline_fillage = ctx.get('fillage_avg_24h', 95.0)
     
-    logger.info(f"[FLUID_POUND_CHECK] Fillage: {fillage}%, Baseline: {baseline_fillage}%, SPM: {spm}")
+    # STRICT CHECK: If we have no fillage data at all, skip the check
+    if fillage is None or pd.isna(fillage):
+        return None
     
-    # Anomaly if fillage drops more than 15% below baseline
-    if spm > 4.0 and fillage < (baseline_fillage * 0.85):
+    # STRICT CHECK: If we have no history baseline, do not guess.
+    # This prevents new wells (or those with missing history) from defaulting to 95% and triggering immediately.
+    baseline_fillage = ctx.get('fillage_avg_3d', ctx.get('fillage_avg_24h'))
+    
+    if baseline_fillage is None:
+        return None
+
+    # Anomaly if fillage drops below baseline band AND is below absolute max (configurable "unusual" range)
+    threshold_fillage = baseline_fillage * FLUID_POUND_FILLAGE_BELOW_BASELINE
+    would_trigger = spm > 4.0 and fillage < threshold_fillage and fillage < FLUID_POUND_FILLAGE_ABSOLUTE_MAX
+    logger.debug(f"[FLUID_POUND_CHECK] Fillage: {fillage}%, Baseline: {baseline_fillage}%, SPM: {spm} (trigger={would_trigger})")
+
+    if would_trigger:
         severity_score = 100 - fillage
         revenue_loss = ctx.get('oil_avg_7d', 0) * ((100 - fillage) / 100) * OIL_PRICE
         
@@ -181,7 +213,7 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
         CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day
         """
         
-        logger.info(f"[FLUID_POUND_DETECTED] Data Summary:\n{data_summary}")
+        logger.debug(f"[FLUID_POUND_DETECTED] Data Summary:\n{data_summary}")
         
         return {
             "code": "FLUID_POUND",
@@ -225,7 +257,7 @@ def check_pump_wear(ctx: Dict) -> Optional[Dict]:
     head = ctx['discharge_pressure'] - ctx['pump_intake_pressure']
     amps = ctx['motor_current']
     
-    if head < 800 and amps > 30:
+    if head < 200 and amps > (ctx.get('amps_avg', 0) * 0.5):
         revenue_loss = 2000.0
         boe_loss = revenue_loss / OIL_PRICE
         
@@ -276,7 +308,7 @@ def check_gas_injection_inefficiency(ctx: Dict) -> Optional[Dict]:
     cp = ctx['casing_pressure']
     tp = ctx['tubing_pressure']
     
-    if rate > 100 and (cp - tp) < 50:
+    if rate > (ctx.get('injection_avg_7d', 0) * 1.2) and (cp - tp) < 50:
         gas_cost = rate * GAS_PRICE
         data_summary = f"""
         DETECTION TYPE: Gas Lift Inefficiency
@@ -319,12 +351,18 @@ def check_energy_efficiency_drift(ctx: Dict) -> Optional[Dict]:
     - Calculate Energy Intensity (Amps / Oil Volume).
     - Compare current vs 30-day average.
     - Trigger if current is 15-20% higher (Pump working harder for same fluid).
+    Detects subtle efficiency drift by reducing Energy Intensity.
+    
+    Logic:
+    - Calculate Energy Intensity (Amps / Oil Volume).
+    - Compare current vs 30-day average.
+    - Trigger if current is 15-20% higher (Pump working harder for same fluid).
     """
     oil = ctx.get('oil_volume', 0)
     amps = ctx.get('motor_current', 0)
     
     # Needs valid production to calculate intensity
-    if oil < 0.1 or amps < 1:
+    if pd.isna(oil) or pd.isna(amps) or oil < 0.1 or amps < 1:
         return None
         
     # Calculate Energy Intensity (Amps per Bbl or KW per Bbl)
@@ -388,14 +426,14 @@ def check_model_divergence(ctx: Dict) -> Optional[Dict]:
     actual = ctx.get('oil_volume', 0)
     predicted = ctx.get('predicted_oil', 0)
     
-    if predicted < 5: # Ignore low production wells
+    if pd.isna(predicted) or predicted < 5: # Ignore low production wells
         return None
         
     # Divergence: (Predicted - Actual) / Predicted
     # Positive means Underperformance (Predicted > Actual)
     divergence_pct = safe_divide((predicted - actual), predicted) * 100
     
-    if divergence_pct > 30: # 30% threshold
+    if divergence_pct > MODEL_DIVERGENCE_MIN_PCT:
         delta = predicted - actual # delta is needed for revenue_loss and boe_loss
         revenue_loss = delta * OIL_PRICE
         boe_loss = delta
@@ -457,10 +495,8 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
     # Let's say current volatility is high if 'tp_std' is high relative to 'tp_avg'.
     
     if tp_avg > 20:
-        cv = (tp_std / tp_avg) * 100 # Coefficient of Variation
-        
-        # If volatility is > 20% and we see it rising
-        if cv > 20:
+        cv = (tp_std / tp_avg) * 100  # Coefficient of Variation
+        if cv > PRESSURE_INSTABILITY_CV_MIN_PCT:
             revenue_loss = ctx.get('oil_volume', 0) * 0.15 * OIL_PRICE
             
             data_summary = f"""
@@ -516,8 +552,8 @@ def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[D
     recent_count = recent['is_shutdown'].sum()
     prev_count_avg = previous['is_shutdown'].sum() / 3 # Monthly avg over 3 months
     
-    # Trigger: Recent count significantly higher (> 2x baseline and > 2 events)
-    if recent_count > 2 and recent_count > (prev_count_avg * 2):
+    # Trigger: recent events clearly above baseline (configurable "unusual" multiplier)
+    if recent_count >= PATTERN_SHIFT_MIN_EVENTS and recent_count > (prev_count_avg * PATTERN_SHIFT_MULTIPLIER):
         increase_pct = ((recent_count - prev_count_avg) / prev_count_avg) * 100 if prev_count_avg > 0 else 100
         
         data_summary = f"""
@@ -558,9 +594,10 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
     """
     if 'timestamp' not in df.columns or df['timestamp'].empty:
         return None
-    
+
     recent_df = df[df['timestamp'] > (df['timestamp'].max() - pd.Timedelta(days=120))].copy()
-    recent_df['month'] = recent_df['timestamp'].dt.to_period('M')
+    # Use YYYY-MM string to avoid Period timezone warning and keep groupby stable
+    recent_df['month'] = recent_df['timestamp'].dt.strftime('%Y-%m')
     
     monthly = recent_df.groupby('month').agg({'oil_volume': ['sum', 'count']}).reset_index()
     monthly.columns = ['month', 'oil_total', 'oil_days']
@@ -578,7 +615,7 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
         
         decline_pct = safe_divide((previous['oil_rate'] - latest['oil_rate']), previous['oil_rate']) * 100
             
-        if decline_pct > 15:
+        if decline_pct > MONTHLY_DECLINE_MIN_PCT:
             revenue_loss = max(0, previous['oil_rate'] - latest['oil_rate']) * OIL_PRICE
             boe_loss = max(0, previous['oil_rate'] - latest['oil_rate'])
             data_summary = f"Monthly Decline: {format_number(decline_pct)}%"
@@ -652,6 +689,103 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
             "chart_payload": {
                 "threshold": threshold,
                 "reconstruction_error": reconstruction_error
+            }
+        }
+    return None
+
+def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
+    """
+    Detects significant divergence between Energy Input (Amps) and Production Output (Oil).
+
+    Previously "Mechanical Failure". Now "Energy/Production Divergence".
+    Uses baselines as of 1 day ago when available so the current day's anomaly does not dilute the baseline.
+    """
+    # Prefer lagged baselines (1d ago) so current anomalous values don't inflate/deflate the baseline
+    oil_baseline = ctx.get('oil_baseline_90d_1d_ago') if not pd.isna(ctx.get('oil_baseline_90d_1d_ago')) else ctx.get('oil_baseline_90d')
+    amps_avg = ctx.get('amps_avg_1d_ago') if not pd.isna(ctx.get('amps_avg_1d_ago')) else ctx.get('amps_avg')
+    if any(pd.isna(ctx.get(k)) for k in ['motor_current', 'oil_volume']) or pd.isna(oil_baseline) or pd.isna(amps_avg):
+        return None
+
+    amps_current = ctx['motor_current']
+    oil_current = ctx['oil_volume']
+
+    # High Amps (working hard) but Low Production (no results)
+    # Thresholds from config: only flag when clearly outside normal range
+    if amps_current > (ENERGY_DIV_AMPS_RATIO * amps_avg) and oil_current < (ENERGY_DIV_OIL_MAX_RATIO * oil_baseline):
+        revenue_loss = oil_baseline * OIL_PRICE
+        boe_loss = oil_baseline
+        
+        data_summary = f"""
+        DETECTION TYPE: Energy/Production Divergence
+        ENERGY INPUT: {format_number(amps_current)} Amps (Baseline: {format_number(amps_avg)})
+        PRODUCTION OUTPUT: {format_number(oil_current)} bbl (Baseline: {format_number(oil_baseline)})
+        DIVERGENCE: Input +{format_number((amps_current/amps_avg - 1)*100)}%, Output -{format_number((1 - oil_current/oil_baseline)*100)}%
+        """
+
+        diagnosis = diagnose_mechanics(ctx)
+
+        return {
+            "code": "ENERGY_DIV",
+            "category": "OPERATIONAL",
+            "raw_data": f"Significant divergence detected between Energy Input (Amps: {format_number(amps_current)}) and Production Output ({format_number(oil_current)} bbl)",
+            "severity_metrics": {'severity_score': 70, 'impact_value': revenue_loss},
+            "impact_value": revenue_loss,
+            "impact_payload": {
+                "financial": {"value": revenue_loss, "label": f"${format_number(revenue_loss)}/day (Potential)"},
+                "production": {"value": boe_loss, "label": f"{format_number(boe_loss)} BOE/day (Potential)"}
+            },
+            "chart_metric": "mechanical_failure_view",
+            "diagnosis": diagnosis,
+            "chart_payload": {
+                "amps": amps_current,
+                "oil": oil_current,
+                "efficiency": (oil_current / amps_current) if amps_current > 0 else 0
+            }
+        }
+    return None
+
+def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
+    """
+    Detects when operational state (Amps/SPM) says 'Running' but Production says 'Zero'.
+    Previously "Ghost Production". Now "Sensor State Mismatch".
+    """
+    # Coerce None to 0 so comparisons don't raise (ctx can have None for missing/NaN)
+    _f = lambda x: 0.0 if x is None or (isinstance(x, float) and pd.isna(x)) else float(x)
+    total_vol = _f(ctx.get('oil_volume')) + _f(ctx.get('water_volume'))
+    baseline_vol = _f(ctx.get('oil_baseline_90d')) + _f(ctx.get('water_avg_30d'))
+    amps = _f(ctx.get('motor_current'))
+    spm = _f(ctx.get('strokes_per_minute'))
+
+    # Active if Amps or SPM above configurable minimum
+    is_active = amps > DATA_MISMATCH_AMPS_ACTIVE_MIN or spm > 1.0
+    if is_active and total_vol < DATA_MISMATCH_ZERO_VOL_MAX and baseline_vol > DATA_MISMATCH_BASELINE_VOL_MIN:
+        revenue_loss = _f(ctx.get('oil_baseline_90d')) * OIL_PRICE
+        
+        data_summary = f"""
+        DETECTION TYPE: Sensor State Mismatch
+        STATUS: Pump is Running (Amps {amps:.1f}, SPM {spm:.1f})
+        FLOW: No Flow Recorded ({total_vol:.2f} bbl)
+        """
+        
+        return {
+            "code": "DATA_MISMATCH",
+            "category": "PRODUCTION",
+            "raw_data": "Operational State is 'Active' but Flow Meter reads zero. Potential meter calibration or data synchronization issue.",
+            "severity_metrics": {'impact_value': revenue_loss, 'severity_score': 60},
+            "impact_value": revenue_loss,
+            "impact_payload": {
+                "financial": {"value": revenue_loss, "label": f"${format_number(revenue_loss)}/day (Risk)"},
+                "production": {"value": 0, "label": "N/A"}
+            },
+            "chart_metric": "ghost_production_view",
+            "diagnosis": {
+                "type": "Data Mismatch",
+                "confidence": "High",
+                "indicators": "Active Pump State vs Zero Flow"
+            },
+            "chart_payload": {
+                "amps": amps,
+                "total_volume": total_vol
             }
         }
     return None

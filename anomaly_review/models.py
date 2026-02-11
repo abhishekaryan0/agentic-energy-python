@@ -389,7 +389,7 @@ def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
     train_df = df[required_cols].copy()
     
     # Handle missing values for training
-    train_df = train_df.fillna(method='ffill').fillna(method='bfill').fillna(0) # Fill NaNs before scaling
+    train_df = train_df.ffill().bfill().fillna(0)  # Fill NaNs before scaling
 
     # Filter for valid training data (e.g., positive oil volume)
     train_df_filtered = train_df[train_df['oil_volume'] > 0.1].copy()
@@ -422,22 +422,21 @@ def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
         ae_artifact = train_autoencoder_model(df, selected_features)
         
         if ae_artifact:
-             models['autoencoder'] = ae_artifact['model']
-             models['threshold'] = ae_artifact['threshold']
-             logger.info(f"Autoencoder trained. Threshold: {ae_artifact['threshold']:.4f}")
-        
+            models['autoencoder'] = ae_artifact['model']
+            models['threshold'] = ae_artifact['threshold']
+            logger.info(f"Autoencoder trained. Threshold: {ae_artifact['threshold']:.4f}")
+
     except Exception as e:
         logger.error(f"Autoencoder training failed: {e}")
 
-    # Save artifacts
+    # Save artifacts (threshold from autoencoder when available)
     artifacts = {
         'models': models,
         'scaler': scaler,
         'imputer': imputer,
-        'features': selected_features,  # Save the EXACT features used
-        # Persist autoencoder threshold (if trained) at top level for consistent reload/use
+        'features': selected_features,
         'threshold': models.get('threshold', 0.5),
-        'trained_date': datetime.now().isoformat(),
+        'trained_date': datetime.now().isoformat()
     }
 
     save_models_to_disk(well_id, artifacts)
@@ -469,12 +468,11 @@ def save_models_to_disk(well_id: str, artifacts: Dict) -> None:
     try:
         model_dir = get_model_dir(well_id)
         
-        # Save lightweight metadata needed for reload
+        # Save metadata (threshold is at top level in artifacts from get_or_train_model)
         metadata = {
             'features': artifacts['features'],
-            # Persist autoencoder threshold if available so reload behavior matches training
             'threshold': artifacts.get('threshold'),
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now().isoformat()
         }
         with open(os.path.join(model_dir, 'metadata.json'), 'w') as f:
             json.dump(metadata, f)
@@ -560,13 +558,12 @@ def load_models_from_disk(well_id: str) -> Optional[Dict]:
                 models['autoencoder'] = ae
         
         logger.info(f"Loaded cached models for {well_id} from disk.")
-        # Return a consistent artifact structure (same shape as training path)
         return {
             'models': models,
             'scaler': scaler,
             'imputer': imputer,
             'features': features,
-            'threshold': threshold if threshold is not None else models.get('threshold', 0.5),
+            'threshold': metadata.get('threshold', 0.5),
         }
         
     except Exception as e:
