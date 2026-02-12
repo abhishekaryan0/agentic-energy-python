@@ -22,7 +22,6 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from anomaly_review.utils import safe_divide
 from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES
 
 logger = logging.getLogger('AnomalyReviewModels')
@@ -145,26 +144,29 @@ def prepare_sequences(
 def engineer_physics_features(df: pd.DataFrame, lift_type: str = "Unknown") -> pd.DataFrame:
     """
     Enrich DataFrame with physics-based engineered features.
-    
-    Uses safe_divide to avoid crashes.
+    Only adds a feature when required columns exist; avoids division by zero via pandas replace/fillna.
     """
     df = df.copy()
-    
-    # 1. Energy Intensity (Amps per Barrel)
-    # Only if we have liquid production
-    total_liquid = df['oil_volume'] + df['water_volume']
-    df['energy_intensity'] = safe_divide(df['motor_current'], total_liquid)
-    
+
+    # 1. Energy Intensity (Amps per Barrel) – only if we have liquid production and motor_current
+    if 'oil_volume' in df.columns and 'water_volume' in df.columns and 'motor_current' in df.columns:
+        total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
+        df['energy_intensity'] = (df['motor_current'] / total_liquid).fillna(0.0)
+
     # 2. Water Cut (Water / Total Liquid)
-    df['water_cut'] = safe_divide(df['water_volume'], total_liquid)
-    
+    if 'oil_volume' in df.columns and 'water_volume' in df.columns:
+        total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
+        df['water_cut'] = (df['water_volume'] / total_liquid).fillna(0.0)
+
     # 3. Gas-Oil Ratio
-    df['gas_oil_ratio'] = safe_divide(df['gas_volume'], df['oil_volume'])
-    
+    if 'gas_volume' in df.columns and 'oil_volume' in df.columns:
+        denom = df['oil_volume'].replace(0, np.nan)
+        df['gas_oil_ratio'] = (df['gas_volume'] / denom).fillna(0.0)
+
     # 4. Pressure Differential (Casing - Tubing)
     if 'casing_pressure' in df.columns and 'tubing_pressure' in df.columns:
         df['pressure_diff'] = df['casing_pressure'] - df['tubing_pressure']
-        
+
     return df
 
 
@@ -334,13 +336,14 @@ def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[D
     }
 
 
-def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
+def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = False) -> Dict:
     """
     Get cached model or train new models for a well.
     
     Args:
         well_id: Well identifier
         df: DataFrame with well data
+        force_retrain: If True, skip cache and always train (add-on training with new data).
         
     Returns:
         Dict with models, scaler, imputer, and features
@@ -350,10 +353,11 @@ def get_or_train_model(well_id: str, df: pd.DataFrame) -> Dict:
         logger.info(f"Skipping model training for {well_id}: insufficient data ({len(df)} rows)")
         return {}
 
-    # Try loading cached model first
-    cached_art = load_models_from_disk(well_id)
-    if cached_art:
-        return cached_art
+    # Try loading cached model first (unless add-on/force retrain)
+    if not force_retrain:
+        cached_art = load_models_from_disk(well_id)
+        if cached_art:
+            return cached_art
 
     logger.info(f"Training new models for {well_id}...")
     
@@ -484,13 +488,8 @@ def save_models_to_disk(well_id: str, artifacts: Dict) -> None:
         if 'rf_model' in artifacts['models']:
             joblib.dump(artifacts['models']['rf_model'], os.path.join(model_dir, f'{well_id}_rf_baseline.joblib'))
         
-        # Save PyTorch models
+        # Save PyTorch models (lstm_regressor is not trained in get_or_train_model; only autoencoder is)
         if TORCH_AVAILABLE:
-            if 'lstm_regressor' in artifacts['models']:
-                torch.save(
-                    artifacts['models']['lstm_regressor'].state_dict(),
-                    os.path.join(model_dir, f'{well_id}_lstm_forecast.pth')
-                )
             if 'autoencoder' in artifacts['models']:
                 torch.save(
                     artifacts['models']['autoencoder'].state_dict(),
@@ -530,7 +529,6 @@ def load_models_from_disk(well_id: str) -> Optional[Dict]:
             metadata = json.load(f)
         
         features = metadata['features']
-        threshold = metadata.get('threshold')
         
         # Load sklearn objects
         scaler = joblib.load(os.path.join(model_dir, f'{well_id}_scaler.joblib'))
@@ -540,6 +538,9 @@ def load_models_from_disk(well_id: str) -> Optional[Dict]:
         rf_path = os.path.join(model_dir, f'{well_id}_rf_baseline.joblib')
         if os.path.exists(rf_path):
             models['rf_model'] = joblib.load(rf_path)
+        
+        if metadata.get('threshold'):
+            models['threshold'] = metadata['threshold']
         
         # Load PyTorch models
         if TORCH_AVAILABLE:

@@ -483,8 +483,8 @@ def train_all_models():
     # Load data (try Snowflake first, fallback to CSV)
     try:
         df = load_training_data_from_snowflake()
-    except:
-        logger.warning("Could not load from Snowflake, trying CSV...")
+    except Exception as e:
+        logger.warning("Could not load from Snowflake: %s. Trying CSV...", e)
         if os.path.exists(TRAINING_DATA_FILE):
             df = load_training_data_from_csv(TRAINING_DATA_FILE)
         else:

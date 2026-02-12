@@ -365,7 +365,6 @@ def generate_efficiency_chart(
         title_text = "Efficiency & production"
         y_axis_text = "Efficiency (%)"
 
-    # Get baseline from payload OR regex fallback
     baseline_efficiency = 100
     if chart_payload and chart_payload.get("baseline_fillage"):
         baseline_efficiency = chart_payload["baseline_fillage"]

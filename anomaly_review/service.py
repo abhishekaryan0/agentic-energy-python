@@ -190,23 +190,17 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     if 'lift_type' not in full_df.columns:
         full_df['lift_type'] = 'Unknown'
     full_df['lift_type'] = full_df['lift_type'].ffill().bfill().fillna('Unknown')
-    return full_df['lift_type'].iloc[-1]
+    current_lift_type = full_df['lift_type'].iloc[-1]
 
-
-def _run_ml_models(well_id: str, full_df: pd.DataFrame) -> (pd.DataFrame, float):
-    """
-    Run model training / loading and all ML-based predictions.
-    Returns the mutated DataFrame and the autoencoder threshold.
-    Keeps behavior identical to the original inline block.
-    """
+    # 2. Pre-Processing & Rolling Baselines
+    full_df = calculate_rolling_baseline(full_df)
+    
     # 3. Model Training (Predictive Efficiency)
     full_df['predicted_oil'] = np.nan
     full_df['efficiency'] = 100.0
-
+    
     model_art = get_or_train_model(well_id, full_df)
-
-    autoencoder_threshold = 999.0
-
+    
     if model_art:
         try:
             # 3a. Random Forest Baseline (Always run if available)
@@ -244,21 +238,21 @@ def _run_ml_models(well_id: str, full_df: pd.DataFrame) -> (pd.DataFrame, float)
             # 3c. Autoencoder Anomaly Detection
             full_df['reconstruction_error'] = 0.0
             autoencoder_threshold = 999.0
-
+            
             if 'autoencoder' in model_art.get('models', {}):
                 try:
                     ae_model = model_art['models']['autoencoder']
                     ae_results = detect_autoencoder_anomalies(
-                        ae_model,
-                        full_df,
-                        model_art['features'],
-                        model_art['scaler'],
+                        ae_model, 
+                        full_df, 
+                        model_art['features'], 
+                        model_art['scaler'], 
                         model_art['imputer'],
                         model_art.get('threshold', 0.5)
                     )
                     if not ae_results.empty:
-                        full_df['reconstruction_error'] = ae_results['reconstruction_error']
-                        autoencoder_threshold = model_art.get('threshold', 0.5)
+                         full_df['reconstruction_error'] = ae_results['reconstruction_error']
+                         autoencoder_threshold = model_art.get('threshold', 0.5)
                 except Exception as e:
                     logger.error(f"Autoencoder detection failed: {e}")
 
@@ -273,36 +267,9 @@ def _run_ml_models(well_id: str, full_df: pd.DataFrame) -> (pd.DataFrame, float)
                 full_df['efficiency_avg_30d'] = temp_df['efficiency'].rolling('30D', min_periods=7).mean().values
             else:
                 full_df['efficiency_avg_30d'] = full_df['efficiency'].rolling(30, min_periods=7).mean()
-
+                
         except Exception as e:
             logger.error(f"ML Prediction failed for {well_id}: {e}")
-
-    return full_df, autoencoder_threshold
-
-
-def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS) -> List[Dict]:
-    logger.info(f"Starting anomaly detection for {well_id}...")
-    
-    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
-    if df is not None:
-        full_df = df
-    else:
-        full_df = fetch_well_data(well_id, days=180)
-    
-    if full_df.empty or len(full_df) < 30:
-        logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df)})")
-        return []
-
-    _apply_alarm_gatekeeper(well_id, full_df)
-    _apply_flatline_detection(well_id, full_df)
-
-    # Ensure lift_type exists (Forward fill to handle intermittent metadata)
-    current_lift_type = _prepare_lift_type(full_df)
-
-    # 2. Pre-Processing & Rolling Baselines
-    full_df = calculate_rolling_baseline(full_df)
-    
-    full_df, autoencoder_threshold = _run_ml_models(well_id, full_df)
 
     # 4. Run Checkers on the Detection Window
     # We fetch 180 days for context, but only scan the last `lookback_days` for new alerts.
@@ -422,11 +389,6 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         if finding['anomaly_code'] == 'MODEL_DIVERGENCE' and title and ('divergence' in title.lower() or 'model performance' in title.lower()):
             title = "Production Below Expected"
             llm_content = {**llm_content, 'title': title}
-        
-        # Check validation result (New Feature)
-        if not llm_content.get('is_valid_anomaly', True):
-             logger.info(f"LLM Validation Rejected: {finding['anomaly_code']} on {finding['event_date']} for {well_id}")
-             continue
         
         # Generate Chart Configuration
         chart_config = generate_chart_config(

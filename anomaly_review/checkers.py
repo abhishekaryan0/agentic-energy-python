@@ -351,12 +351,6 @@ def check_energy_efficiency_drift(ctx: Dict) -> Optional[Dict]:
     - Calculate Energy Intensity (Amps / Oil Volume).
     - Compare current vs 30-day average.
     - Trigger if current is 15-20% higher (Pump working harder for same fluid).
-    Detects subtle efficiency drift by reducing Energy Intensity.
-    
-    Logic:
-    - Calculate Energy Intensity (Amps / Oil Volume).
-    - Compare current vs 30-day average.
-    - Trigger if current is 15-20% higher (Pump working harder for same fluid).
     """
     oil = ctx.get('oil_volume', 0)
     amps = ctx.get('motor_current', 0)
