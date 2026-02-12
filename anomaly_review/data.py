@@ -145,51 +145,154 @@ def fetch_all_active_wells() -> List[str]:
 
 
 def get_recent_anomaly_history(
-    well_id: str, 
-    anomaly_code: str, 
-    exclude_date: str = None
+    well_id: str,
+    anomaly_code: str,
+    exclude_date: str = None,
 ) -> str:
     """
-    Fetch recent anomaly history for a well.
-    
-    Args:
-        well_id: Well identifier
-        anomaly_code: Type of anomaly
-        exclude_date: Date to exclude from history
-        
-    Returns:
-        Formatted string of recent history
+    Fetch recent anomaly history for a well (same code) for historical_context.
+    Tries Postgres first, then Snowflake, so history is found regardless of where reviews are saved.
     """
-    query = """
-    SELECT event_date, severity, title 
-    FROM anomaly_review 
-    WHERE well_id = %s 
-    AND anomaly_code = %s 
-    ORDER BY event_date DESC
-    LIMIT 5
-    """
+    # 1) Try Postgres (same table we write to when DATABASE_URL is set)
+    url = get_db_url()
+    if url:
+        try:
+            import psycopg2
+            with psycopg2.connect(url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT event_date, severity, title
+                           FROM anomaly_review
+                           WHERE well_id = %s AND anomaly_code = %s
+                           ORDER BY event_date DESC
+                           LIMIT 10""",
+                        (well_id, anomaly_code),
+                    )
+                    rows = cur.fetchall()
+            if rows:
+                history_list = _format_history_rows(rows, exclude_date)
+                if history_list:
+                    return "\n".join(history_list)
+        except Exception as e:
+            logger.warning(f"get_recent_anomaly_history (Postgres) failed: {e}")
+
+    # 2) Try Snowflake with fully qualified table (same as save path)
     try:
+        from anomaly_review.config import SNOWFLAKE_ANOMALY_REVIEW_TABLE
+        table = SNOWFLAKE_ANOMALY_REVIEW_TABLE
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            rows = cur.execute(query, (well_id, anomaly_code)).fetchall()
-        
-        if not rows:
-            return "No prior history found."
-        
-        history_list = []
-        for r in rows:
-            r_date = str(r[0])
-            if exclude_date and r_date == str(exclude_date):
-                continue
-            history_list.append(f"- Date: {r_date}, Severity: {r[1]}, Title: {r[2]}")
-        
-        if not history_list:
-            return "No prior history found."
-        
-        return "\n".join(history_list)
+            cur.execute(
+                f"""SELECT event_date, severity, title
+                    FROM {table}
+                    WHERE well_id = %s AND anomaly_code = %s
+                    ORDER BY event_date DESC
+                    LIMIT 10""",
+                (well_id, anomaly_code),
+            )
+            rows = cur.fetchall()
+        if rows:
+            history_list = _format_history_rows(rows, exclude_date)
+            if history_list:
+                return "\n".join(history_list)
     except Exception as e:
-        logger.warning(f"History fetch failed: {e}")
-        return "History check unavailable."
+        logger.warning(f"get_recent_anomaly_history (Snowflake) failed: {e}")
+
+    return "No prior history found."
+
+
+def _format_history_rows(rows, exclude_date: str = None):
+    """Build list of history lines from (event_date, severity, title) rows."""
+    out = []
+    for r in rows:
+        r_date = str(r[0]) if r[0] is not None else ""
+        if exclude_date and r_date == str(exclude_date):
+            continue
+        sev = r[1] if r[1] is not None else "N/A"
+        title = (r[2] or "Anomaly") if len(r) > 2 else "Anomaly"
+        out.append(f"- Date: {r_date}, Severity: {sev}, Title: {title}")
+    return out
+
+
+def has_recent_anomaly(well_id: str, anomaly_code: str, within_days: int) -> bool:
+    """
+    Return True if this well already has an anomaly_review row for the given code
+    with event_date within the last `within_days`. Used to avoid duplicate daily
+    alerts (e.g. PATTERN_SHIFT only once per episode per well).
+    """
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=within_days)).isoformat()
+    url = get_db_url()
+    if url:
+        try:
+            import psycopg2
+            with psycopg2.connect(url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM anomaly_review WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
+                        (well_id, anomaly_code, cutoff),
+                    )
+                    if cur.fetchone():
+                        return True
+        except Exception as e:
+            logger.warning(f"has_recent_anomaly (Postgres) failed: {e}")
+    try:
+        from anomaly_review.config import SNOWFLAKE_ANOMALY_REVIEW_TABLE
+        with get_snowflake_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT 1 FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE} WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
+                (well_id, anomaly_code, cutoff),
+            )
+            if cur.fetchone():
+                return True
+    except Exception as e:
+        logger.warning(f"has_recent_anomaly (Snowflake) failed: {e}")
+    return False
+
+
+def get_existing_anomaly_event_date(well_id: str, anomaly_code: str, within_days: int):
+    """
+    Return the event_date (YYYY-MM-DD string) of the most recent anomaly_review row
+    for this well+code within the last `within_days`. Used to update that row with
+    fresh content when the same anomaly is still severe (so it stays visible).
+    Returns None if no row found.
+    """
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=within_days)).isoformat()
+    url = get_db_url()
+    if url:
+        try:
+            import psycopg2
+            with psycopg2.connect(url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT event_date FROM anomaly_review
+                           WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
+                           ORDER BY event_date DESC LIMIT 1""",
+                        (well_id, anomaly_code, cutoff),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return str(row[0]) if row[0] else None
+        except Exception as e:
+            logger.warning(f"get_existing_anomaly_event_date (Postgres) failed: {e}")
+    try:
+        from anomaly_review.config import SNOWFLAKE_ANOMALY_REVIEW_TABLE
+        with get_snowflake_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""SELECT event_date FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE}
+                    WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
+                    ORDER BY event_date DESC LIMIT 1""",
+                (well_id, anomaly_code, cutoff),
+            )
+            row = cur.fetchone()
+            if row:
+                return str(row[0]) if row[0] else None
+    except Exception as e:
+        logger.warning(f"get_existing_anomaly_event_date (Snowflake) failed: {e}")
+    return None
 
 
 # Global cache for sensor metadata

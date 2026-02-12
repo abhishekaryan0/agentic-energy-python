@@ -25,6 +25,11 @@ TRAINING_CUTOFF_DAYS = 7
 ROLLING_BASELINE_DAYS = 90
 MODEL_CACHE_DAYS = 7
 MODEL_DIR = "models"
+# How many days of well data we fetch for anomaly review (baselines, models, pattern-shift).
+# Pattern-shift compares last 30d vs previous 90d within this window (no full-year history).
+ANOMALY_REVIEW_FETCH_DAYS = 180
+# Snowflake fully qualified table for anomaly_review (used for history / existence checks)
+SNOWFLAKE_ANOMALY_REVIEW_TABLE = "AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW"
 
 # =============================================================================
 # DETECTION THRESHOLDS (What counts as "unusual")
@@ -53,6 +58,25 @@ MONTHLY_DECLINE_MIN_PCT = 15.0
 # Pattern shift: trigger when recent event count > (PATTERN_SHIFT_MULTIPLIER * baseline).
 PATTERN_SHIFT_MULTIPLIER = 2.0
 PATTERN_SHIFT_MIN_EVENTS = 2
+# What counts as "shutdown" for event counting: motor_current below this (Amps).
+PATTERN_SHIFT_SHUTDOWN_AMPS_MAX = 1.0
+# Only count a "shutdown event" when motor current is off for at least this many hours (avoids brief glitches).
+# 24 = about a day; sensor down for a day counts as one shutdown, not hourly blips.
+PATTERN_SHIFT_MIN_SHUTDOWN_HOURS = 24
+# Don't create a new row for these codes if one exists in the last N days; instead update that row so it stays visible (still severe).
+PATTERN_SHIFT_SUPPRESS_DAYS = 7
+ANOMALY_CODES_UPDATE_WHEN_RECENT: List[str] = ["PATTERN_SHIFT"]
+# Compare counts: recent window vs baseline window. We care that "it used to happen X times, now it happens Y times" (count, not calendar alignment).
+PATTERN_SHIFT_BASELINE_DAYS = 90
+PATTERN_SHIFT_RECENT_DAYS = 30
+# Other event types: min contiguous hours to count (sustained event, not spike).
+PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE = 2
+PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP = 4
+PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP = 4
+# Thresholds: pressure spike = tubing_pressure > baseline_30d * (1 + this). Fillage drop = below baseline * this. SPM drop = below this value.
+PATTERN_SHIFT_PRESSURE_SPIKE_ABOVE_BASELINE_RATIO = 1.25
+PATTERN_SHIFT_FILLAGE_DROP_BELOW_BASELINE_RATIO = 0.75
+PATTERN_SHIFT_SPM_DROP_BELOW = 2.0
 
 # Sensor state mismatch: "active" if amps > this or SPM > 1; "zero flow" if total_vol < this.
 DATA_MISMATCH_AMPS_ACTIVE_MIN = 5.0
@@ -108,44 +132,53 @@ SEVERITY_THRESHOLDS: Dict[str, Dict[str, float]] = {
 # =============================================================================
 # SUPPRESSION RULES (Hierarchy of Truth)
 # =============================================================================
-
-# This system prevents alert fatigue by suppressing "Symptom" anomalies 
-# when a specific "Root Cause" anomaly is detected on the same day.
+# When anomaly A is present, any code listed in SUPPRESSION_RULES[A] is hidden.
+# Order: root cause wins; same-issue or symptom codes are suppressed so you
+# get one alert per underlying issue, not duplicates.
 
 SUPPRESSION_RULES: Dict[str, List[str]] = {
-    # Top-level rule
+    # Most specific / critical first
     'MECHANICAL_FAILURE': [
-        'FLUID_POUND', 'PUMP_WEAR', 'EFFICIENCY_DEGRADATION', 
-        'MONTHLY_DECLINE', 'PRESSURE_INSTABILITY', 'ML_PATTERN_ANOMALY'
+        'FLUID_POUND', 'PUMP_WEAR', 'EFFICIENCY_DEGRADATION',
+        'MONTHLY_DECLINE', 'PRESSURE_INSTABILITY', 'PATTERN_SHIFT', 'ML_PATTERN_ANOMALY'
     ],
-    # Existing rules
+    'DATA_MISMATCH': ['ML_PATTERN_ANOMALY', 'PATTERN_SHIFT'],
+    'MODEL_DIVERGENCE': ['ML_PATTERN_ANOMALY'],
+    'ENERGY_DIV': ['ML_PATTERN_ANOMALY', 'PATTERN_SHIFT'],
+    # Physics / operational
     'FLUID_POUND': [
-        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE', 
-        'PRESSURE_INSTABILITY', 'ML_PATTERN_ANOMALY'
+        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE',
+        'PRESSURE_INSTABILITY', 'PATTERN_SHIFT', 'ML_PATTERN_ANOMALY'
     ],
     'PUMP_WEAR': [
-        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE', 'ML_PATTERN_ANOMALY'
+        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE', 'PATTERN_SHIFT', 'ML_PATTERN_ANOMALY'
     ],
     'GAS_HOG': [
-        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE', 
-        'PRESSURE_INSTABILITY', 'ML_PATTERN_ANOMALY'
+        'EFFICIENCY_DEGRADATION', 'MONTHLY_DECLINE',
+        'PRESSURE_INSTABILITY', 'PATTERN_SHIFT', 'ML_PATTERN_ANOMALY'
     ],
-    # Updated rules
-    'PRESSURE_INSTABILITY': ['MONTHLY_DECLINE', 'EFFICIENCY_DEGRADATION'],
-    'EFFICIENCY_DEGRADATION': ['MONTHLY_DECLINE'],
+    # One pressure alert: volatility (root) hides spike-frequency (pattern shift)
+    'PRESSURE_INSTABILITY': ['MONTHLY_DECLINE', 'EFFICIENCY_DEGRADATION', 'PATTERN_SHIFT', 'ML_PATTERN_ANOMALY'],
+    'EFFICIENCY_DEGRADATION': ['MONTHLY_DECLINE', 'ML_PATTERN_ANOMALY'],
+    'PATTERN_SHIFT': ['ML_PATTERN_ANOMALY'],
+    'MONTHLY_DECLINE': ['ML_PATTERN_ANOMALY'],
 }
 
 # Priority Ranking (1 = Highest Priority / Most Specific)
 ANOMALY_PRIORITY: Dict[str, int] = {
     'GHOST_PROD': 1,
     'MECHANICAL_FAILURE': 1,
+    'DATA_MISMATCH': 1,
     'FLUID_POUND': 2,
     'PUMP_WEAR': 2,
     'GAS_HOG': 2,
+    'ENERGY_DIV': 2,
     'EFFICIENCY_DEGRADATION': 3,
     'PRESSURE_INSTABILITY': 3,
+    'PATTERN_SHIFT': 4,
     'ML_PATTERN_ANOMALY': 4,
-    'MONTHLY_DECLINE': 5
+    'MONTHLY_DECLINE': 5,
+    'MODEL_DIVERGENCE': 5,
 }
 
 # =============================================================================

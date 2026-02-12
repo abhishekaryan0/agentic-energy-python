@@ -151,17 +151,17 @@ def engineer_physics_features(df: pd.DataFrame, lift_type: str = "Unknown") -> p
     # 1. Energy Intensity (Amps per Barrel) – only if we have liquid production and motor_current
     if 'oil_volume' in df.columns and 'water_volume' in df.columns and 'motor_current' in df.columns:
         total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
-        df['energy_intensity'] = (df['motor_current'] / total_liquid).fillna(0.0)
+        df['energy_intensity'] = (df['motor_current'] / total_liquid).fillna(0.0).infer_objects(copy=False)
 
     # 2. Water Cut (Water / Total Liquid)
     if 'oil_volume' in df.columns and 'water_volume' in df.columns:
         total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
-        df['water_cut'] = (df['water_volume'] / total_liquid).fillna(0.0)
+        df['water_cut'] = (df['water_volume'] / total_liquid).fillna(0.0).infer_objects(copy=False)
 
     # 3. Gas-Oil Ratio
     if 'gas_volume' in df.columns and 'oil_volume' in df.columns:
         denom = df['oil_volume'].replace(0, np.nan)
-        df['gas_oil_ratio'] = (df['gas_volume'] / denom).fillna(0.0)
+        df['gas_oil_ratio'] = (df['gas_volume'] / denom).fillna(0.0).infer_objects(copy=False)
 
     # 4. Pressure Differential (Casing - Tubing)
     if 'casing_pressure' in df.columns and 'tubing_pressure' in df.columns:
@@ -183,8 +183,8 @@ def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], targ
         if not valid_feats:
             return []
             
-        X = df[valid_feats].fillna(0)
-        y = df[target_col].fillna(0)
+        X = df[valid_feats].fillna(0).infer_objects(copy=False)
+        y = df[target_col].fillna(0).infer_objects(copy=False)
         
         # Train lightweight RF
         rf = RandomForestRegressor(n_estimators=50, max_depth=5, n_jobs=-1, random_state=42)

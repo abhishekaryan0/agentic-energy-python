@@ -33,6 +33,16 @@ from anomaly_review.config import (
     MONTHLY_DECLINE_MIN_PCT,
     PATTERN_SHIFT_MULTIPLIER,
     PATTERN_SHIFT_MIN_EVENTS,
+    PATTERN_SHIFT_SHUTDOWN_AMPS_MAX,
+    PATTERN_SHIFT_MIN_SHUTDOWN_HOURS,
+    PATTERN_SHIFT_BASELINE_DAYS,
+    PATTERN_SHIFT_RECENT_DAYS,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP,
+    PATTERN_SHIFT_PRESSURE_SPIKE_ABOVE_BASELINE_RATIO,
+    PATTERN_SHIFT_FILLAGE_DROP_BELOW_BASELINE_RATIO,
+    PATTERN_SHIFT_SPM_DROP_BELOW,
     DATA_MISMATCH_AMPS_ACTIVE_MIN,
     DATA_MISMATCH_ZERO_VOL_MAX,
     DATA_MISMATCH_BASELINE_VOL_MIN,
@@ -497,6 +507,7 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
             DETECTION TYPE: Pressure Volatility
             VOLATILITY (CV): {cv:.1f}% (High)
             STD DEV: {tp_std:.1f} psi (Mean Pressure: {tp_avg:.0f} psi)
+            CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day
             """
 
             return {
@@ -524,61 +535,144 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
     return None
 
 
+def _count_events_min_hours(series: pd.Series, min_hours: int) -> int:
+    """
+    Count contiguous runs where value is True, only if run length >= min_hours.
+    Use this so we don't count sensor glitches (e.g. 1 hour of 0) as shutdown;
+    only sustained low reading (e.g. 4+ or 24+ hours) counts as one event.
+    """
+    if series.empty or not series.any():
+        return 0
+    padded = np.concatenate([[False], series.values.astype(bool), [False]])
+    diff = np.diff(padded.astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    if len(starts) != len(ends):
+        return 0
+    lengths = ends - starts
+    if min_hours < 1:
+        return len(lengths)
+    return int(np.sum(lengths >= min_hours))
+
+
 def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[Dict]:
     """
-    Detects change in operational pattern frequency.
-    Checks frequency of 'Shutdowns' (Amps == 0) in last 30d vs previous.
+    Detects change in operational pattern by comparing counts: e.g. "it used to happen
+    once (in baseline window), now it happened 3 times (in recent window)". When the
+    anomaly happened (calendar date) does not matter; the count does.
+
+    Shutdown: We only count "shutdown" when motor_current is low for at least 24 hours
+    (PATTERN_SHIFT_MIN_SHUTDOWN_HOURS). So sensor down for a day = one event; brief
+    glitch or hourly blip does not count.
+
+    Baseline = previous PATTERN_SHIFT_BASELINE_DAYS (90d). Recent = last PATTERN_SHIFT_RECENT_DAYS (30d).
+    We compare event counts (recent count vs baseline count normalized to per-30d).
     """
     if full_df is None or 'motor_current' not in full_df.columns:
         return None
-        
-    # Define "Event": Motor Current < 1.0 (Shutdown)
-    full_df['is_shutdown'] = full_df['motor_current'] < 1.0
-    
-    # Last 30 days
-    last_30_start = full_df['timestamp'].max() - pd.Timedelta(days=30)
-    recent = full_df[full_df['timestamp'] >= last_30_start]
-    
-    # Previous window (30d to 120d ago)
-    prev_start = last_30_start - pd.Timedelta(days=90)
-    previous = full_df[(full_df['timestamp'] < last_30_start) & (full_df['timestamp'] >= prev_start)]
-    
-    recent_count = recent['is_shutdown'].sum()
-    prev_count_avg = previous['is_shutdown'].sum() / 3 # Monthly avg over 3 months
-    
-    # Trigger: recent events clearly above baseline (configurable "unusual" multiplier)
-    if recent_count >= PATTERN_SHIFT_MIN_EVENTS and recent_count > (prev_count_avg * PATTERN_SHIFT_MULTIPLIER):
-        increase_pct = ((recent_count - prev_count_avg) / prev_count_avg) * 100 if prev_count_avg > 0 else 100
-        
+
+    full_df = full_df.sort_values('timestamp').copy()
+    last_ts = full_df['timestamp'].max()
+    recent_start = last_ts - pd.Timedelta(days=PATTERN_SHIFT_RECENT_DAYS)
+    prev_start = recent_start - pd.Timedelta(days=PATTERN_SHIFT_BASELINE_DAYS)
+    baseline_label = f"previous {PATTERN_SHIFT_BASELINE_DAYS}d"
+
+    # Add derived columns to full_df before slicing so recent/previous have them
+    full_df['is_shutdown'] = full_df['motor_current'] < PATTERN_SHIFT_SHUTDOWN_AMPS_MAX
+    if 'tubing_pressure' in full_df.columns:
+        tp_median = full_df['tubing_pressure'].median()
+        thresh = tp_median * PATTERN_SHIFT_PRESSURE_SPIKE_ABOVE_BASELINE_RATIO
+        full_df['is_pressure_spike'] = full_df['tubing_pressure'] > thresh
+    if 'pump_fillage' in full_df.columns:
+        fill_median = full_df['pump_fillage'].median()
+        thresh = fill_median * PATTERN_SHIFT_FILLAGE_DROP_BELOW_BASELINE_RATIO
+        full_df['is_fillage_drop'] = full_df['pump_fillage'] < thresh
+    if 'strokes_per_minute' in full_df.columns:
+        full_df['is_spm_drop'] = full_df['strokes_per_minute'] < PATTERN_SHIFT_SPM_DROP_BELOW
+
+    recent = full_df[full_df['timestamp'] >= recent_start]
+    previous = full_df[(full_df['timestamp'] < recent_start) & (full_df['timestamp'] >= prev_start)]
+
+    # 1) Shutdown: only count when low amps last >= 24h (sensor down for a day)
+    recent_shutdown = _count_events_min_hours(recent['is_shutdown'], PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
+    prev_shutdown = _count_events_min_hours(previous['is_shutdown'], PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
+    prev_shutdown_per_30d = prev_shutdown / 3.0  # 90d = 3 × 30d
+
+    # 2) Pressure spike, fillage drop, SPM drop (sustained events)
+    events_detected = []
+    if 'is_pressure_spike' in full_df.columns:
+        r_ps = _count_events_min_hours(recent['is_pressure_spike'], PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE)
+        p_ps = _count_events_min_hours(previous['is_pressure_spike'], PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE)
+        p_ps_per = p_ps / 3.0
+        if r_ps >= 1 and (p_ps_per == 0 or r_ps > PATTERN_SHIFT_MULTIPLIER * p_ps_per):
+            events_detected.append(("pressure spike", r_ps, p_ps_per))
+    if 'is_fillage_drop' in full_df.columns:
+        r_fd = _count_events_min_hours(recent['is_fillage_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP)
+        p_fd = _count_events_min_hours(previous['is_fillage_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP)
+        p_fd_per = p_fd / 3.0
+        if r_fd >= 1 and (p_fd_per == 0 or r_fd > PATTERN_SHIFT_MULTIPLIER * p_fd_per):
+            events_detected.append(("fillage drop", r_fd, p_fd_per))
+    if 'is_spm_drop' in full_df.columns:
+        r_spm = _count_events_min_hours(recent['is_spm_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP)
+        p_spm = _count_events_min_hours(previous['is_spm_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP)
+        p_spm_per = p_spm / 3.0
+        if r_spm >= 1 and (p_spm_per == 0 or r_spm > PATTERN_SHIFT_MULTIPLIER * p_spm_per):
+            events_detected.append(("SPM drop", r_spm, p_spm_per))
+
+    # Estimate operational risk impact (so every anomaly has a non-zero impact for UI/clarity)
+    recent_oil = float(recent["oil_volume"].mean()) if "oil_volume" in recent.columns and not recent["oil_volume"].empty else 0.0
+    pattern_impact = recent_oil * 0.10 * OIL_PRICE if recent_oil > 0 else 50.0 * OIL_PRICE  # 10% risk or ~$3750 placeholder
+    impact_label = f"${format_number(pattern_impact)}/day (Operational Risk)" if pattern_impact > 0 else "Operational Review"
+
+    # Trigger on shutdown increase (sustained events only)
+    shutdown_trigger = recent_shutdown >= 1 and (
+        (prev_shutdown_per_30d == 0 and recent_shutdown >= PATTERN_SHIFT_MIN_EVENTS)
+        or (prev_shutdown_per_30d > 0 and recent_shutdown > PATTERN_SHIFT_MULTIPLIER * prev_shutdown_per_30d)
+    )
+    if shutdown_trigger:
+        increase_pct = ((recent_shutdown - prev_shutdown_per_30d) / prev_shutdown_per_30d) * 100 if prev_shutdown_per_30d > 0 else 100
+        event_desc = "Pump shutdowns (sustained low amps ≥{}h)".format(PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
         data_summary = f"""
-        DETECTION TYPE: Recurring Operational Events
-        EVENT: Pump Shutdowns
-        RECENT COUNT (30d): {recent_count}
-        HISTORICAL AVG: {prev_count_avg:.1f} per month
-        FREQUENCY CHANGE: +{increase_pct:.0f}%
+        DETECTION TYPE: Operational pattern change (event frequency)
+        EVENT: {event_desc}
+        RECENT (30d): {recent_shutdown} event(s)
+        BASELINE ({baseline_label}): {prev_shutdown_per_30d:.2f} per 30d
+        CHANGE: Activity that was rare is now happening more often (e.g. twice a year → monthly).
+        CALCULATED_REVENUE_LOSS: ${format_number(pattern_impact)}/day (operational risk estimate)
         """
-        
+        if events_detected:
+            data_summary += "\n        Also increased: " + ", ".join(f"{n} (recent {r}, baseline {p:.1f})" for n, r, p in events_detected)
         return {
             "code": "PATTERN_SHIFT",
             "category": "OPERATIONAL",
-            "raw_data": data_summary,
-            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': 0},
-            "impact_value": 0,
-            "impact_payload": {
-                "financial": {"value": 0, "label": "Operational Review"},
-                "production": {"value": 0, "label": "N/A"}
-            },
-            "chart_metric": "mechanical_failure_view", # Visualize amps
-            "diagnosis": {
-                "type": "Recurring Operational Events",
-                "confidence": "High",
-                "indicators": f"Shutdowns jumped to {recent_count}/mo from {prev_count_avg:.1f}/mo"
-            },
-            "chart_payload": {
-                "recent_count": recent_count,
-                "historical_avg": prev_count_avg,
-                "increase_pct": increase_pct
-            }
+            "raw_data": data_summary.strip(),
+            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
+            "impact_value": pattern_impact,
+            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "chart_metric": "mechanical_failure_view",
+            "diagnosis": {"type": "Recurring Operational Events", "confidence": "High", "indicators": f"Shutdown: {recent_shutdown}/30d vs {prev_shutdown_per_30d:.2f}/30d"},
+            "chart_payload": {"recent_count": recent_shutdown, "historical_avg": prev_shutdown_per_30d, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
+        }
+    # Trigger on other event types only (no shutdown increase)
+    if events_detected:
+        name, r, p = events_detected[0]
+        increase_pct = ((r - p) / p) * 100 if p > 0 else 100
+        data_summary = f"""
+        DETECTION TYPE: Operational pattern change
+        EVENT: {name} (sustained events)
+        RECENT (30d): {r} | BASELINE ({baseline_label}): {p:.1f} per 30d
+        CALCULATED_REVENUE_LOSS: ${format_number(pattern_impact)}/day (operational risk estimate)
+        Also: """ + ", ".join(f"{n}=recent {r2}" for n, r2, _ in events_detected)
+        return {
+            "code": "PATTERN_SHIFT",
+            "category": "OPERATIONAL",
+            "raw_data": data_summary.strip(),
+            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
+            "impact_value": pattern_impact,
+            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "chart_metric": "mechanical_failure_view",
+            "diagnosis": {"type": "Recurring Operational Events", "confidence": "Moderate", "indicators": f"Increased: {', '.join(e[0] for e in events_detected)}"},
+            "chart_payload": {"recent_count": r, "historical_avg": p, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
         }
     return None
 

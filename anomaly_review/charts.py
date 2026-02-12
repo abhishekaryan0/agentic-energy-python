@@ -278,7 +278,11 @@ def generate_mechanical_failure_chart(
     daily_df, labels = prepare_daily_aggregation(df, days=30, custom_agg=custom_agg)
 
     oil_data = pd.to_numeric(daily_df["oil_volume"], errors="coerce").fillna(0).round(1).tolist()
-    if "motor_current" in daily_df.columns:
+    use_motor = (
+        "motor_current" in daily_df.columns
+        and pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0).gt(0).any()
+    )
+    if use_motor:
         sensor_data = pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0).round(1).tolist()
         sensor_label = "Peak motor current (A)"
         sensor_color = CHART_COLORS["alert"]
@@ -618,6 +622,16 @@ def generate_pattern_shift_chart(
     if "tubing" in anomaly_data.lower() or "pressure" in anomaly_data.lower():
         sensor_col = "tubing_pressure"
         sensor_label = "Peak tubing pressure (psi)"
+    # If motor_current is present but all zeros, use tubing_pressure for a meaningful chart
+    if (
+        sensor_col == "motor_current"
+        and "motor_current" in daily_df.columns
+        and "tubing_pressure" in daily_df.columns
+    ):
+        mc_series = pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0)
+        if not mc_series.gt(0).any():
+            sensor_col = "tubing_pressure"
+            sensor_label = "Peak tubing pressure (psi)"
 
     sensor_data = (
         pd.to_numeric(daily_df[sensor_col], errors="coerce").fillna(0).round(1).tolist()
