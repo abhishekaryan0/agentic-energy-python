@@ -1,33 +1,33 @@
 {
   "ESP": {
     "isolation_forest": {
-      "precision": 0.8196106705118962,
-      "recall": 0.8165493463582818,
-      "f1": 0.818077144502015,
-      "true_positives": 5684,
-      "false_positives": 1251,
-      "false_negatives": 1277,
-      "true_negatives": 61393,
-      "auc_roc": 0.011790183499389505
+      "precision": 0.9514018691588785,
+      "recall": 0.9640151515151515,
+      "f1": 0.9576669802445907,
+      "true_positives": 509,
+      "false_positives": 26,
+      "false_negatives": 19,
+      "true_negatives": 4726,
+      "auc_roc": 0.0007532713498622604
     },
     "statistical": {
-      "precision": 0.6868686868686869,
-      "recall": 0.019537422784082745,
-      "f1": 0.037994133258835036,
-      "true_positives": 136,
-      "false_positives": 62,
-      "false_negatives": 6825,
-      "true_negatives": 62582,
-      "auc_roc": 0.8848351510460082
+      "precision": 1.0,
+      "recall": 0.2746212121212121,
+      "f1": 0.4309063893016345,
+      "true_positives": 145,
+      "false_positives": 0,
+      "false_negatives": 383,
+      "true_negatives": 4752,
+      "auc_roc": 0.9698619719926538
     },
     "lstm": {
-      "test_mse": 0.005038182716816664,
+      "test_mse": 0.0168750137090683,
       "epochs": 20,
       "seq_len": 10,
       "input_dim": 23
     },
-    "training_samples": 278419,
-    "test_samples": 69605,
+    "training_samples": 21120,
+    "test_samples": 5280,
     "features": [
       "motor_temp",
       "motor_current",
@@ -53,37 +53,37 @@
       "acceleration_ramp_time",
       "cycle"
     ],
-    "timestamp": "2026-02-03T12:35:01.002888"
+    "timestamp": "2026-02-13T12:39:12.503637"
   },
   "Gas Lift": {
     "isolation_forest": {
-      "precision": 0.8009532888465205,
-      "recall": 0.8047892720306513,
-      "f1": 0.8028666985188724,
-      "true_positives": 4201,
-      "false_positives": 1044,
-      "false_negatives": 1019,
-      "true_negatives": 45939,
-      "auc_roc": 0.013806526417030437
+      "precision": 0.9530075187969925,
+      "recall": 0.9602272727272727,
+      "f1": 0.9566037735849057,
+      "true_positives": 507,
+      "false_positives": 25,
+      "false_negatives": 21,
+      "true_negatives": 4727,
+      "auc_roc": 0.0009437812468115505
     },
     "statistical": {
-      "precision": 0.5588235294117647,
-      "recall": 0.0072796934865900385,
-      "f1": 0.014372163388804841,
-      "true_positives": 38,
-      "false_positives": 30,
-      "false_negatives": 5182,
-      "true_negatives": 46953,
-      "auc_roc": 0.9149909036145217
+      "precision": 1.0,
+      "recall": 0.08712121212121213,
+      "f1": 0.1602787456445993,
+      "true_positives": 46,
+      "false_positives": 0,
+      "false_negatives": 482,
+      "true_negatives": 4752,
+      "auc_roc": 0.9795452951229466
     },
     "lstm": {
-      "test_mse": 0.000684811151586473,
+      "test_mse": 0.011659902520477772,
       "epochs": 20,
       "seq_len": 10,
       "input_dim": 20
     },
-    "training_samples": 208812,
-    "test_samples": 52203,
+    "training_samples": 21120,
+    "test_samples": 5280,
     "features": [
       "injection_rate",
       "injection_temperature",
@@ -106,37 +106,37 @@
       "well_close",
       "velocity_limit"
     ],
-    "timestamp": "2026-02-03T12:47:58.736126"
+    "timestamp": "2026-02-13T12:39:52.846931"
   },
   "Rod Pump": {
     "isolation_forest": {
-      "precision": 0.8567335243553008,
-      "recall": 0.8590308370044053,
-      "f1": 0.8578806426931905,
-      "true_positives": 4485,
-      "false_positives": 750,
-      "false_negatives": 736,
-      "true_negatives": 46234,
-      "auc_roc": 0.007048404338880434
+      "precision": 0.9199255121042831,
+      "recall": 0.9356060606060606,
+      "f1": 0.927699530516432,
+      "true_positives": 494,
+      "false_positives": 43,
+      "false_negatives": 34,
+      "true_negatives": 4709,
+      "auc_roc": 0.0024993463677175794
     },
     "statistical": {
-      "precision": 0.9748953974895398,
-      "recall": 0.04462746600268148,
-      "f1": 0.08534798534798535,
-      "true_positives": 233,
-      "false_positives": 6,
-      "false_negatives": 4988,
-      "true_negatives": 46978,
-      "auc_roc": 0.8237965730479859
+      "precision": 1.0,
+      "recall": 0.2537878787878788,
+      "f1": 0.40483383685800606,
+      "true_positives": 134,
+      "false_positives": 0,
+      "false_negatives": 394,
+      "true_negatives": 4752,
+      "auc_roc": 0.9789418809305173
     },
     "lstm": {
-      "test_mse": 0.33940058946609497,
+      "test_mse": 0.008721429854631424,
       "epochs": 20,
       "seq_len": 10,
       "input_dim": 19
     },
-    "training_samples": 208820,
-    "test_samples": 52205,
+    "training_samples": 21120,
+    "test_samples": 5280,
     "features": [
       "strokes_per_minute",
       "torque",
@@ -158,6 +158,6 @@
       "pump_depth",
       "idle_time_setpoint"
     ],
-    "timestamp": "2026-02-03T13:02:07.150336"
+    "timestamp": "2026-02-13T12:40:26.428774"
   }
 }
