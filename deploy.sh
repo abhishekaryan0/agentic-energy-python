@@ -26,12 +26,16 @@ echo "4) Push to ECR..."
 docker push "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
 
 echo "5) Register new task definition revision..."
-aws ecs register-task-definition --cli-input-json file://"$TASK_DEF_FILE" --region "$REGION"
+aws ecs register-task-definition --cli-input-json file://"$TASK_DEF_FILE" --region "$REGION" --output text --query 'taskDefinition.revision'
 
 echo "6) Force ECS service redeploy..."
-aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --region "$REGION"
+aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --region "$REGION" --output text --query 'service.deployments[0].status'
 
-echo "7) Tail deployment logs (CTRL+C to exit)..."
+echo ""
+echo "7) Tailing deployment logs (press CTRL+C to stop and finish)..."
+echo "   Deployment is in progress; new tasks may take 1–2 minutes to appear."
+echo ""
 aws logs tail "$LOG_GROUP" --region "$REGION" --follow
 
 echo "Done."
+

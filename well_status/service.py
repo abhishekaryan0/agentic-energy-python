@@ -13,7 +13,7 @@ Run this service periodically (e.g., every hour via cron) to update well statuse
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
@@ -149,12 +149,15 @@ def get_all_wells() -> List[Dict]:
         conn.close()
 
 
-def get_anomaly_counts(well_id: str, hours: int = 24) -> Tuple[int, int]:
+def get_anomaly_counts(well_id: str, hours: int = 24, conn=None) -> Tuple[int, int]:
     """
     Get anomaly counts for a well in the last N hours.
-    Returns (total_count, critical_count)
+    Returns (total_count, critical_count).
+    If conn is provided, use it and do not close it (caller owns it).
     """
-    conn = get_snowflake_connection()
+    own_conn = conn is None
+    if conn is None:
+        conn = get_snowflake_connection()
     cursor = conn.cursor()
     
     try:
@@ -179,7 +182,8 @@ def get_anomaly_counts(well_id: str, hours: int = 24) -> Tuple[int, int]:
         return (0, 0)
     finally:
         cursor.close()
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def calculate_idle_score(well: Dict, lift_type: str) -> Tuple[int, List[str]]:
@@ -246,7 +250,7 @@ def determine_well_status(well: Dict) -> Tuple[str, str]:
         return ('SHUTDOWN', 'No sensor readings found')
     
     # Calculate hours since last reading
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     if isinstance(last_timestamp, str):
         try:
             last_timestamp = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
@@ -277,11 +281,14 @@ def determine_well_status(well: Dict) -> Tuple[str, str]:
     return ('RUNNING', f'Normal operation, last reading {hours_since_reading:.1f} hours ago')
 
 
-def update_well_status(well_id: str, status: str, reason: str, well_data: Dict):
+def update_well_status(well_id: str, status: str, reason: str, well_data: Dict, conn=None):
     """
     Update or insert well status in WELL_STATUS table.
+    If conn is provided, use it and do not close it (caller owns it).
     """
-    conn = get_snowflake_connection()
+    own_conn = conn is None
+    if conn is None:
+        conn = get_snowflake_connection()
     cursor = conn.cursor()
     
     try:
@@ -289,7 +296,7 @@ def update_well_status(well_id: str, status: str, reason: str, well_data: Dict):
         last_timestamp = well_data.get('last_reading_timestamp')
         reading_age_hours = None
         if last_timestamp:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             if isinstance(last_timestamp, str):
                 try:
                     last_timestamp = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
@@ -299,8 +306,8 @@ def update_well_status(well_id: str, status: str, reason: str, well_data: Dict):
                 last_timestamp = last_timestamp.replace(tzinfo=None)
             reading_age_hours = (now - last_timestamp).total_seconds() / 3600
         
-        # Get anomaly counts
-        anomaly_count, critical_count = get_anomaly_counts(well_id, 24)
+        # Get anomaly counts (reuse conn if provided)
+        anomaly_count, critical_count = get_anomaly_counts(well_id, 24, conn=conn)
         
         # Use MERGE to upsert
         merge_query = """
@@ -364,7 +371,8 @@ def update_well_status(well_id: str, status: str, reason: str, well_data: Dict):
         conn.rollback()
     finally:
         cursor.close()
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def get_well_status(well_id: str) -> Optional[Dict]:
@@ -443,6 +451,7 @@ def update_all_well_statuses():
     """
     Main function to update status for all wells.
     Should be run periodically (e.g., hourly via cron).
+    Reuses a single Snowflake connection for the whole batch to avoid slowness.
     """
     logger.info("=" * 50)
     logger.info("Starting well status update job")
@@ -455,12 +464,15 @@ def update_all_well_statuses():
         return
     
     status_counts = {'RUNNING': 0, 'IDLE': 0, 'SHUTDOWN': 0}
-    
-    for well in wells:
-        well_id = well.get('well_id')
-        status, reason = determine_well_status(well)
-        update_well_status(well_id, status, reason, well)
-        status_counts[status] = status_counts.get(status, 0) + 1
+    conn = get_snowflake_connection()
+    try:
+        for well in wells:
+            well_id = well.get('well_id')
+            status, reason = determine_well_status(well)
+            update_well_status(well_id, status, reason, well, conn=conn)
+            status_counts[status] = status_counts.get(status, 0) + 1
+    finally:
+        conn.close()
     
     logger.info("=" * 50)
     logger.info("Well status update complete")
@@ -521,7 +533,7 @@ def run_scheduler(interval_hours: int = 24):
             update_all_well_statuses()
             
             # Log next run time
-            next_run = datetime.utcnow() + timedelta(hours=interval_hours)
+            next_run = datetime.now(timezone.utc) + timedelta(hours=interval_hours)
             logger.info(f"Next automatic run scheduled at: {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
             # Sleep until next run
