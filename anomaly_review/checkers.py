@@ -743,18 +743,26 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
     
     Triggers when reconstruction error exceeds threshold.
     """
-    # Goldilocks Filter: Ignore massive errors (Sensor Failures)
-    # If error is > 10x the threshold, it's likely a sensor blowout, not a subtle pattern.
-    ceiling = threshold * 10
-    
-    if threshold < reconstruction_error < ceiling:
-        severity_score = min(100, (reconstruction_error / threshold) * 50)
+    if reconstruction_error is None:
+        return None
+    try:
+        rec_error = float(reconstruction_error)
+    except (TypeError, ValueError):
+        return None
+    if rec_error != rec_error:  # NaN
+        return None
+    # Goldilocks Filter: Ignore only absurdly massive errors (sensor blowout).
+    # Use a large multiple so normal "high" errors (e.g. 25k when threshold=95) still get flagged.
+    ceiling = threshold * 1000
+
+    if threshold < rec_error < ceiling:
+        severity_score = min(100, (rec_error / threshold) * 50)
         oil_loss = ctx.get('oil_avg_7d', 0) * 0.2  # Assume 20% risk
         revenue_loss = oil_loss * OIL_PRICE
-        
+
         data_summary = f"""
         DETECTION TYPE: ML Pattern Anomaly (Autoencoder)
-        ERROR: {reconstruction_error:.4f} (Threshold: {threshold:.4f})
+        ERROR: {rec_error:.4f} (Threshold: {threshold:.4f})
         ROOT CAUSE: Unsupervised model detected a sensor pattern deviation not covered by standard physics rules.
         """
         
@@ -772,11 +780,11 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
             "diagnosis": {
                 "type": "ML Pattern Anomaly",
                 "confidence": "Low",
-                "indicators": f"Reconstruction Error {reconstruction_error:.2f} > {threshold:.2f}"
+                "indicators": f"Reconstruction Error {rec_error:.2f} > {threshold:.2f}"
             },
             "chart_payload": {
                 "threshold": threshold,
-                "reconstruction_error": reconstruction_error
+                "reconstruction_error": rec_error
             }
         }
     return None

@@ -8,13 +8,15 @@ import random
 from datetime import datetime, timedelta
 
 # Same Snowflake / .env setup as generate_sample_data.py
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.isfile(_env_path):
-    from dotenv import load_dotenv
-    load_dotenv(_env_path)
+# Same Snowflake / .env setup as generate_sample_data.py
 _sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _sys_root not in sys.path:
     sys.path.insert(0, _sys_root)
+
+_env_path = os.path.join(_sys_root, ".env")
+if os.path.isfile(_env_path):
+    from dotenv import load_dotenv
+    load_dotenv(_env_path)
 
 # --- CONFIGURATION ---
 START_DATE = datetime(2014, 1, 1)
@@ -264,6 +266,21 @@ def generate_well_timeline(well):
     })
 
 # --- 4. SNOWFLAKE UPLOAD (same tables as generate_sample_data.py) ---
+# BOE = Barrel of Oil Equivalent. Client formula: BOE = (bbl oil) + (mcf gas / 6)
+# Example: 20 bbl oil + 372 mcf gas -> BOE = 20 + 62 = 82
+def compute_boe(oil_bbl, gas_mcf):
+    """BOE = oil (bbl) + gas (mcf) / 6."""
+    try:
+        return round(float(oil_bbl or 0) + float(gas_mcf or 0) / 6.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+# Twin data we have but do NOT insert (no matching DB column or not yet used):
+# - facility_id (prod table has no facility_id)
+# - test_oil, test_water, test_gas (periodic test data; prod table has no test columns)
+# - notes (free text; could go to a separate table or well_sensor_readings if added)
+# We now insert: boe (prod), well_status + stroke lengths (sensor) when columns exist.
+
 # Map digital twin column names -> well_sensor_readings field names (snake_case)
 TWIN_TO_SENSOR_COL = {
     "avg_tubing_pressure": "tubing_pressure",
@@ -275,6 +292,8 @@ TWIN_TO_SENSOR_COL = {
     "motor_temp_f": "motor_temp",
     "freq_hz": "freq_hz",  # use as-is if DB has it; else try "frequency"
     "injection_rate_mcf": "injection_rate",
+    "gross_stroke_len": "surface_stroke_length",   # Rod Pump surface stroke
+    "net_stroke_len": "downhole_net_stroke",       # Rod Pump downhole net stroke
 }
 
 def _clean_val(val):
@@ -285,11 +304,26 @@ def _clean_val(val):
     except (TypeError, ValueError):
         return None
 
+def _get_table_columns(cursor, database, schema, table_name):
+    """Return list of column names (lowercase) for the table, in order."""
+    cursor.execute("""
+        SELECT LOWER(COLUMN_NAME) AS col
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE LOWER(TABLE_CATALOG) = LOWER(%s)
+          AND LOWER(TABLE_SCHEMA) = LOWER(%s)
+          AND LOWER(TABLE_NAME) = LOWER(%s)
+        ORDER BY ORDINAL_POSITION
+    """, (database, schema, table_name))
+    return [row[0] for row in cursor.fetchall()]
+
+
 def upload_to_snowflake(master_df, well_meta):
-    """Insert digital twin data into well_daily_production and well_sensor_readings."""
+    """Insert digital twin data into well_daily_production and well_sensor_readings.
+    Uses only columns that exist in the DB so it works when not all columns are present.
+    Run scripts/sync_snowflake_schema.py first to add missing columns if needed.
+    """
     try:
         from snowflake.connector import connect as snowflake_connect
-        from config.sensor_config import get_all_sensor_columns
     except Exception as e:
         print(f"Cannot upload to Snowflake: {e}")
         return
@@ -307,50 +341,91 @@ def upload_to_snowflake(master_df, well_meta):
         print("Snowflake credentials not set (.env). Skipping upload.")
         return
 
-    try:
-        all_columns = get_all_sensor_columns()
-    except Exception:
-        all_columns = [
-            "well_id", "timestamp", "lift_type",
-            "strokes_per_minute", "torque", "polish_rod_load", "pump_fillage", "tubing_pressure",
-            "motor_temp", "motor_current", "discharge_pressure", "pump_intake_pressure", "motor_voltage",
-            "injection_rate", "injection_temperature", "bottomhole_pressure", "injection_pressure", "cycle_time",
-            "surface_pressure", "casing_pressure", "wellhead_temp",
-        ]
-
     conn = snowflake_connect(**SNOWFLAKE_CONFIG)
     cursor = conn.cursor()
+    db = SNOWFLAKE_CONFIG.get("database", "AT_RISK_ASSETS")
+    schema = SNOWFLAKE_CONFIG.get("schema", "SENSOR_DATA")
 
     try:
+        # Use actual DB columns so we don't require columns that don't exist
+        prod_columns = _get_table_columns(cursor, db, schema, "WELL_DAILY_PRODUCTION")
+        sensor_columns = _get_table_columns(cursor, db, schema, "WELL_SENSOR_READINGS")
+
+        # Exclude auto/system columns from insert (order matches twin data)
+        _prod_col_order = [
+            "well_id", "date", "oil_volume", "gas_volume", "water_volume", "boe", "lift_type",
+            "status", "notes", "test_oil", "test_water", "test_gas", "facility_id",
+        ]
+        insert_prod_cols = [c for c in _prod_col_order if c in prod_columns]
+        if not insert_prod_cols:
+            print("ERROR: well_daily_production has no insertable columns. Run sync_snowflake_schema.py or create table.")
+            return
+
+        # Sensor: use only columns that exist in the table (order preserved)
+        insert_sensor_cols = [c for c in sensor_columns if c not in ("id", "created_at")]
+        if not insert_sensor_cols:
+            print("ERROR: well_sensor_readings has no insertable columns.")
+            return
+
+        print(f"Production columns for insert: {insert_prod_cols}")
+        print(f"Sensor columns for insert: {len(insert_sensor_cols)} (first 10: {insert_sensor_cols[:10]}...)")
+
         print("Clearing previous data in well_daily_production and well_sensor_readings...")
         cursor.execute("DELETE FROM well_daily_production")
         cursor.execute("DELETE FROM well_sensor_readings")
 
-        # --- Daily production (same schema as generate_sample_data) ---
+        # --- Daily production: only insert into columns that exist ---
         daily_tuples = []
         for _, row in master_df.iterrows():
-            daily_tuples.append((
-                row["asset_id"],
-                row["date"].strftime("%Y-%m-%d"),
-                _clean_val(row["true_oil"]) or 0,
-                _clean_val(row["true_gas"]) or 0,
-                _clean_val(row["true_water"]) or 0,
-                row["lift_type"],
-            ))
-        cursor.executemany("""
-            INSERT INTO well_daily_production
-            (well_id, date, oil_volume, gas_volume, water_volume, lift_type)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, daily_tuples)
+            oil = _clean_val(row["true_oil"]) or 0
+            gas = _clean_val(row["true_gas"]) or 0
+            boe = compute_boe(oil, gas)
+            # Build tuple in same order as insert_prod_cols
+            vals = []
+            for col in insert_prod_cols:
+                if col == "well_id":
+                    vals.append(row["asset_id"])
+                elif col == "date":
+                    vals.append(row["date"].strftime("%Y-%m-%d"))
+                elif col == "oil_volume":
+                    vals.append(oil)
+                elif col == "gas_volume":
+                    vals.append(gas)
+                elif col == "water_volume":
+                    vals.append(_clean_val(row["true_water"]) or 0)
+                elif col == "boe":
+                    vals.append(boe)
+                elif col == "lift_type":
+                    vals.append(row["lift_type"])
+                elif col == "status":
+                    vals.append(str(row["status"]) if row.get("status") else None)
+                elif col == "notes":
+                    vals.append(str(row["notes"])[:500] if row.get("notes") else None)
+                elif col == "test_oil":
+                    vals.append(_clean_val(row.get("test_oil")))
+                elif col == "test_water":
+                    vals.append(_clean_val(row.get("test_water")))
+                elif col == "test_gas":
+                    vals.append(_clean_val(row.get("test_gas")))
+                elif col == "facility_id":
+                    vals.append(str(row["facility_id"]) if row.get("facility_id") else None)
+                else:
+                    vals.append(None)
+            daily_tuples.append(tuple(vals))
+
+        placeholders_prod = ", ".join(["%s"] * len(insert_prod_cols))
+        cursor.executemany(
+            f"INSERT INTO well_daily_production ({', '.join(insert_prod_cols)}) VALUES ({placeholders_prod})",
+            daily_tuples,
+        )
         print(f"  Inserted {len(daily_tuples):,} daily production records.")
 
-        # --- Hourly sensor readings: 24 rows per well per day (daily value repeated) ---
-        # Build mapping: twin col -> list of possible DB col names
+        # --- Hourly sensor readings: only columns that exist in DB ---
         twin_to_db = {}
         for twin_col, db_col in TWIN_TO_SENSOR_COL.items():
-            if db_col in all_columns:
+            if db_col in insert_sensor_cols:
                 twin_to_db[twin_col] = db_col
-            elif twin_col == "freq_hz" and "frequency" in all_columns:
+            elif twin_col == "freq_hz" and "frequency" in insert_sensor_cols:
                 twin_to_db[twin_col] = "frequency"
 
         sensor_rows = []
@@ -358,32 +433,33 @@ def upload_to_snowflake(master_df, well_meta):
             base_ts = pd.Timestamp(row["date"])
             for hour in range(24):
                 ts = (base_ts + pd.Timedelta(hours=hour)).strftime("%Y-%m-%d %H:%M:%S")
-                rec = {"well_id": row["asset_id"], "timestamp": ts, "lift_type": row["lift_type"]}
-                for col in all_columns:
-                    if col in rec:
-                        continue
-                    rec[col] = None
+                rec = {col: None for col in insert_sensor_cols}
+                rec["well_id"] = row["asset_id"]
+                rec["timestamp"] = ts
+                rec["lift_type"] = row["lift_type"]
                 for twin_col, db_col in twin_to_db.items():
                     if twin_col in row.index:
                         val = _clean_val(row[twin_col])
                         if val is not None:
                             rec[db_col] = val
-                if row["lift_type"] == "Gas Lift" and "injection_pressure" in all_columns and rec.get("injection_pressure") is None:
+                if row["lift_type"] == "Gas Lift" and "injection_pressure" in insert_sensor_cols and rec.get("injection_pressure") is None:
                     rec["injection_pressure"] = _clean_val(row.get("avg_casing_pressure"))
+                if "well_status" in insert_sensor_cols and row.get("status"):
+                    rec["well_status"] = str(row["status"])
                 sensor_rows.append(rec)
 
         batch_size = 5000
-        placeholders = ", ".join(["%s"] * len(all_columns))
+        placeholders = ", ".join(["%s"] * len(insert_sensor_cols))
         for i in range(0, len(sensor_rows), batch_size):
             batch = sensor_rows[i : i + batch_size]
-            data_tuples = [tuple(r.get(c) for c in all_columns) for r in batch]
+            data_tuples = [tuple(r.get(c) for c in insert_sensor_cols) for r in batch]
             cursor.executemany(
-                f"INSERT INTO well_sensor_readings ({', '.join(all_columns)}) VALUES ({placeholders})",
+                f"INSERT INTO well_sensor_readings ({', '.join(insert_sensor_cols)}) VALUES ({placeholders})",
                 data_tuples,
             )
             print(f"  Sensor batch {i // batch_size + 1}: {min(i + batch_size, len(sensor_rows)):,} / {len(sensor_rows):,}")
         conn.commit()
-        print("SUCCESS: Digital twin data uploaded to Snowflake (same tables as generate_sample_data).")
+        print("SUCCESS: Digital twin data uploaded to Snowflake.")
     except Exception as e:
         conn.rollback()
         print(f"ERROR during Snowflake upload: {e}")

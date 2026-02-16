@@ -302,8 +302,9 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                         model_art.get('threshold', 0.5)
                     )
                     if not ae_results.empty:
-                         full_df['reconstruction_error'] = ae_results['reconstruction_error']
-                         autoencoder_threshold = model_art.get('threshold', 0.5)
+                        # Align by index so rows without ae result keep 0.0 (avoid NaNs breaking ML check)
+                        full_df.loc[ae_results.index, 'reconstruction_error'] = ae_results['reconstruction_error'].values
+                        autoencoder_threshold = model_art.get('threshold', 0.5)
                 except Exception as e:
                     logger.error(f"Autoencoder detection failed: {e}")
 
@@ -328,6 +329,27 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     if window_df.empty:
         logger.warning(f"Empty detection window for {well_id}; skipping checkers.")
         return []
+
+    # Diagnostic: why 0 anomalies? (data health + ML stats)
+    ts_min, ts_max = full_df['timestamp'].min(), full_df['timestamp'].max()
+    logger.info(
+        f"[ANOMALY_DEBUG] {well_id}: data rows={len(full_df)}, window rows={len(window_df)}, "
+        f"window={ts_min.date()} to {ts_max.date()} (last {lookback_days}d)"
+    )
+    if 'reconstruction_error' in window_df.columns:
+        rec = window_df['reconstruction_error']
+        above = (rec > autoencoder_threshold).sum()
+        # NaN-safe stats
+        valid = rec.replace(0, np.nan).dropna()
+        logger.info(
+            f"[ANOMALY_DEBUG] {well_id}: reconstruction_error in window: "
+            f"min={rec.min():.4f}, max={rec.max():.4f}, mean={rec.mean():.4f}, "
+            f"threshold={autoencoder_threshold:.4f}, count_above_threshold={above}"
+        )
+        if above == 0 and valid.empty:
+            logger.info(f"[ANOMALY_DEBUG] {well_id}: all reconstruction_error are 0 in window (check index alignment with ae_results).")
+    else:
+        logger.info(f"[ANOMALY_DEBUG] {well_id}: no reconstruction_error column (autoencoder not used).")
 
     # Checkers aligned with Anomaly Review: pattern change, production inconsistency, unexpected events
     all_checkers = [
@@ -404,6 +426,8 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "chart_payload": res.get('chart_payload', {})
                 })
 
+    logger.info(f"[ANOMALY_DEBUG] {well_id}: raw_findings before suppression: {len(raw_findings)}")
+
     # 1. FATAL OVERRIDE: Data Mismatch (prev Ghost Production) implies sensor failure or critical break.
     # If this exists, it invalidates physics checks like Fluid Pound.
     ghost = next((a for a in raw_findings if a['anomaly_code'] == 'DATA_MISMATCH'), None)
@@ -413,6 +437,7 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
 
     # 5. Filter & Deduplicate (The Truth Hierarchy) — suppress first to avoid costly LLM calls for discarded alerts
     final_anomalies = select_top_anomalies_per_well(raw_findings)
+    logger.info(f"[ANOMALY_DEBUG] {well_id}: after suppression/dedup: {len(final_anomalies)} anomalies")
 
     # 6. Generate Content & Save — OpenRouter/LLM is called only for anomalies we keep (after suppression)
     enriched_results = []

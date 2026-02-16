@@ -22,7 +22,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES
+from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES, AUTOENCODER_THRESHOLD_SIGMA
 
 logger = logging.getLogger('AnomalyReviewModels')
 
@@ -35,11 +35,11 @@ try:
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
     TORCH_AVAILABLE = True
-except ImportError:
+except Exception as e:
     TORCH_AVAILABLE = False
     torch = None
     nn = None
-    logger.warning("PyTorch not available; LSTM models disabled")
+    logger.warning("PyTorch not available; LSTM/Autoencoder disabled (%s)", e)
 
 
 # =============================================================================
@@ -125,7 +125,12 @@ def prepare_sequences(
     if len(df) <= window_size:
         return None, None
     
-    data = df[features].values
+    # Coerce to float64 so PyTorch FloatTensor never sees object dtype (e.g. from Snowflake/digital twin)
+    block = df[features].copy()
+    for c in block.columns:
+        block[c] = pd.to_numeric(block[c], errors="coerce")
+    block = block.fillna(0).astype(np.float64)
+    data = block.values
     X, y = [], []
     
     for i in range(len(data) - window_size):
@@ -183,8 +188,8 @@ def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], targ
         if not valid_feats:
             return []
             
-        X = df[valid_feats].fillna(0).infer_objects(copy=False)
-        y = df[target_col].fillna(0).infer_objects(copy=False)
+        X = df[valid_feats].apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float64)
+        y = df[target_col].apply(pd.to_numeric, errors="coerce").fillna(0)
         
         # Train lightweight RF
         rf = RandomForestRegressor(n_estimators=50, max_depth=5, n_jobs=-1, random_state=42)
@@ -204,10 +209,8 @@ def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], targ
 
 def safe_prepare_data(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
     """
-    Prepare DataFrame for prediction by ensuring all required features exist.
-    
-    If features are missing (e.g., failed sensor), they are created with 0 values
-    to prevent model crash.
+    Prepare DataFrame for prediction by ensuring all required features exist
+    and are numeric (avoids object dtype from DB/digital twin breaking scaler/torch).
     """
     df_safe = df.copy()
     missing = [f for f in features if f not in df_safe.columns]
@@ -216,9 +219,12 @@ def safe_prepare_data(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
         logger.warning(f"Missing features for prediction: {missing}. Imputing with Mean (via NaNs).")
         for f in missing:
             df_safe[f] = np.nan
-            
-    # Return features in exact order expected by model/scaler
-    return df_safe[features]
+
+    out = df_safe[features].copy()
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.fillna(0).astype(np.float64)
+    return out
 
 
 # =============================================================================
@@ -294,6 +300,7 @@ def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[D
     if X_np is None or len(X_np) < 50:
         return None
     
+    X_np = np.asarray(X_np, dtype=np.float64)
     X_tensor = torch.FloatTensor(X_np)
     dataset = TensorDataset(X_tensor)
     loader = DataLoader(dataset, batch_size=16, shuffle=True)
@@ -312,12 +319,12 @@ def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[D
             loss.backward()
             optimizer.step()
     
-    # Calculate threshold (Mean + 2 Sigma on training data for better sensitivity)
+    # Calculate threshold (Mean + N*Sigma); N from config so you can lower for digital twin / testing
     model.eval()
     with torch.no_grad():
         reconstructions = model(X_tensor)
         train_loss = torch.mean((X_tensor - reconstructions) ** 2, dim=[1, 2])
-        threshold = torch.mean(train_loss) + 2 * torch.std(train_loss)
+        threshold = torch.mean(train_loss) + float(AUTOENCODER_THRESHOLD_SIGMA) * torch.std(train_loss)
         
         # Safety: If threshold is NaN (e.g., from constant input), use default
         if torch.isnan(threshold) or threshold == 0:
@@ -391,9 +398,10 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
     # Ensure 'oil_volume' is available for target, even if not a feature
     required_cols = list(set(selected_features + ['oil_volume']))
     train_df = df[required_cols].copy()
-    
-    # Handle missing values for training
-    train_df = train_df.ffill().bfill().fillna(0)  # Fill NaNs before scaling
+    # Coerce to float first to avoid object dtype and FutureWarning from fillna/ffill downcasting
+    for c in train_df.columns:
+        train_df[c] = pd.to_numeric(train_df[c], errors="coerce")
+    train_df = train_df.ffill().bfill().fillna(0).astype(np.float64)
 
     # Filter for valid training data (e.g., positive oil volume)
     train_df_filtered = train_df[train_df['oil_volume'] > 0.1].copy()

@@ -69,10 +69,13 @@ def fetch_well_data(well_id: str, days: int = None) -> pd.DataFrame:
     Fetch well sensor and production data from Snowflake.
     
     Uses 'SELECT s.*' to automatically grab any new sensors added to the DB.
+    When days is set, uses this well's real last N days (relative to the well's
+    max timestamp), not calendar-relative.
     
     Args:
         well_id: Well identifier
-        days: Number of days of history to fetch (None = all)
+        days: Number of days of history to fetch (None = all). Cutoff is
+              (well's max timestamp) - days.
         
     Returns:
         DataFrame with sensor and production data
@@ -81,9 +84,12 @@ def fetch_well_data(well_id: str, days: int = None) -> pd.DataFrame:
     where_clause = ""
     
     if days:
-        where_clause = "AND s.timestamp >= %s"
-        cutoff_date = datetime.now() - timedelta(days=days)
-        params.append(cutoff_date)
+        # Each well's real last N days: cutoff = (this well's max timestamp) - days
+        where_clause = """
+      AND s.timestamp >= (SELECT DATEADD(day, -%s, MAX(timestamp))
+                          FROM well_sensor_readings WHERE well_id = %s)
+        """
+        params.extend([days, well_id])
     
     query = f"""
     SELECT 
