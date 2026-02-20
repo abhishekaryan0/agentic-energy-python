@@ -140,6 +140,27 @@ def generate_llm_content(
             If "is_valid_anomaly": false, you may leave other fields empty. 
             """
 
+        data_mismatch_instruction = ""
+        if anomaly_code == "DATA_MISMATCH":
+            data_mismatch_instruction = """
+            DATA_MISMATCH (CRITICAL): This is a sensor/data consistency issue, NOT a mechanical well failure.
+            - Root cause: Pump state (Amps/SPM) says "running" but flow meter reads zero. Likely meter calibration, data sync, or sensor fault.
+            - Do NOT invent mechanical causes (pump failure, fluid pound, etc.). Frame as "data or meter issue—verify sensors and data pipeline."
+            - Title: e.g. "Sensor state mismatch (meter or data)" or "Pump active but zero flow (verify meter)".
+            - recommended_actions: 1. Verify flow meter calibration and wiring. 2. Check data sync between SCADA and production system. 3. Compare with well test or manual gauge.
+            """
+
+        ml_pattern_instruction = ""
+        if anomaly_code == "ML_PATTERN_ANOMALY":
+            ml_pattern_instruction = """
+            ML PATTERN ANOMALY (CRITICAL - READ FIRST):
+            Use the "READABLE SUMMARY" and "*** ROOT CAUSE ANALYSIS (Feature Contribution) ***" in the ANOMALY DATA. Your output must be concrete and non-generic.
+            - Lead with the "X× above threshold" from READABLE SUMMARY (e.g. "The error is 29× above threshold—the sensor pattern does not match the learned normal."). Do NOT lead with the raw number (e.g. 155,209) without context.
+            - TITLE and DESCRIPTION must name the exact sensors from ROOT CAUSE ANALYSIS (e.g. "Pattern deviation (Injection Pressure, Casing Pressure)" and "Driven mainly by Injection Pressure and Casing Pressure").
+            - You MUST NOT invent or imply root causes that are not in the data. FORBIDDEN: "gas lift", "pressure management malfunction", "flow instability", "well dynamics", "lift efficiency"—unless the ANOMALY DATA explicitly states them. The model only provides which sensors deviated (with %); say "pattern deviated; check these sensors" and list the sensors. suspected_root_cause must be limited to: "Deviation driven mainly by [sensor names from ROOT CAUSE ANALYSIS]; recommend reviewing their trends to identify cause."
+            - RECOMMENDED_ACTIONS: Numbered steps that reference the named sensors (e.g. "1. Review trend for Injection Pressure. 2. Review trend for Casing Pressure. 3. Compare to baseline or prior week.").
+            """
+
         prompt = f"""
 ROLE: Senior Production Engineer / Optimization Specialist with deep expertise in rod pumping and anomaly diagnostics.
 TASK: Generate a COMPREHENSIVE technical investigation report for a well performance deviation. The output must be rich in engineering detail, explaining the *mechanics* of the issue, not just stating the metrics.
@@ -153,6 +174,8 @@ PLAIN LANGUAGE AND REAL CAUSE (CRITICAL): Users need to know WHAT IS WRONG and t
 - SUSPECTED_ROOT_CAUSE: Explain the REAL cause so an engineer can act. Do not leave this vague.
 
 {validation_instruction}
+{data_mismatch_instruction}
+{ml_pattern_instruction}
 
 {confidence_instruction}
 

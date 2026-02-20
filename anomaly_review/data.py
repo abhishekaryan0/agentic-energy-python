@@ -51,9 +51,15 @@ def get_db_url() -> Optional[str]:
 
 
 def get_openai_client():
-    """Create and return an OpenAI client."""
-    import openai
-    
+    """Create and return an OpenAI client (OpenAI or OpenRouter). Returns None if openai package is not installed."""
+    try:
+        import openai
+    except ImportError:
+        logger.warning(
+            "OpenAI client unavailable: 'openai' package not installed. "
+            "Install with: pip install openai. LLM-generated anomaly text will use fallback content."
+        )
+        return None
     return openai.OpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_API_BASE")
@@ -159,6 +165,9 @@ def get_recent_anomaly_history(
     Fetch recent anomaly history for a well (same code) for historical_context.
     Tries Postgres first, then Snowflake, so history is found regardless of where reviews are saved.
     """
+    from anomaly_review.config import get_organization_id
+    org_id = get_organization_id()
+
     # 1) Try Postgres (same table we write to when DATABASE_URL is set)
     url = get_db_url()
     if url:
@@ -166,14 +175,24 @@ def get_recent_anomaly_history(
             import psycopg2
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """SELECT event_date, severity, title
-                           FROM anomaly_review
-                           WHERE well_id = %s AND anomaly_code = %s
-                           ORDER BY event_date DESC
-                           LIMIT 10""",
-                        (well_id, anomaly_code),
-                    )
+                    if org_id:
+                        cur.execute(
+                            """SELECT event_date, severity, title
+                               FROM anomaly_review
+                               WHERE well_id = %s AND anomaly_code = %s AND (organization_id = %s OR organization_id IS NULL)
+                               ORDER BY event_date DESC
+                               LIMIT 10""",
+                            (well_id, anomaly_code, org_id),
+                        )
+                    else:
+                        cur.execute(
+                            """SELECT event_date, severity, title
+                               FROM anomaly_review
+                               WHERE well_id = %s AND anomaly_code = %s
+                               ORDER BY event_date DESC
+                               LIMIT 10""",
+                            (well_id, anomaly_code),
+                        )
                     rows = cur.fetchall()
             if rows:
                 history_list = _format_history_rows(rows, exclude_date)
@@ -188,14 +207,24 @@ def get_recent_anomaly_history(
         table = SNOWFLAKE_ANOMALY_REVIEW_TABLE
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"""SELECT event_date, severity, title
-                    FROM {table}
-                    WHERE well_id = %s AND anomaly_code = %s
-                    ORDER BY event_date DESC
-                    LIMIT 10""",
-                (well_id, anomaly_code),
-            )
+            if org_id:
+                cur.execute(
+                    f"""SELECT event_date, severity, title
+                        FROM {table}
+                        WHERE well_id = %s AND anomaly_code = %s AND (organization_id = %s OR organization_id IS NULL)
+                        ORDER BY event_date DESC
+                        LIMIT 10""",
+                    (well_id, anomaly_code, org_id),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT event_date, severity, title
+                        FROM {table}
+                        WHERE well_id = %s AND anomaly_code = %s
+                        ORDER BY event_date DESC
+                        LIMIT 10""",
+                    (well_id, anomaly_code),
+                )
             rows = cur.fetchall()
         if rows:
             history_list = _format_history_rows(rows, exclude_date)
@@ -227,17 +256,25 @@ def has_recent_anomaly(well_id: str, anomaly_code: str, within_days: int) -> boo
     alerts (e.g. PATTERN_SHIFT only once per episode per well).
     """
     from datetime import date, timedelta
+    from anomaly_review.config import get_organization_id
     cutoff = (date.today() - timedelta(days=within_days)).isoformat()
+    org_id = get_organization_id()
     url = get_db_url()
     if url:
         try:
             import psycopg2
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT 1 FROM anomaly_review WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
-                        (well_id, anomaly_code, cutoff),
-                    )
+                    if org_id:
+                        cur.execute(
+                            "SELECT 1 FROM anomaly_review WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s AND (organization_id = %s OR organization_id IS NULL) LIMIT 1",
+                            (well_id, anomaly_code, cutoff, org_id),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT 1 FROM anomaly_review WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
+                            (well_id, anomaly_code, cutoff),
+                        )
                     if cur.fetchone():
                         return True
         except Exception as e:
@@ -246,10 +283,16 @@ def has_recent_anomaly(well_id: str, anomaly_code: str, within_days: int) -> boo
         from anomaly_review.config import SNOWFLAKE_ANOMALY_REVIEW_TABLE
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"SELECT 1 FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE} WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
-                (well_id, anomaly_code, cutoff),
-            )
+            if org_id:
+                cur.execute(
+                    f"SELECT 1 FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE} WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s AND (organization_id = %s OR organization_id IS NULL) LIMIT 1",
+                    (well_id, anomaly_code, cutoff, org_id),
+                )
+            else:
+                cur.execute(
+                    f"SELECT 1 FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE} WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s LIMIT 1",
+                    (well_id, anomaly_code, cutoff),
+                )
             if cur.fetchone():
                 return True
     except Exception as e:
@@ -265,19 +308,29 @@ def get_existing_anomaly_event_date(well_id: str, anomaly_code: str, within_days
     Returns None if no row found.
     """
     from datetime import date, timedelta
+    from anomaly_review.config import get_organization_id
     cutoff = (date.today() - timedelta(days=within_days)).isoformat()
+    org_id = get_organization_id()
     url = get_db_url()
     if url:
         try:
             import psycopg2
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """SELECT event_date FROM anomaly_review
-                           WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
-                           ORDER BY event_date DESC LIMIT 1""",
-                        (well_id, anomaly_code, cutoff),
-                    )
+                    if org_id:
+                        cur.execute(
+                            """SELECT event_date FROM anomaly_review
+                               WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s AND (organization_id = %s OR organization_id IS NULL)
+                               ORDER BY event_date DESC LIMIT 1""",
+                            (well_id, anomaly_code, cutoff, org_id),
+                        )
+                    else:
+                        cur.execute(
+                            """SELECT event_date FROM anomaly_review
+                               WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
+                               ORDER BY event_date DESC LIMIT 1""",
+                            (well_id, anomaly_code, cutoff),
+                        )
                     row = cur.fetchone()
                     if row:
                         return str(row[0]) if row[0] else None
@@ -287,12 +340,20 @@ def get_existing_anomaly_event_date(well_id: str, anomaly_code: str, within_days
         from anomaly_review.config import SNOWFLAKE_ANOMALY_REVIEW_TABLE
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"""SELECT event_date FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE}
-                    WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
-                    ORDER BY event_date DESC LIMIT 1""",
-                (well_id, anomaly_code, cutoff),
-            )
+            if org_id:
+                cur.execute(
+                    f"""SELECT event_date FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE}
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s AND (organization_id = %s OR organization_id IS NULL)
+                        ORDER BY event_date DESC LIMIT 1""",
+                    (well_id, anomaly_code, cutoff, org_id),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT event_date FROM {SNOWFLAKE_ANOMALY_REVIEW_TABLE}
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date >= %s
+                        ORDER BY event_date DESC LIMIT 1""",
+                    (well_id, anomaly_code, cutoff),
+                )
             row = cur.fetchone()
             if row:
                 return str(row[0]) if row[0] else None
@@ -345,6 +406,39 @@ def fetch_sensor_metadata() -> pd.DataFrame:
 # DATA PROCESSING
 # =============================================================================
 
+def resample_to_daily_if_subdaily(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If the DataFrame has multiple rows per calendar day (e.g. hourly data with
+    same value repeated 24h from digital twin), aggregate to one row per day.
+    That way "current" vs "baseline" compares one day to previous days, so
+    physics checkers (ENERGY_DIV, FLUID_POUND) can fire on failure days.
+
+    Expects df to have a DatetimeIndex. Returns df unchanged if already daily
+    or if not time-indexed; otherwise returns df with one row per day.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) == 0:
+        return df
+    n_rows = len(df)
+    days = df.index.normalize().unique()
+    n_days = len(days)
+    # Already daily (or close): no need to resample
+    if n_rows <= n_days * 1.5:
+        return df
+    # Multiple rows per day: aggregate to one row per day
+    by_day = df.groupby(df.index.normalize())
+    agg_dict = {}
+    for c in df.columns:
+        if df[c].dtype.kind in 'iufc':
+            agg_dict[c] = 'mean'
+        else:
+            agg_dict[c] = 'first'
+    resampled = by_day.agg(agg_dict)
+    # Use end-of-day as timestamp so rolling windows align with calendar days
+    resampled.index = resampled.index + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    resampled.index.name = df.index.name
+    return resampled.sort_index()
+
+
 def calculate_rolling_baseline(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate rolling baselines for various metrics.
@@ -358,8 +452,8 @@ def calculate_rolling_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if 'timestamp' in df.columns:
         df = df.set_index('timestamp').sort_index()
-    
-    MIN_PERIODS = 7
+    df = resample_to_daily_if_subdaily(df)
+    MIN_PERIODS = 1
     
     # Production baselines
     if 'oil_volume' in df.columns:

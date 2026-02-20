@@ -280,26 +280,44 @@ def train_lstm_model(df: pd.DataFrame, features: List[str], target: str) -> Opti
     }
 
 
-def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[Dict]:
+def train_autoencoder_model(
+    df: pd.DataFrame,
+    features: List[str],
+    scaler: Optional[StandardScaler] = None,
+    imputer: Optional[SimpleImputer] = None,
+) -> Optional[Dict]:
     """
     Train LSTM Autoencoder for unsupervised anomaly detection.
-    
+
+    Must be trained on the SAME scaled data used at inference, otherwise
+    threshold (from training MSE) and inference reconstruction error are in
+    different units and you get impossible ratios (e.g. 29× above threshold).
+
     Args:
         df: Training DataFrame with features
         features: List of feature column names
-        
+        scaler: Fitted StandardScaler (if None, trains on raw data - not recommended)
+        imputer: Fitted SimpleImputer (if None, uses raw data)
+
     Returns:
         Dict with model, type, features, threshold, and window_size or None if training fails
     """
     if not TORCH_AVAILABLE:
         return None
-    
+
     window_size = 7
-    X_np, _ = prepare_sequences(df, features, target=None, window_size=window_size)
-    
+    # Build sequences from SCALED data so threshold and inference errors are in the same units
+    if scaler is not None and imputer is not None:
+        safe_df = safe_prepare_data(df, features)
+        scaled_data = scaler.transform(imputer.transform(safe_df))
+        scaled_df = pd.DataFrame(scaled_data, columns=features)
+        X_np, _ = prepare_sequences(scaled_df, features, target=None, window_size=window_size)
+    else:
+        X_np, _ = prepare_sequences(df, features, target=None, window_size=window_size)
+
     if X_np is None or len(X_np) < 50:
         return None
-    
+
     X_np = np.asarray(X_np, dtype=np.float64)
     X_tensor = torch.FloatTensor(X_np)
     dataset = TensorDataset(X_tensor)
@@ -427,11 +445,9 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
         logger.error(f"RF training failed: {e}")
 
     # B. LSTM Autoencoder (For Anomaly Detection)
+    # Train on SCALED data so threshold and inference MSE are in the same units (avoids 29× impossible ratios)
     try:
-        # Train Autoencoder on the same filtered/imputed data
-        # We re-use 'train_df_filtered' but need to pass the full original DF pattern for sequences
-        # ideally. However, train_autoencoder_model takes (df, features).
-        ae_artifact = train_autoencoder_model(df, selected_features)
+        ae_artifact = train_autoencoder_model(df, selected_features, scaler=scaler, imputer=imputer)
         
         if ae_artifact:
             models['autoencoder'] = ae_artifact['model']
@@ -675,6 +691,12 @@ def detect_autoencoder_anomalies(
     try:
         # Create missing columns if needed
         safe_df = safe_prepare_data(df, features)
+        # Clip to prevent massive Z-scores when synthetic/data spikes (e.g. 0 from high mean)
+        mean_ = safe_df.mean()
+        std_ = safe_df.std().replace(0, np.nan)
+        lower = mean_ - 5 * std_
+        upper = mean_ + 5 * std_
+        safe_df = safe_df.clip(lower=lower.fillna(safe_df.min()), upper=upper.fillna(safe_df.max()), axis=1)
         scaled_data = scaler.transform(imputer.transform(safe_df))
         X_list = []
         indices = []
@@ -692,11 +714,36 @@ def detect_autoencoder_anomalies(
         with torch.no_grad():
             model.eval()
             reconstructions = model(X_tensor)
-            errors = torch.mean((X_tensor - reconstructions) ** 2, dim=[1, 2]).numpy()
+            sq_err = (X_tensor - reconstructions) ** 2
+            errors = torch.mean(sq_err, dim=[1, 2]).numpy()
+            # Per-feature MSE (mean over time) for attribution
+            per_feature_mse = torch.mean(sq_err, dim=1).numpy()
         
         results = pd.DataFrame(index=indices)
         results['reconstruction_error'] = errors
+        th = max(threshold, 1e-9)
+        results['anomaly_score'] = errors / th
         results['is_ml_anomaly'] = errors > threshold
+        # Feature attribution: % contribution per feature, top 3 as "Tubing Pressure (85%), Motor Current (10%)"
+        def _feature_display_name(name: str) -> str:
+            return str(name).replace("_", " ").title()
+        top_k = min(3, len(features))
+        top_contrib = []
+        for i in range(len(indices)):
+            contrib = per_feature_mse[i]
+            total = contrib.sum()
+            if total <= 0:
+                top_contrib.append("")
+                continue
+            pct = 100.0 * contrib / total
+            order = np.argsort(contrib)[::-1]
+            parts = []
+            for j in order[:top_k]:
+                if contrib[j] <= 0:
+                    continue
+                parts.append(f"{_feature_display_name(features[j])} ({pct[j]:.0f}%)")
+            top_contrib.append(", ".join(parts) if parts else "")
+        results['top_contributing_features'] = top_contrib
         return results
         
     except Exception as e:

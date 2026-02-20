@@ -309,57 +309,73 @@ def update_well_status(well_id: str, status: str, reason: str, well_data: Dict, 
         # Get anomaly counts (reuse conn if provided)
         anomaly_count, critical_count = get_anomaly_counts(well_id, 24, conn=conn)
         
-        # Use MERGE to upsert
-        merge_query = """
-        MERGE INTO WELL_STATUS AS target
-        USING (SELECT %s AS WELL_ID) AS source
-        ON target.WELL_ID = source.WELL_ID
-        WHEN MATCHED THEN UPDATE SET
-            LIFT_TYPE = %s,
-            STATUS = %s,
-            LAST_READING_TIMESTAMP = %s,
-            LAST_READING_AGE_HOURS = %s,
-            STROKES_PER_MINUTE = %s,
-            MOTOR_CURRENT = %s,
-            INJECTION_RATE = %s,
-            ANOMALY_COUNT_24H = %s,
-            CRITICAL_ANOMALY_COUNT_24H = %s,
-            STATUS_REASON = %s,
-            UPDATED_AT = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN INSERT (
-            WELL_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP, LAST_READING_AGE_HOURS,
-            STROKES_PER_MINUTE, MOTOR_CURRENT, INJECTION_RATE,
-            ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H, STATUS_REASON
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        params = (
-            # For USING clause
-            well_id,
-            # For UPDATE
-            well_data.get('lift_type'),
-            status,
-            well_data.get('last_reading_timestamp'),
-            reading_age_hours,
-            well_data.get('strokes_per_minute'),
-            well_data.get('motor_current'),
-            well_data.get('injection_rate'),
-            anomaly_count,
-            critical_count,
-            reason,
-            # For INSERT
-            well_id,
-            well_data.get('lift_type'),
-            status,
-            well_data.get('last_reading_timestamp'),
-            reading_age_hours,
-            well_data.get('strokes_per_minute'),
-            well_data.get('motor_current'),
-            well_data.get('injection_rate'),
-            anomaly_count,
-            critical_count,
-            reason
-        )
+        org_id = os.getenv("ORGANIZATION_ID")
+
+        # Use MERGE to upsert (when not matched, set ORGANIZATION_ID from env if available)
+        if org_id:
+            merge_query = """
+            MERGE INTO WELL_STATUS AS target
+            USING (SELECT %s AS WELL_ID, %s AS ORGANIZATION_ID) AS source
+            ON target.WELL_ID = source.WELL_ID
+            WHEN MATCHED THEN UPDATE SET
+                LIFT_TYPE = %s,
+                STATUS = %s,
+                LAST_READING_TIMESTAMP = %s,
+                LAST_READING_AGE_HOURS = %s,
+                STROKES_PER_MINUTE = %s,
+                MOTOR_CURRENT = %s,
+                INJECTION_RATE = %s,
+                ANOMALY_COUNT_24H = %s,
+                CRITICAL_ANOMALY_COUNT_24H = %s,
+                STATUS_REASON = %s,
+                UPDATED_AT = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                WELL_ID, ORGANIZATION_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP, LAST_READING_AGE_HOURS,
+                STROKES_PER_MINUTE, MOTOR_CURRENT, INJECTION_RATE,
+                ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H, STATUS_REASON
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            params = (
+                well_id, org_id,
+                well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
+                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
+                well_data.get('injection_rate'), anomaly_count, critical_count, reason,
+                well_id, org_id, well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
+                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
+                well_data.get('injection_rate'), anomaly_count, critical_count, reason
+            )
+        else:
+            merge_query = """
+            MERGE INTO WELL_STATUS AS target
+            USING (SELECT %s AS WELL_ID) AS source
+            ON target.WELL_ID = source.WELL_ID
+            WHEN MATCHED THEN UPDATE SET
+                LIFT_TYPE = %s,
+                STATUS = %s,
+                LAST_READING_TIMESTAMP = %s,
+                LAST_READING_AGE_HOURS = %s,
+                STROKES_PER_MINUTE = %s,
+                MOTOR_CURRENT = %s,
+                INJECTION_RATE = %s,
+                ANOMALY_COUNT_24H = %s,
+                CRITICAL_ANOMALY_COUNT_24H = %s,
+                STATUS_REASON = %s,
+                UPDATED_AT = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                WELL_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP, LAST_READING_AGE_HOURS,
+                STROKES_PER_MINUTE, MOTOR_CURRENT, INJECTION_RATE,
+                ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H, STATUS_REASON
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            params = (
+                well_id,
+                well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
+                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
+                well_data.get('injection_rate'), anomaly_count, critical_count, reason,
+                well_id, well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
+                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
+                well_data.get('injection_rate'), anomaly_count, critical_count, reason
+            )
         
         cursor.execute(merge_query, params)
         conn.commit()

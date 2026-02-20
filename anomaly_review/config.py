@@ -5,8 +5,14 @@ Contains all constants, thresholds, and configuration values used
 throughout the anomaly review package.
 """
 
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+
+def get_organization_id() -> Optional[str]:
+    """Organization UUID from env (from your organizations Postgres). Used for tenant scoping."""
+    return os.getenv("ORGANIZATION_ID")
 
 # =============================================================================
 # PRICING CONSTANTS (Keep static as requested)
@@ -44,11 +50,11 @@ MODEL_DIVERGENCE_MIN_PCT = 25.0
 
 # Energy/Production divergence: high amps + low oil vs baseline.
 # Trigger when amps > (AMPS_RATIO * baseline) AND oil < (OIL_MAX_RATIO * baseline).
-ENERGY_DIV_AMPS_RATIO = 1.35
+ENERGY_DIV_AMPS_RATIO = 1.15
 ENERGY_DIV_OIL_MAX_RATIO = 0.28
 
 # Fluid pound: trigger when fillage < (FILLAGE_BELOW_BASELINE * baseline) and < FILLAGE_ABSOLUTE_MAX.
-FLUID_POUND_FILLAGE_BELOW_BASELINE = 0.72
+FLUID_POUND_FILLAGE_BELOW_BASELINE = 0.85
 FLUID_POUND_FILLAGE_ABSOLUTE_MAX = 82.0
 
 # Pressure instability: trigger when coefficient of variation (std/mean) > this %.
@@ -253,7 +259,7 @@ class BatchConfig:
 
     test_mode: bool = True
     test_well_limit: int = 1
-    test_well_id: str = "Pinto-4-3-H"
+    test_well_id: str = "Mustang-12-3-V"
     max_workers: int = 10
 
     def validate(self) -> None:

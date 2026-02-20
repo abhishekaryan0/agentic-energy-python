@@ -126,7 +126,16 @@ def diagnose_mechanics(ctx: Dict) -> Dict:
             'indicators': f'Motor Current dropped significantly ({amps_ratio:.2f}x)'
         }
 
-    # Seized Pump / Locked Rotor
+    # Seized Pump / Locked Rotor (High Amps + Zero SPM)
+    spm = ctx.get('strokes_per_minute', 0)
+    if amps > 5 and (spm is None or float(spm) < 0.1):
+        return {
+            'type': 'Seized Pump / Locked Rotor',
+            'confidence': 'High',
+            'indicators': f'High Amps ({amps:.1f}) with Zero SPM'
+        }
+
+    # Seized Pump / Locked Rotor (high amps ratio, near-zero flow)
     elif amps_ratio > 1.5 and efficiency < 20:
         return {
             'type': 'Seized Pump / Locked Rotor',
@@ -178,9 +187,11 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     """
     lift_type = str(ctx.get('lift_type', '')).lower().replace(' ', '')
     if 'rod' not in lift_type:
+        logger.debug(f"[FLUID_POUND] skip: lift_type='{lift_type}' (not rod pump)")
         return None
 
     if pd.isna(ctx.get('pump_fillage')) or pd.isna(ctx.get('strokes_per_minute')):
+        logger.debug(f"[FLUID_POUND] skip: pump_fillage or strokes_per_minute missing/NaN")
         return None
     
     # Use rolling average fillage to avoid false positives from transient sensor noise
@@ -197,13 +208,18 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     baseline_fillage = ctx.get('fillage_avg_3d', ctx.get('fillage_avg_24h'))
     
     if baseline_fillage is None:
+        logger.debug(f"[FLUID_POUND] skip: no fillage baseline (fillage_avg_3d/24h)")
         return None
 
     # Anomaly if fillage drops below baseline band AND is below absolute max (configurable "unusual" range)
     threshold_fillage = baseline_fillage * FLUID_POUND_FILLAGE_BELOW_BASELINE
-    would_trigger = spm > 4.0 and fillage < threshold_fillage and fillage < FLUID_POUND_FILLAGE_ABSOLUTE_MAX
+    would_trigger = spm >= 0.0 and fillage < threshold_fillage and fillage < FLUID_POUND_FILLAGE_ABSOLUTE_MAX
     logger.debug(f"[FLUID_POUND_CHECK] Fillage: {fillage}%, Baseline: {baseline_fillage}%, SPM: {spm} (trigger={would_trigger})")
 
+    if not would_trigger:
+        logger.debug(
+            f"[FLUID_POUND] skip: fillage={fillage}% >= threshold {threshold_fillage:.0f}% or >= absolute max {FLUID_POUND_FILLAGE_ABSOLUTE_MAX}"
+        )
     if would_trigger:
         severity_score = 100 - fillage
         revenue_loss = ctx.get('oil_avg_7d', 0) * ((100 - fillage) / 100) * OIL_PRICE
@@ -706,12 +722,19 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
         if decline_pct > MONTHLY_DECLINE_MIN_PCT:
             revenue_loss = max(0, previous['oil_rate'] - latest['oil_rate']) * OIL_PRICE
             boe_loss = max(0, previous['oil_rate'] - latest['oil_rate'])
-            data_summary = f"Monthly Decline: {format_number(decline_pct)}%"
+            data_summary = f"""
+        DETECTION TYPE: Monthly Production Decline
+        PREVIOUS MONTH RATE: {format_number(previous['oil_rate'])} bbl/day
+        CURRENT MONTH RATE: {format_number(latest['oil_rate'])} bbl/day
+        DECLINE: {format_number(decline_pct)}%
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day. Production gap: {format_number(boe_loss)} BOE/day.
+        ROOT CAUSE: Cannot be determined from production data alone. Field investigation recommended (pump, inflow, or surface equipment).
+        """
             
             return {
                 "code": "MONTHLY_DECLINE",
                 "category": "PRODUCTION",
-                "raw_data": data_summary,
+                "raw_data": data_summary.strip(),
                 "severity_metrics": {'decline_pct': decline_pct, 'impact_value': revenue_loss},
                 "impact_value": revenue_loss,
                 "impact_payload": {
@@ -720,10 +743,10 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
                 },
                 "chart_metric": "monthly_production",
                 "diagnosis": {
-                "type": "Monthly Production Decline",
-                "confidence": "High",
-                "indicators": "Comparison of monthly production rates."
-            },
+                    "type": "Monthly Production Decline",
+                    "confidence": "High",
+                    "indicators": f"Month-over-month decline {decline_pct:.1f}%. Previous: {format_number(previous['oil_rate'])} bbl/day, current: {format_number(latest['oil_rate'])} bbl/day."
+                },
                 "chart_payload": {
                     "decline_pct": decline_pct,
                     "previous_rate": previous['oil_rate'],
@@ -760,12 +783,38 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
         oil_loss = ctx.get('oil_avg_7d', 0) * 0.2  # Assume 20% risk
         revenue_loss = oil_loss * OIL_PRICE
 
+        top_sensors = (ctx.get('top_contributing_features') or "").strip()
+        if top_sensors:
+            sensor_line = f"\nTOP CONTRIBUTING SENSORS (by reconstruction error): {top_sensors}\nRecommend reviewing trends for these sensors to identify root cause."
+            root_cause_section = f"""
+        *** ROOT CAUSE ANALYSIS (Feature Contribution) ***
+        {top_sensors}
+        """
+        else:
+            sensor_line = "\nRecommend trend review to identify which sensors drove the deviation."
+            root_cause_section = "\n*** ROOT CAUSE ANALYSIS (Feature Contribution) ***\n(No feature attribution available.)"
+
+        times_above = (rec_error / threshold) if threshold and threshold > 0 else 0
+        readable_summary = f"In plain numbers: the error is **{times_above:.0f}× above threshold** ({format_number(rec_error)} vs {format_number(threshold)}). The model does NOT diagnose root cause—it only shows which sensors contributed most. Use the ROOT CAUSE ANALYSIS list below to know what to check. Do NOT invent causes (e.g. 'gas lift', 'pressure management', 'flow instability'); only report the sensor list and recommend reviewing those trends."
+
         data_summary = f"""
         DETECTION TYPE: ML Pattern Anomaly (Autoencoder)
-        ERROR: {rec_error:.4f} (Threshold: {threshold:.4f})
-        ROOT CAUSE: Unsupervised model detected a sensor pattern deviation not covered by standard physics rules.
+
+        WHAT THIS ERROR MEANS (explain this to the user in plain language):
+        The model learned the normal pattern of how this well's sensors (pressure, amps, production, etc.) typically move together. "Reconstruction error" measures how much the current readings deviate from that normal; a high value means the well is behaving differently than usual. This metric does not tell you the root cause—only which sensors contributed most.
+
+        READABLE SUMMARY (use this in your description):
+        {readable_summary}
+
+        ERROR: {rec_error:.4f} (Threshold: {threshold:.4f})  →  {times_above:.0f}× above threshold
+        {sensor_line}
+        {root_cause_section}
         """
-        
+
+        diagnosis_indicators = f"Reconstruction Error {rec_error:.2f} > {threshold:.2f}"
+        if top_sensors:
+            diagnosis_indicators += f". Root cause (feature contribution): {top_sensors}"
+
         return {
             "code": "ML_PATTERN_ANOMALY",
             "category": "PROCESS",
@@ -780,11 +829,13 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
             "diagnosis": {
                 "type": "ML Pattern Anomaly",
                 "confidence": "Low",
-                "indicators": f"Reconstruction Error {rec_error:.2f} > {threshold:.2f}"
+                "indicators": diagnosis_indicators,
+                "top_contributing_sensors": top_sensors or None,
             },
             "chart_payload": {
                 "threshold": threshold,
-                "reconstruction_error": rec_error
+                "reconstruction_error": rec_error,
+                "top_contributing_features": top_sensors or None,
             }
         }
     return None
@@ -800,10 +851,16 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
     oil_baseline = ctx.get('oil_baseline_90d_1d_ago') if not pd.isna(ctx.get('oil_baseline_90d_1d_ago')) else ctx.get('oil_baseline_90d')
     amps_avg = ctx.get('amps_avg_1d_ago') if not pd.isna(ctx.get('amps_avg_1d_ago')) else ctx.get('amps_avg')
     if any(pd.isna(ctx.get(k)) for k in ['motor_current', 'oil_volume']) or pd.isna(oil_baseline) or pd.isna(amps_avg):
+        logger.debug(
+            f"[ENERGY_DIV] skip: motor_current={ctx.get('motor_current')}, oil_volume={ctx.get('oil_volume')}, "
+            f"oil_baseline={oil_baseline}, amps_avg={amps_avg} (missing or NaN)"
+        )
         return None
 
     amps_current = ctx['motor_current']
     oil_current = ctx['oil_volume']
+    amps_ratio = amps_current / amps_avg if amps_avg and amps_avg > 0 else 0
+    oil_ratio = oil_current / oil_baseline if oil_baseline and oil_baseline > 0 else 1
 
     # High Amps (working hard) but Low Production (no results)
     # Thresholds from config: only flag when clearly outside normal range
@@ -816,6 +873,8 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
         ENERGY INPUT: {format_number(amps_current)} Amps (Baseline: {format_number(amps_avg)})
         PRODUCTION OUTPUT: {format_number(oil_current)} bbl (Baseline: {format_number(oil_baseline)})
         DIVERGENCE: Input +{format_number((amps_current/amps_avg - 1)*100)}%, Output -{format_number((1 - oil_current/oil_baseline)*100)}%
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day (Potential). Production gap: {format_number(boe_loss)} BOE/day.
+        ROOT CAUSE: High energy input with low production suggests mechanical inefficiency (pump, drive, or wellbore). Use diagnosis below.
         """
 
         diagnosis = diagnose_mechanics(ctx)
@@ -823,7 +882,7 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
         return {
             "code": "ENERGY_DIV",
             "category": "OPERATIONAL",
-            "raw_data": f"Significant divergence detected between Energy Input (Amps: {format_number(amps_current)}) and Production Output ({format_number(oil_current)} bbl)",
+            "raw_data": data_summary.strip(),
             "severity_metrics": {'severity_score': 70, 'impact_value': revenue_loss},
             "impact_value": revenue_loss,
             "impact_payload": {
@@ -838,6 +897,10 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
                 "efficiency": (oil_current / amps_current) if amps_current > 0 else 0
             }
         }
+    logger.debug(
+        f"[ENERGY_DIV] skip: amps_ratio={amps_ratio:.2f} (need >{ENERGY_DIV_AMPS_RATIO}) or "
+        f"oil_ratio={oil_ratio:.2f} (need <{ENERGY_DIV_OIL_MAX_RATIO})"
+    )
     return None
 
 def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
@@ -858,15 +921,17 @@ def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
         revenue_loss = _f(ctx.get('oil_baseline_90d')) * OIL_PRICE
         
         data_summary = f"""
-        DETECTION TYPE: Sensor State Mismatch
-        STATUS: Pump is Running (Amps {amps:.1f}, SPM {spm:.1f})
-        FLOW: No Flow Recorded ({total_vol:.2f} bbl)
+        DETECTION TYPE: Sensor State Mismatch (Ghost Production)
+        STATUS: Pump is Running (Amps {format_number(amps)}, SPM {format_number(spm)})
+        FLOW: No Flow Recorded ({format_number(total_vol)} bbl). Baseline expected: {format_number(baseline_vol)} bbl.
+        ROOT CAUSE: Operational state indicates active pump but flow meter reads zero. Likely meter calibration, data sync, or sensor fault—not a mechanical well failure.
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day (Risk)
         """
         
         return {
             "code": "DATA_MISMATCH",
             "category": "PRODUCTION",
-            "raw_data": "Operational State is 'Active' but Flow Meter reads zero. Potential meter calibration or data synchronization issue.",
+            "raw_data": data_summary.strip(),
             "severity_metrics": {'impact_value': revenue_loss, 'severity_score': 60},
             "impact_value": revenue_loss,
             "impact_payload": {

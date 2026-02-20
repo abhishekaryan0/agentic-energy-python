@@ -12,8 +12,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(env_path)
+# Load .env from project root (same as app and scripts)
+_env_dir = Path(__file__).resolve().parent.parent
+load_dotenv(_env_dir / ".env")
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -37,6 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # Each tuple: (column_name_lower, Snowflake type for ALTER ADD COLUMN)
 # ---------------------------------------------------------------------------
 WELL_DAILY_PRODUCTION_COLUMNS = [
+    ("organization_id", "VARCHAR(36)"),
     ("well_id", "VARCHAR(100)"),
     ("date", "DATE"),
     ("oil_volume", "FLOAT"),
@@ -53,6 +55,7 @@ WELL_DAILY_PRODUCTION_COLUMNS = [
 ]
 
 WELL_SENSOR_READINGS_COLUMNS = [
+    ("organization_id", "VARCHAR(36)"),
     ("well_id", "VARCHAR(100)"),
     ("timestamp", "TIMESTAMP_NTZ"),
     ("lift_type", "VARCHAR(50)"),
@@ -209,6 +212,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.WELL_DAILY_PRODUCTION (
                 ID INT AUTOINCREMENT PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL,
                 DATE DATE NOT NULL,
                 OIL_VOLUME FLOAT,
@@ -230,6 +234,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.WELL_SENSOR_READINGS (
                 ID INT AUTOINCREMENT PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL,
                 TIMESTAMP TIMESTAMP_NTZ NOT NULL,
                 LIFT_TYPE VARCHAR(50),
@@ -303,6 +308,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.WELL_ANOMALIES (
                 ID INT AUTOINCREMENT PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL,
                 TIMESTAMP TIMESTAMP_NTZ NOT NULL,
                 ANOMALY_TYPE VARCHAR(500),
@@ -319,6 +325,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.ANOMALY_VIOLATIONS_NEW (
                 ID INT AUTOINCREMENT PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 ANOMALY_ID INT NOT NULL,
                 WELL_ID VARCHAR(100) NOT NULL,
                 TIMESTAMP TIMESTAMP_NTZ NOT NULL,
@@ -335,6 +342,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.ANOMALY_REVIEW (
                 ID VARCHAR(100) PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL,
                 EVENT_DATE DATE NOT NULL,
                 DETECTED_AT TIMESTAMP_NTZ,
@@ -355,6 +363,7 @@ def setup_snowflake():
             (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.OPERATION_RECOMMENDATION (
                 ID VARCHAR(100) PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL,
                 CATEGORY VARCHAR(100),
                 ACTION VARCHAR(500),
@@ -378,23 +387,9 @@ def setup_snowflake():
                 "OPERATION_RECOMMENDATION",
             ),
             (
-                f"""CREATE TABLE IF NOT EXISTS {qual}.PRODUCTION_FORECASTING (
-                ID VARCHAR(100) PRIMARY KEY,
-                UID VARCHAR(50) UNIQUE,
-                WELL_ID VARCHAR(100),
-                BOE FLOAT,
-                OIL FLOAT,
-                GAS FLOAT,
-                WATER FLOAT,
-                TIMESTAMP TIMESTAMP_NTZ,
-                LIFT_TYPE VARCHAR(50),
-                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-            )""",
-                "PRODUCTION_FORECASTING",
-            ),
-            (
                 f"""CREATE TABLE IF NOT EXISTS {qual}.WELL_STATUS (
                 ID INT AUTOINCREMENT PRIMARY KEY,
+                ORGANIZATION_ID VARCHAR(36),
                 WELL_ID VARCHAR(100) NOT NULL UNIQUE,
                 LIFT_TYPE VARCHAR(50),
                 STATUS VARCHAR(50) NOT NULL DEFAULT 'UNKNOWN',
@@ -406,12 +401,76 @@ def setup_snowflake():
                 ANOMALY_COUNT_24H INT DEFAULT 0,
                 CRITICAL_ANOMALY_COUNT_24H INT DEFAULT 0,
                 STATUS_REASON VARCHAR(500),
+                FACILITY_ID VARCHAR(100),
+                DATA_QUALITY_GROUP VARCHAR(50),
+                ORIENTATION VARCHAR(50),
+                SPUD_DATE DATE,
                 UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
                 CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )""",
                 "WELL_STATUS",
             ),
         ]
+
+        # Add ORGANIZATION_ID (and WELL_STATUS metadata) to existing tables that were created before these columns existed
+        alter_sqls = [
+            (
+                f"ALTER TABLE {qual}.WELL_DAILY_PRODUCTION ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "WELL_DAILY_PRODUCTION.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_SENSOR_READINGS ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "WELL_SENSOR_READINGS.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_ANOMALIES ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "WELL_ANOMALIES.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.ANOMALY_VIOLATIONS_NEW ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "ANOMALY_VIOLATIONS_NEW.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.ANOMALY_REVIEW ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "ANOMALY_REVIEW.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.OPERATION_RECOMMENDATION ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "OPERATION_RECOMMENDATION.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_STATUS ADD COLUMN ORGANIZATION_ID VARCHAR(36)",
+                "WELL_STATUS.ORGANIZATION_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_STATUS ADD COLUMN FACILITY_ID VARCHAR(100)",
+                "WELL_STATUS.FACILITY_ID",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_STATUS ADD COLUMN DATA_QUALITY_GROUP VARCHAR(50)",
+                "WELL_STATUS.DATA_QUALITY_GROUP",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_STATUS ADD COLUMN ORIENTATION VARCHAR(50)",
+                "WELL_STATUS.ORIENTATION",
+            ),
+            (
+                f"ALTER TABLE {qual}.WELL_STATUS ADD COLUMN SPUD_DATE DATE",
+                "WELL_STATUS.SPUD_DATE",
+            ),
+        ]
+        for alter_sql, label in alter_sqls:
+            try:
+                cur.execute(alter_sql)
+                logger.info(f"Snowflake: added column {label}")
+            except Exception as e:
+                if (
+                    "already exists" in str(e).lower()
+                    or "duplicate column" in str(e).lower()
+                ):
+                    logger.debug(f"Column {label} already exists, skipping")
+                else:
+                    logger.warning(f"Snowflake alter {label}: {e}")
 
         for sql, name in tables_sql:
             try:
@@ -920,6 +979,7 @@ def setup_postgres():
             """
             CREATE TABLE IF NOT EXISTS operation_suggestion (
                 id VARCHAR(50) PRIMARY KEY,
+                organization_id UUID,
                 well_id VARCHAR(50) NOT NULL,
                 category VARCHAR(50) DEFAULT 'Production',
                 action VARCHAR(255) NOT NULL,
@@ -952,12 +1012,16 @@ def setup_postgres():
             )
         """
         )
+        cur.execute(
+            "ALTER TABLE operation_suggestion ADD COLUMN IF NOT EXISTS organization_id UUID;"
+        )
         logger.info("PostgreSQL: operation_suggestion OK")
 
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS anomaly_suggestions (
                 id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                organization_id UUID,
                 well_id VARCHAR(50) NOT NULL,
                 asset_id VARCHAR(50),
                 lift_type VARCHAR(50),
@@ -978,6 +1042,9 @@ def setup_postgres():
         """
         )
         cur.execute(
+            "ALTER TABLE anomaly_suggestions ADD COLUMN IF NOT EXISTS organization_id UUID;"
+        )
+        cur.execute(
             "ALTER TABLE anomaly_suggestions ADD COLUMN IF NOT EXISTS well_status VARCHAR(50);"
         )
         cur.execute(
@@ -990,26 +1057,9 @@ def setup_postgres():
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS production_forecasting (
-                id VARCHAR(50) PRIMARY KEY,
-                uid VARCHAR(20) UNIQUE,
-                well_id VARCHAR(100),
-                boe FLOAT,
-                oil FLOAT,
-                gas FLOAT,
-                water FLOAT,
-                timestamp TIMESTAMP,
-                lift_type VARCHAR(50),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """
-        )
-        logger.info("PostgreSQL: production_forecasting OK")
-
-        cur.execute(
-            """
             CREATE TABLE IF NOT EXISTS anomaly_review (
                 id VARCHAR(100) PRIMARY KEY,
+                organization_id UUID,
                 well_id VARCHAR(100) NOT NULL,
                 event_date DATE NOT NULL,
                 detected_at TIMESTAMP,
@@ -1026,6 +1076,9 @@ def setup_postgres():
                 UNIQUE (well_id, anomaly_code, event_date)
             )
         """
+        )
+        cur.execute(
+            "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS organization_id UUID;"
         )
         logger.info("PostgreSQL: anomaly_review OK")
 

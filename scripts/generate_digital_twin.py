@@ -16,6 +16,7 @@ if _sys_root not in sys.path:
 _env_path = os.path.join(_sys_root, ".env")
 if os.path.isfile(_env_path):
     from dotenv import load_dotenv
+
     load_dotenv(_env_path)
 
 # --- CONFIGURATION ---
@@ -28,50 +29,51 @@ FAILURE_MODES = {
     "Rod Pump": {
         "Early": ["Polished Rod Clamp Slip", "Misaligned Unit"],
         "Mid": ["Parted Rods", "Stuck Pump", "Gearbox Failure"],
-        "Late": ["Hole in Tubing", "Casing Leak", "Unit Structural Fatigue"]
+        "Late": ["Hole in Tubing", "Casing Leak", "Unit Structural Fatigue"],
     },
     "ESP": {
         "Early": ["Splicing Failure", "Improper Cooling"],
         "Mid": ["Broken Shaft", "Cable Short", "Vibration Trip"],
-        "Late": ["Pump Stage Wear", "Scale Deposition"]
+        "Late": ["Pump Stage Wear", "Scale Deposition"],
     },
     "Gas Lift": {
         "Early": ["Valve Installation Error"],
         "Mid": ["Compressor Trip", "Injection Line Freeze"],
-        "Late": ["Scale Restriction", "Liquid Loading"]
-    }
+        "Late": ["Scale Restriction", "Liquid Loading"],
+    },
 }
+
 
 # --- 2. ASSET BUILDER ---
 def build_hierarchy():
     well_registry = []
-    facility_registry = {} 
-    
+    facility_registry = {}
+
     lifts = ["Rod Pump", "ESP", "Gas Lift"]
     orients = ["Horizontal", "Vertical"]
-    
+
     definitions = []
     for lift in lifts:
         for orient in orients:
             for _ in range(5):
                 definitions.append({"lift": lift, "orient": orient})
     random.shuffle(definitions)
-    
-    status_pool = ["Happy Path"]*12 + ["Failure"]*9 + ["Degrading"]*9
+
+    status_pool = ["Happy Path"] * 12 + ["Failure"] * 9 + ["Degrading"] * 9
     random.shuffle(status_pool)
-    
+
     leases = ["Mustang", "Bronco", "Ranger", "Pinto"]
 
     for i in range(30):
         defn = definitions[i]
         lease = leases[i % len(leases)]
         sect = [12, 22, 14, 4][i % 4]
-        
+
         fac_id = f"{lease}-{defn['orient']}-Battery"
-        
+
         age_days = random.randint(365, TOTAL_DAYS - 30)
         spud_date = END_DATE - timedelta(days=age_days)
-        
+
         if fac_id not in facility_registry:
             facility_registry[fac_id] = spud_date
         elif spud_date < facility_registry[fac_id]:
@@ -79,70 +81,74 @@ def build_hierarchy():
 
         exist = len([w for w in well_registry if w["lease"] == lease]) + 1
         w_name = f"{lease}-{sect}-{exist}-{defn['orient'][0]}"
-        
-        well_registry.append({
-            "asset_id": w_name,
-            "lease": lease,
-            "facility_id": fac_id,
-            "lift_type": defn["lift"],
-            "orientation": defn["orient"],
-            "spud_date": spud_date,
-            "current_status_goal": status_pool[i],
-            "base_rate": 800 if defn["orient"] == "Horizontal" else 150
-        })
-        
+
+        well_registry.append(
+            {
+                "asset_id": w_name,
+                "lease": lease,
+                "facility_id": fac_id,
+                "lift_type": defn["lift"],
+                "orientation": defn["orient"],
+                "spud_date": spud_date,
+                "current_status_goal": status_pool[i],
+                "base_rate": 800 if defn["orient"] == "Horizontal" else 150,
+            }
+        )
+
     return well_registry, facility_registry
+
 
 # --- 3. PHYSICS ENGINE (The Engineering KPIs) ---
 def generate_well_timeline(well):
     dates = pd.date_range(well["spud_date"], END_DATE, freq="D")
     days = len(dates)
-    if days < 1: return pd.DataFrame()
+    if days < 1:
+        return pd.DataFrame()
 
     # A. Base Production (Decline)
     t = np.arange(days)
     decline = 0.0006 if well["orientation"] == "Horizontal" else 0.0002
     rates = well["base_rate"] * np.exp(-decline * t)
-    rates = rates * np.random.normal(1.0, 0.05, days) # Noise
-    
+    rates = rates * np.random.normal(1.0, 0.05, days)  # Noise
+
     # B. Lift-Specific Parameters (KPIs)
     lift = well["lift_type"]
-    
+
     # Common Defaults
-    gross_stroke = [None]*days
-    net_stroke = [None]*days
-    spm = [None]*days
-    fillage = [None]*days
-    freq_hz = [None]*days
-    motor_amps = [None]*days
-    pip = [None]*days
-    motor_temp = [None]*days
-    inj_rate = [None]*days
-    inj_press = [None]*days
-    
+    gross_stroke = [None] * days
+    net_stroke = [None] * days
+    spm = [None] * days
+    fillage = [None] * days
+    freq_hz = [None] * days
+    motor_amps = [None] * days
+    pip = [None] * days
+    motor_temp = [None] * days
+    inj_rate = [None] * days
+    inj_press = [None] * days
+
     # Common Sensors
-    tp = (rates * 0.1) + 200 # Base Tubing Press
-    cp = (rates * 0.05) + 50 # Base Casing Press
-    
+    tp = (rates * 0.1) + 200  # Base Tubing Press
+    cp = (rates * 0.05) + 50  # Base Casing Press
+
     # --- ENGINEERING LOGIC ---
     if lift == "Rod Pump":
         # Gross Stroke (Surface)
         gross_base = 144 if well["orientation"] == "Horizontal" else 100
         gross_stroke = np.full(days, gross_base)
-        
+
         # Net Stroke (Downhole)
         net_stroke = gross_stroke * np.random.uniform(0.85, 0.90, days)
-        
+
         # Speed
         spm = np.random.normal(8.5, 0.2, days)
-        
+
         # Fillage
         fillage = np.random.normal(92, 3, days)
         fillage = np.clip(fillage, 0, 100)
-        
+
         # Amps
         motor_amps = (rates / 10) + 20 + np.random.normal(0, 2, days)
-        
+
         # PIP (Added for Rod Pump)
         # Low PIP = Starvation risk. High PIP = Inefficient pumping.
         pip = 300 + (rates * 0.3) + np.random.normal(0, 15, days)
@@ -151,24 +157,24 @@ def generate_well_timeline(well):
         # Frequency
         freq_hz = np.random.normal(58, 1, days)
         freq_hz = np.clip(freq_hz, 0, 65)
-        
+
         # Amps
         motor_amps = (rates / 8) + 30 + np.random.normal(0, 3, days)
-        
+
         # PIP
         pip = 500 + (rates * 0.2) + np.random.normal(0, 10, days)
-        
+
         # Motor Temp
         motor_temp = 170 + (motor_amps * 0.5) + np.random.normal(0, 2, days)
 
     elif lift == "Gas Lift":
         # Injection Rate
         inj_rate = np.random.normal(600, 20, days)
-        
+
         # Injection Pressure
         inj_press = np.random.normal(900, 15, days)
-        cp = inj_press 
-        tp = inj_press * 0.3 
+        cp = inj_press
+        tp = inj_press * 0.3
 
     # C. Failure Logic
     num_failures = max(1, int(days / random.randint(180, 450)))
@@ -178,92 +184,96 @@ def generate_well_timeline(well):
 
     status_col = ["OK"] * days
     notes_col = [""] * days
-    
+
     for idx in fail_indices:
         mode = random.choice(FAILURE_MODES[lift]["Mid"])
         downtime = random.randint(3, 10)
         end = min(idx + downtime, days)
-        
+
         rates[idx:end] = 0
         status_col[idx:end] = ["FAILURE"] * (end - idx)
-        
+
         if lift == "Rod Pump":
             if "Parted" in mode:
                 motor_amps[idx:end] *= 0.4
                 fillage[idx:end] = 0
                 net_stroke[idx:end] = 0
-                pip[idx:end] += 200 # Fluid level rises (pump not moving fluid)
+                pip[idx:end] += 200  # Fluid level rises (pump not moving fluid)
             elif "Stuck" in mode:
                 motor_amps[idx:end] *= 2.0
                 spm[idx:end] = 0
-                
+
         elif lift == "ESP":
             if "Shaft" in mode:
                 motor_amps[idx:end] = 20
-                pip[idx:end] = 2500 # Max static P
+                pip[idx:end] = 2500  # Max static P
             elif "Short" in mode:
                 motor_amps[idx:end] = 0
                 freq_hz[idx:end] = 0
-                
+
         elif lift == "Gas Lift":
             if "Trip" in mode:
                 inj_rate[idx:end] = 0
                 cp[idx:end] *= 0.5
 
         notes_col[idx] = f"ALERT: {mode}."
-        if end < days: notes_col[end] = "Workover Complete."
+        if end < days:
+            notes_col[end] = "Workover Complete."
 
     # D. End of Life Goal
     last_30 = slice(-30, None)
     if well["current_status_goal"] == "Degrading":
         decay = np.linspace(1.0, 0.7, 30)
         rates[last_30] *= decay
-        if lift == "ESP": 
+        if lift == "ESP":
             pip[last_30] *= decay
             motor_temp[last_30] *= 1.1
         elif lift == "Rod Pump":
             fillage[last_30] *= decay
             # As rate drops, PIP usually drops (starvation) OR rises (pump wear)
             # Modeling starvation here:
-            pip[last_30] *= decay 
+            pip[last_30] *= decay
 
     # E. Test Logic
-    test_oil = [None]*days
-    test_water = [None]*days
-    test_gas = [None]*days
+    test_oil = [None] * days
+    test_water = [None] * days
+    test_gas = [None] * days
     curr = random.randint(0, 20)
     while curr < days:
         if rates[curr] > 0:
             test_oil[curr] = round(rates[curr], 2)
-            test_water[curr] = round(rates[curr]*2.5, 2)
-            test_gas[curr] = round(rates[curr]*1.5, 2)
+            test_water[curr] = round(rates[curr] * 2.5, 2)
+            test_gas[curr] = round(rates[curr] * 1.5, 2)
         curr += random.randint(10, 25)
 
-    return pd.DataFrame({
-        "date": dates,
-        "asset_id": well["asset_id"],
-        "facility_id": well["facility_id"],
-        "lift_type": well["lift_type"],
-        "true_oil": rates,
-        "true_water": rates*2.5,
-        "true_gas": rates*1.5,
-        "test_oil": test_oil,
-        "test_water": test_water,
-        "test_gas": test_gas,
-        "avg_tubing_pressure": tp,
-        "avg_casing_pressure": cp,
-        "spm": spm,
-        "gross_stroke_len": gross_stroke,
-        "net_stroke_len": net_stroke,
-        "pump_fillage_pct": fillage,
-        "avg_motor_amps": motor_amps,
-        "freq_hz": freq_hz,
-        "pump_intake_pressure": pip, # SHARED for RP and ESP
-        "motor_temp_f": motor_temp,
-        "injection_rate_mcf": inj_rate,
-        "status": status_col,
-        "notes": notes_col
-    })
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "asset_id": well["asset_id"],
+            "facility_id": well["facility_id"],
+            "lift_type": well["lift_type"],
+            "true_oil": rates,
+            "true_water": rates * 2.5,
+            "true_gas": rates * 1.5,
+            "test_oil": test_oil,
+            "test_water": test_water,
+            "test_gas": test_gas,
+            "avg_tubing_pressure": tp,
+            "avg_casing_pressure": cp,
+            "spm": spm,
+            "gross_stroke_len": gross_stroke,
+            "net_stroke_len": net_stroke,
+            "pump_fillage_pct": fillage,
+            "avg_motor_amps": motor_amps,
+            "freq_hz": freq_hz,
+            "pump_intake_pressure": pip,  # SHARED for RP and ESP
+            "motor_temp_f": motor_temp,
+            "injection_rate_mcf": inj_rate,
+            "status": status_col,
+            "notes": notes_col,
+        }
+    )
+
 
 # --- 4. SNOWFLAKE UPLOAD (same tables as generate_sample_data.py) ---
 # BOE = Barrel of Oil Equivalent. Client formula: BOE = (bbl oil) + (mcf gas / 6)
@@ -274,6 +284,7 @@ def compute_boe(oil_bbl, gas_mcf):
         return round(float(oil_bbl or 0) + float(gas_mcf or 0) / 6.0, 2)
     except (TypeError, ValueError):
         return None
+
 
 # Twin data we have but do NOT insert (no matching DB column or not yet used):
 # - facility_id (prod table has no facility_id)
@@ -292,9 +303,10 @@ TWIN_TO_SENSOR_COL = {
     "motor_temp_f": "motor_temp",
     "freq_hz": "freq_hz",  # use as-is if DB has it; else try "frequency"
     "injection_rate_mcf": "injection_rate",
-    "gross_stroke_len": "surface_stroke_length",   # Rod Pump surface stroke
-    "net_stroke_len": "downhole_net_stroke",       # Rod Pump downhole net stroke
+    "gross_stroke_len": "surface_stroke_length",  # Rod Pump surface stroke
+    "net_stroke_len": "downhole_net_stroke",  # Rod Pump downhole net stroke
 }
+
 
 def _clean_val(val):
     if pd.isna(val) or val is None:
@@ -304,24 +316,32 @@ def _clean_val(val):
     except (TypeError, ValueError):
         return None
 
+
 def _get_table_columns(cursor, database, schema, table_name):
     """Return list of column names (lowercase) for the table, in order."""
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT LOWER(COLUMN_NAME) AS col
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE LOWER(TABLE_CATALOG) = LOWER(%s)
           AND LOWER(TABLE_SCHEMA) = LOWER(%s)
           AND LOWER(TABLE_NAME) = LOWER(%s)
         ORDER BY ORDINAL_POSITION
-    """, (database, schema, table_name))
+    """,
+        (database, schema, table_name),
+    )
     return [row[0] for row in cursor.fetchall()]
 
 
-def upload_to_snowflake(master_df, well_meta):
+def upload_to_snowflake(master_df, well_meta, organization_id=None):
     """Insert digital twin data into well_daily_production and well_sensor_readings.
     Uses only columns that exist in the DB so it works when not all columns are present.
-    Run scripts/sync_snowflake_schema.py first to add missing columns if needed.
+    organization_id: UUID from your organizations Postgres; can also set env ORGANIZATION_ID.
     """
+    organization_id = organization_id or os.getenv("ORGANIZATION_ID")
+    if not organization_id:
+        print("ORGANIZATION_ID not set (env or argument). Skipping Snowflake upload.")
+        return
     try:
         from snowflake.connector import connect as snowflake_connect
     except Exception as e:
@@ -353,26 +373,46 @@ def upload_to_snowflake(master_df, well_meta):
 
         # Exclude auto/system columns from insert (order matches twin data)
         _prod_col_order = [
-            "well_id", "date", "oil_volume", "gas_volume", "water_volume", "boe", "lift_type",
-            "status", "notes", "test_oil", "test_water", "test_gas", "facility_id",
+            "organization_id",
+            "well_id",
+            "date",
+            "oil_volume",
+            "gas_volume",
+            "water_volume",
+            "boe",
+            "lift_type",
+            "status",
+            "notes",
+            "test_oil",
+            "test_water",
+            "test_gas",
+            "facility_id",
         ]
         insert_prod_cols = [c for c in _prod_col_order if c in prod_columns]
         if not insert_prod_cols:
-            print("ERROR: well_daily_production has no insertable columns. Run sync_snowflake_schema.py or create table.")
+            print(
+                "ERROR: well_daily_production has no insertable columns. Run sync_snowflake_schema.py or create table."
+            )
             return
 
         # Sensor: use only columns that exist in the table (order preserved)
-        insert_sensor_cols = [c for c in sensor_columns if c not in ("id", "created_at")]
+        insert_sensor_cols = [
+            c for c in sensor_columns if c not in ("id", "created_at")
+        ]
         if not insert_sensor_cols:
             print("ERROR: well_sensor_readings has no insertable columns.")
             return
 
         print(f"Production columns for insert: {insert_prod_cols}")
-        print(f"Sensor columns for insert: {len(insert_sensor_cols)} (first 10: {insert_sensor_cols[:10]}...)")
+        print(
+            f"Sensor columns for insert: {len(insert_sensor_cols)} (first 10: {insert_sensor_cols[:10]}...)"
+        )
 
-        print("Clearing previous data in well_daily_production and well_sensor_readings...")
-        cursor.execute("DELETE FROM well_daily_production")
-        cursor.execute("DELETE FROM well_sensor_readings")
+        print(
+            "Clearing previous data for this organization in well_daily_production and well_sensor_readings..."
+        )
+        cursor.execute("DELETE FROM well_daily_production WHERE organization_id = %s", (organization_id,))
+        cursor.execute("DELETE FROM well_sensor_readings WHERE organization_id = %s", (organization_id,))
 
         # --- Daily production: only insert into columns that exist ---
         daily_tuples = []
@@ -383,7 +423,9 @@ def upload_to_snowflake(master_df, well_meta):
             # Build tuple in same order as insert_prod_cols
             vals = []
             for col in insert_prod_cols:
-                if col == "well_id":
+                if col == "organization_id":
+                    vals.append(organization_id)
+                elif col == "well_id":
                     vals.append(row["asset_id"])
                 elif col == "date":
                     vals.append(row["date"].strftime("%Y-%m-%d"))
@@ -408,7 +450,9 @@ def upload_to_snowflake(master_df, well_meta):
                 elif col == "test_gas":
                     vals.append(_clean_val(row.get("test_gas")))
                 elif col == "facility_id":
-                    vals.append(str(row["facility_id"]) if row.get("facility_id") else None)
+                    vals.append(
+                        str(row["facility_id"]) if row.get("facility_id") else None
+                    )
                 else:
                     vals.append(None)
             daily_tuples.append(tuple(vals))
@@ -421,6 +465,11 @@ def upload_to_snowflake(master_df, well_meta):
         print(f"  Inserted {len(daily_tuples):,} daily production records.")
 
         # --- Hourly sensor readings: only columns that exist in DB ---
+        # NOTE: We add small per-hour noise so the same value is NOT repeated 24 times.
+        # Repeating the same value 24h makes rolling 24h std = 0 and "current vs baseline"
+        # ratios ~1.0 on normal days, so physics checkers (ENERGY_DIV, FLUID_POUND, etc.)
+        # rarely fire. With hourly noise, variance is non-zero and anomalies stand out.
+        HOURLY_NOISE_PCT = 0.01  # ±1% per hour so 24h has small variance
         twin_to_db = {}
         for twin_col, db_col in TWIN_TO_SENSOR_COL.items():
             if db_col in insert_sensor_cols:
@@ -434,6 +483,8 @@ def upload_to_snowflake(master_df, well_meta):
             for hour in range(24):
                 ts = (base_ts + pd.Timedelta(hours=hour)).strftime("%Y-%m-%d %H:%M:%S")
                 rec = {col: None for col in insert_sensor_cols}
+                if "organization_id" in insert_sensor_cols:
+                    rec["organization_id"] = organization_id
                 rec["well_id"] = row["asset_id"]
                 rec["timestamp"] = ts
                 rec["lift_type"] = row["lift_type"]
@@ -441,9 +492,19 @@ def upload_to_snowflake(master_df, well_meta):
                     if twin_col in row.index:
                         val = _clean_val(row[twin_col])
                         if val is not None:
-                            rec[db_col] = val
-                if row["lift_type"] == "Gas Lift" and "injection_pressure" in insert_sensor_cols and rec.get("injection_pressure") is None:
-                    rec["injection_pressure"] = _clean_val(row.get("avg_casing_pressure"))
+                            # Add small hourly variation so 24h is not flat (helps physics checkers)
+                            noise = 1.0 + np.random.uniform(
+                                -HOURLY_NOISE_PCT, HOURLY_NOISE_PCT
+                            )
+                            rec[db_col] = round(val * noise, 2)
+                if (
+                    row["lift_type"] == "Gas Lift"
+                    and "injection_pressure" in insert_sensor_cols
+                    and rec.get("injection_pressure") is None
+                ):
+                    rec["injection_pressure"] = _clean_val(
+                        row.get("avg_casing_pressure")
+                    )
                 if "well_status" in insert_sensor_cols and row.get("status"):
                     rec["well_status"] = str(row["status"])
                 sensor_rows.append(rec)
@@ -457,7 +518,45 @@ def upload_to_snowflake(master_df, well_meta):
                 f"INSERT INTO well_sensor_readings ({', '.join(insert_sensor_cols)}) VALUES ({placeholders})",
                 data_tuples,
             )
-            print(f"  Sensor batch {i // batch_size + 1}: {min(i + batch_size, len(sensor_rows)):,} / {len(sensor_rows):,}")
+            print(
+                f"  Sensor batch {i // batch_size + 1}: {min(i + batch_size, len(sensor_rows)):,} / {len(sensor_rows):,}"
+            )
+
+        # Upsert WELL_STATUS with static metadata (data_quality_group, facility_id, orientation, spud_date)
+        # so we don't overwrite live status fields (STATUS, LAST_READING_TIMESTAMP, etc.) when they exist
+        well_status_table = f"{db}.{schema}.WELL_STATUS"
+        for w in well_meta:
+            try:
+                cursor.execute(
+                    f"""
+                    MERGE INTO {well_status_table} AS target
+                    USING (SELECT %s AS WELL_ID, %s AS ORGANIZATION_ID, %s AS LIFT_TYPE, %s AS FACILITY_ID,
+                                  %s AS DATA_QUALITY_GROUP, %s AS ORIENTATION, %s AS SPUD_DATE) AS source
+                    ON target.WELL_ID = source.WELL_ID
+                    WHEN MATCHED THEN UPDATE SET
+                        target.ORGANIZATION_ID = source.ORGANIZATION_ID,
+                        target.FACILITY_ID = source.FACILITY_ID,
+                        target.DATA_QUALITY_GROUP = source.DATA_QUALITY_GROUP,
+                        target.ORIENTATION = source.ORIENTATION,
+                        target.SPUD_DATE = source.SPUD_DATE
+                    WHEN NOT MATCHED THEN INSERT (
+                        WELL_ID, ORGANIZATION_ID, LIFT_TYPE, FACILITY_ID, DATA_QUALITY_GROUP,
+                        ORIENTATION, SPUD_DATE, STATUS
+                    ) VALUES (source.WELL_ID, source.ORGANIZATION_ID, source.LIFT_TYPE, source.FACILITY_ID,
+                              source.DATA_QUALITY_GROUP, source.ORIENTATION, source.SPUD_DATE, 'UNKNOWN')
+                    """,
+                    (
+                        w["asset_id"],
+                        organization_id,
+                        w["lift_type"],
+                        w.get("facility_id"),
+                        w.get("current_status_goal"),
+                        w.get("orientation"),
+                        w["spud_date"].strftime("%Y-%m-%d") if w.get("spud_date") else None,
+                    ),
+                )
+            except Exception as e:
+                print(f"  Warning: WELL_STATUS upsert for {w['asset_id']}: {e}")
         conn.commit()
         print("SUCCESS: Digital twin data uploaded to Snowflake.")
     except Exception as e:
@@ -473,60 +572,70 @@ def upload_to_snowflake(master_df, well_meta):
 def run_simulation(upload_snowflake=False, write_json=True):
     print("Generating Engineering-Grade Digital Twin (v3.1)...")
     well_meta, fac_meta = build_hierarchy()
-    
+
     all_dfs = []
     for w in well_meta:
         all_dfs.append(generate_well_timeline(w))
     master_df = pd.concat(all_dfs).sort_values(["date", "facility_id"])
-    
+
     output = {"company": "Apex Permian", "assets": {}}
     for w in well_meta:
-        output["assets"][w["asset_id"]] = {"type": "Well", "lift": w["lift_type"], "history": []}
+        output["assets"][w["asset_id"]] = {
+            "type": "Well",
+            "lift": w["lift_type"],
+            "history": [],
+        }
     for fid in fac_meta:
         output["assets"][fid] = {"type": "Facility", "history": []}
-    
+
     for fid in master_df["facility_id"].unique():
         fac_df = master_df[master_df["facility_id"] == fid]
         for date, day_data in fac_df.groupby("date"):
             d_str = date.strftime("%Y-%m-%d")
-            
+
             esd = False
-            if random.random() < 0.0005: esd = True
-            
+            if random.random() < 0.0005:
+                esd = True
+
             total_oil = day_data["true_oil"].sum() if not esd else 0
-            
-            output["assets"][fid]["history"].append({
-                "date": d_str,
-                "oil_prod": round(total_oil, 2),
-                "status": "ESD" if esd else "OK"
-            })
-            
+
+            output["assets"][fid]["history"].append(
+                {
+                    "date": d_str,
+                    "oil_prod": round(total_oil, 2),
+                    "status": "ESD" if esd else "OK",
+                }
+            )
+
             sum_true = day_data["true_oil"].sum()
             for _, row in day_data.iterrows():
                 alloc_oil = 0
                 if not esd and sum_true > 0:
-                    alloc_oil = total_oil * (row["true_oil"]/sum_true)
-                
-                def clean(val): return None if pd.isna(val) else round(val, 2)
-                
-                output["assets"][row["asset_id"]]["history"].append({
-                    "date": d_str,
-                    "allocated_oil": round(alloc_oil, 2),
-                    "test_oil": row["test_oil"],
-                    "avg_tubing_pressure": clean(row["avg_tubing_pressure"]),
-                    "avg_casing_pressure": clean(row["avg_casing_pressure"]),
-                    "avg_motor_amps": clean(row["avg_motor_amps"]),
-                    "gross_stroke_len": clean(row["gross_stroke_len"]),
-                    "net_stroke_len": clean(row["net_stroke_len"]),
-                    "spm": clean(row["spm"]),
-                    "pump_fillage_pct": clean(row["pump_fillage_pct"]),
-                    "freq_hz": clean(row["freq_hz"]),
-                    "pump_intake_pressure": clean(row["pump_intake_pressure"]),
-                    "motor_temp_f": clean(row["motor_temp_f"]),
-                    "injection_rate_mcf": clean(row["injection_rate_mcf"]),
-                    "status": "SHUT_IN" if esd else row["status"],
-                    "notes": row["notes"]
-                })
+                    alloc_oil = total_oil * (row["true_oil"] / sum_true)
+
+                def clean(val):
+                    return None if pd.isna(val) else round(val, 2)
+
+                output["assets"][row["asset_id"]]["history"].append(
+                    {
+                        "date": d_str,
+                        "allocated_oil": round(alloc_oil, 2),
+                        "test_oil": row["test_oil"],
+                        "avg_tubing_pressure": clean(row["avg_tubing_pressure"]),
+                        "avg_casing_pressure": clean(row["avg_casing_pressure"]),
+                        "avg_motor_amps": clean(row["avg_motor_amps"]),
+                        "gross_stroke_len": clean(row["gross_stroke_len"]),
+                        "net_stroke_len": clean(row["net_stroke_len"]),
+                        "spm": clean(row["spm"]),
+                        "pump_fillage_pct": clean(row["pump_fillage_pct"]),
+                        "freq_hz": clean(row["freq_hz"]),
+                        "pump_intake_pressure": clean(row["pump_intake_pressure"]),
+                        "motor_temp_f": clean(row["motor_temp_f"]),
+                        "injection_rate_mcf": clean(row["injection_rate_mcf"]),
+                        "status": "SHUT_IN" if esd else row["status"],
+                        "notes": row["notes"],
+                    }
+                )
 
     if write_json:
         with open("apex_permian_v3_1_engineering.json", "w") as f:
@@ -534,11 +643,29 @@ def run_simulation(upload_snowflake=False, write_json=True):
         print("Done: apex_permian_v3_1_engineering.json")
 
     if upload_snowflake:
-        upload_to_snowflake(master_df, well_meta)
+        upload_to_snowflake(master_df, well_meta, organization_id=os.getenv("ORGANIZATION_ID"))
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate digital twin data (JSON and/or Snowflake).")
-    parser.add_argument("--snowflake", action="store_true", help="Upload to Snowflake (same tables as generate_sample_data)")
-    parser.add_argument("--no-json", action="store_true", help="Skip writing apex_permian_v3_1_engineering.json")
+    parser = argparse.ArgumentParser(
+        description="Generate digital twin data (JSON and/or Snowflake)."
+    )
+    parser.add_argument(
+        "--snowflake",
+        action="store_true",
+        help="Upload to Snowflake (same tables as generate_sample_data)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write apex_permian_v3_1_engineering.json to current directory (default: do not write)",
+    )
+    parser.add_argument(
+        "--organization-id",
+        default=os.getenv("ORGANIZATION_ID"),
+        help="Organization UUID (from organizations Postgres). Default: ORGANIZATION_ID env.",
+    )
     args = parser.parse_args()
-    run_simulation(upload_snowflake=args.snowflake, write_json=not args.no_json)
+    if args.organization_id:
+        os.environ["ORGANIZATION_ID"] = args.organization_id
+    run_simulation(upload_snowflake=args.snowflake, write_json=args.json)

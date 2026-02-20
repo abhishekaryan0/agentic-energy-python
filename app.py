@@ -115,6 +115,11 @@ SNOWFLAKE_CONFIG = {
     'role': os.getenv('SNOWFLAKE_ROLE')
 }
 
+
+def _get_organization_id():
+    """Organization UUID from env (from your organizations Postgres). Passed to Snowflake/Postgres writes."""
+    return os.getenv("ORGANIZATION_ID")
+
 REQUIRED_SNOWFLAKE_KEYS = ['user', 'password', 'account', 'warehouse', 'database', 'schema', 'role']
 missing_sf = [k for k in REQUIRED_SNOWFLAKE_KEYS if not SNOWFLAKE_CONFIG.get(k)]
 if missing_sf:
@@ -417,19 +422,35 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
         violation_summary = "; ".join([v['violation'] for v in anomaly_details.get('violations', [])])
         raw_values = json.dumps(readings, cls=CustomJSONEncoder, default=str)
 
-        anomaly_params = [
-            well_id, timestamp_str, violation_summary,
-            float(anomaly_details.get('anomaly_score', 0)), raw_values,
-            'Rule_Based_Frontend', 'New', final_severity, lift_type
-        ]
-        cursor.execute(
-            """
-            INSERT INTO well_anomalies
-            (well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category)
-            SELECT %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s, %s, %s
-            """,
-            anomaly_params
-        )
+        org_id = _get_organization_id()
+        if org_id:
+            anomaly_params = [
+                org_id, well_id, timestamp_str, violation_summary,
+                float(anomaly_details.get('anomaly_score', 0)), raw_values,
+                'Rule_Based_Frontend', 'New', final_severity, lift_type
+            ]
+            cursor.execute(
+                """
+                INSERT INTO well_anomalies
+                (organization_id, well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category)
+                SELECT %s, %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s, %s, %s
+                """,
+                anomaly_params
+            )
+        else:
+            anomaly_params = [
+                well_id, timestamp_str, violation_summary,
+                float(anomaly_details.get('anomaly_score', 0)), raw_values,
+                'Rule_Based_Frontend', 'New', final_severity, lift_type
+            ]
+            cursor.execute(
+                """
+                INSERT INTO well_anomalies
+                (well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category)
+                SELECT %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s, %s, %s
+                """,
+                anomaly_params
+            )
         cursor.execute(
             "SELECT ID FROM well_anomalies WHERE well_id = %s AND timestamp = %s ORDER BY ID DESC LIMIT 1",
             (well_id, timestamp_str)
@@ -438,21 +459,38 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
         current_anomaly_id = row_id[0] if row_id else None
 
         if current_anomaly_id and anomaly_details.get('violations'):
-            query_vio = """
-            INSERT INTO anomaly_violations_new
-            (anomaly_id, well_id, timestamp, parameter_name, actual_value, expected_min, expected_max, unit, deviation_percent)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            for v in anomaly_details['violations']:
-                dev_pct = v.get('deviation_pct', 0.0)
-                e_min = v.get('min') if v.get('min') is not None else 0.0
-                e_max = v.get('max') if v.get('max') is not None else 0.0
-                params_vio = (
-                    current_anomaly_id, well_id, timestamp_str,
-                    v.get('field'), v.get('value'), e_min, e_max,
-                    v.get('unit', ''), dev_pct
-                )
-                cursor.execute(query_vio, params_vio)
+            if org_id:
+                query_vio = """
+                INSERT INTO anomaly_violations_new
+                (organization_id, anomaly_id, well_id, timestamp, parameter_name, actual_value, expected_min, expected_max, unit, deviation_percent)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                for v in anomaly_details['violations']:
+                    dev_pct = v.get('deviation_pct', 0.0)
+                    e_min = v.get('min') if v.get('min') is not None else 0.0
+                    e_max = v.get('max') if v.get('max') is not None else 0.0
+                    params_vio = (
+                        org_id, current_anomaly_id, well_id, timestamp_str,
+                        v.get('field'), v.get('value'), e_min, e_max,
+                        v.get('unit', ''), dev_pct
+                    )
+                    cursor.execute(query_vio, params_vio)
+            else:
+                query_vio = """
+                INSERT INTO anomaly_violations_new
+                (anomaly_id, well_id, timestamp, parameter_name, actual_value, expected_min, expected_max, unit, deviation_percent)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                for v in anomaly_details['violations']:
+                    dev_pct = v.get('deviation_pct', 0.0)
+                    e_min = v.get('min') if v.get('min') is not None else 0.0
+                    e_max = v.get('max') if v.get('max') is not None else 0.0
+                    params_vio = (
+                        current_anomaly_id, well_id, timestamp_str,
+                        v.get('field'), v.get('value'), e_min, e_max,
+                        v.get('unit', ''), dev_pct
+                    )
+                    cursor.execute(query_vio, params_vio)
 
         conn.commit()
 
@@ -1098,8 +1136,9 @@ def insert_reading():
                 return val
             
             # --- 1. INSERT RAW READING ---
-            field_names = ['well_id', 'timestamp', 'lift_type', 'well_status'] + list(readings.keys())
-            field_values = [well_id, timestamp_str, lift_type, well_status] + [convert_for_db(v) for v in readings.values()]
+            org_id = _get_organization_id()
+            field_names = (['organization_id'] if org_id else []) + ['well_id', 'timestamp', 'lift_type', 'well_status'] + list(readings.keys())
+            field_values = ([org_id] if org_id else []) + [well_id, timestamp_str, lift_type, well_status] + [convert_for_db(v) for v in readings.values()]
             placeholders = ', '.join(['%s'] * len(field_values))
             fields_str = ', '.join(field_names)
             
@@ -1109,9 +1148,9 @@ def insert_reading():
                 cursor.execute(query_readings, field_values)
             except Exception as e:
                 # If lift_type or well_status column is missing, retry without them
-                if "lift_type" in str(e).lower() or "well_status" in str(e).lower() or "invalid identifier" in str(e).lower():
-                    field_names = ['well_id', 'timestamp'] + list(readings.keys())
-                    field_values = [well_id, timestamp_str] + [convert_for_db(v) for v in readings.values()]
+                if "lift_type" in str(e).lower() or "well_status" in str(e).lower() or "organization_id" in str(e).lower() or "invalid identifier" in str(e).lower():
+                    field_names = (['organization_id'] if org_id else []) + ['well_id', 'timestamp'] + list(readings.keys())
+                    field_values = ([org_id] if org_id else []) + [well_id, timestamp_str] + [convert_for_db(v) for v in readings.values()]
                     placeholders = ', '.join(['%s'] * len(field_values))
                     fields_str = ', '.join(field_names)
                     query_readings = f"INSERT INTO well_sensor_readings ({fields_str}) VALUES ({placeholders})"

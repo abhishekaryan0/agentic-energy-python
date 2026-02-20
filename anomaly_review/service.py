@@ -206,33 +206,24 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     except Exception as e:
         logger.error(f"Alarm Gatekeeper failed for {well_id}: {e}")
 
-    # --- FLATLINE DETECTION ---
-    # Detect sensors stuck at a single value (Variance = 0) over last 24 hours
-    try:
-        # Define sensors to check
-        flatline_sensors = ['tubing_pressure', 'casing_pressure', 'motor_current', 'pump_fillage', 'strokes_per_minute']
-        
-        # Get data for last 24 hours
-        if not full_df.empty and 'timestamp' in full_df.columns:
-            last_ts = full_df['timestamp'].max()
-            start_ts = last_ts - pd.Timedelta(hours=24)
-            
-            # Mask for recent data
-            recent_mask = full_df['timestamp'] >= start_ts
-            recent_data = full_df.loc[recent_mask]
-            
-            if len(recent_data) > 2: # Need at least a few points to compute std
-                for sensor in flatline_sensors:
-                    if sensor in recent_data.columns:
-                        std_dev = recent_data[sensor].std()
-                        
-                        # Check strictly for 0.0 (or extremely close)
-                        if pd.notna(std_dev) and std_dev == 0.0:
-                            logger.warning(f"Flatline detected for {sensor} on {well_id} (StdDev=0). Masking recent values.")
-                            # Mask values in the main dataframe for the recent period
-                            full_df.loc[recent_mask, sensor] = np.nan
-    except Exception as e:
-        logger.error(f"Flatline detection failed for {well_id}: {e}")
+    # --- FLATLINE DETECTION (DISABLED) ---
+    # Synthetic / perfect data often repeats values for 24h; treating that as "broken sensor" and
+    # converting to NaN kills Physics checkers. Re-enable only when real SCADA variance is available.
+    # try:
+    #     flatline_sensors = ['tubing_pressure', 'casing_pressure', 'motor_current', 'pump_fillage', 'strokes_per_minute']
+    #     if not full_df.empty and 'timestamp' in full_df.columns:
+    #         last_ts = full_df['timestamp'].max()
+    #         start_ts = last_ts - pd.Timedelta(hours=24)
+    #         recent_mask = full_df['timestamp'] >= start_ts
+    #         recent_data = full_df.loc[recent_mask]
+    #         if len(recent_data) > 2:
+    #             for sensor in flatline_sensors:
+    #                 if sensor in recent_data.columns:
+    #                     std_dev = recent_data[sensor].std()
+    #                     if pd.notna(std_dev) and std_dev == 0.0:
+    #                         full_df.loc[recent_mask, sensor] = np.nan
+    # except Exception as e:
+    #     logger.error(f"Flatline detection failed for {well_id}: {e}")
     # --------------------------
 
     # Ensure lift_type exists (Forward fill to handle intermittent metadata)
@@ -304,6 +295,8 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     if not ae_results.empty:
                         # Align by index so rows without ae result keep 0.0 (avoid NaNs breaking ML check)
                         full_df.loc[ae_results.index, 'reconstruction_error'] = ae_results['reconstruction_error'].values
+                        if 'top_contributing_features' in ae_results.columns:
+                            full_df.loc[ae_results.index, 'top_contributing_features'] = ae_results['top_contributing_features'].values
                         autoencoder_threshold = model_art.get('threshold', 0.5)
                 except Exception as e:
                     logger.error(f"Autoencoder detection failed: {e}")
@@ -388,21 +381,6 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     res = check(ctx)
             except Exception as e:
                 logger.error(f"Checker '{check.__name__}' failed: {e}")
-            
-            # ML Anomaly Check (Special case - requires reconstruction error)
-            if res is None and 'reconstruction_error' in ctx:
-                try:
-                    from anomaly_review.checkers import check_ml_anomaly
-                    rec_error = ctx.get('reconstruction_error', 0.0)
-                    res = check_ml_anomaly(
-                        ctx,
-                        rec_error,
-                        autoencoder_threshold
-                    )
-                    if res:
-                        logger.info(f"[ML_CHECK] Row {idx}: ANOMALY DETECTED recon_error={rec_error:.4f}, threshold={autoencoder_threshold:.4f}")
-                except Exception as e:
-                    logger.error(f"ML Anomaly checker failed: {e}")
 
             if res:
                 # Calculate severity based on specific metric thresholds
@@ -425,6 +403,35 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "severity_metrics": res.get('severity_metrics', {}),
                     "chart_payload": res.get('chart_payload', {})
                 })
+
+        # ML Anomaly Check once per row (not inside checker loop to avoid duplicate findings and log spam)
+        if 'reconstruction_error' in ctx:
+            try:
+                from anomaly_review.checkers import check_ml_anomaly
+                rec_error = ctx.get('reconstruction_error', 0.0)
+                res_ml = check_ml_anomaly(ctx, rec_error, autoencoder_threshold)
+                if res_ml:
+                    logger.info(f"[ML_CHECK] Row {idx}: ANOMALY DETECTED recon_error={rec_error:.4f}, threshold={autoencoder_threshold:.4f}")
+                    severity = determine_severity(res_ml['code'], res_ml.get('severity_metrics', {}))
+                    raw_findings.append({
+                        "well_id": well_id,
+                        "event_date": str(row['timestamp'].date()),
+                        "timestamp": row['timestamp'],
+                        "detected_at": datetime.now(timezone.utc).isoformat(),
+                        "anomaly_code": res_ml['code'],
+                        "category": res_ml['category'],
+                        "severity": severity,
+                        "raw_data": res_ml['raw_data'],
+                        "chart_metric": res_ml['chart_metric'],
+                        "impact_value": res_ml['impact_value'],
+                        "impact_payload": res_ml['impact_payload'],
+                        "lift_type": str(current_lift_type),
+                        "diagnosis": res_ml.get('diagnosis'),
+                        "severity_metrics": res_ml.get('severity_metrics', {}),
+                        "chart_payload": res_ml.get('chart_payload', {})
+                    })
+            except Exception as e:
+                logger.error(f"ML Anomaly checker failed: {e}")
 
     logger.info(f"[ANOMALY_DEBUG] {well_id}: raw_findings before suppression: {len(raw_findings)}")
 
@@ -487,13 +494,15 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             llm_content = {**llm_content, 'title': title}
 
         try:
+            chart_payload = dict(finding.get('chart_payload') or {})
+            chart_payload['event_date'] = finding.get('event_date')
             chart_config = generate_chart_config(
                 finding.get('raw_data', ''),
                 finding.get('chart_metric', ''),
                 full_df,
                 anomaly_code=finding.get('anomaly_code'),
                 severity_metrics=finding.get('severity_metrics') or {},
-                chart_payload=finding.get('chart_payload') or {}
+                chart_payload=chart_payload
             )
         except Exception as e:
             logger.warning(f"Chart config failed for {finding.get('anomaly_code')} on {well_id}: {e}")
@@ -558,6 +567,9 @@ def save_reviews(reviews):
             cleaned['impact_value'] = 0.0
         cleaned_reviews.append(cleaned)
 
+    from anomaly_review.config import get_organization_id
+    org_id = get_organization_id()
+
     # ------------------------------------------------------------------
     # --- POSTGRES SAVE (ACTIVE) ---
     # ------------------------------------------------------------------
@@ -566,31 +578,58 @@ def save_reviews(reviews):
         try:
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    q = '''
-                        INSERT INTO anomaly_review
-                        (well_id, event_date, detected_at, anomaly_code, category, severity,
-                         title, ui_text, impact_value, impact_metrics, chart_data, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
-                        detected_at = EXCLUDED.detected_at,
-                        severity = EXCLUDED.severity,
-                        title = EXCLUDED.title,
-                        ui_text = EXCLUDED.ui_text,
-                        impact_value = EXCLUDED.impact_value,
-                        impact_metrics = EXCLUDED.impact_metrics,
-                        chart_data = EXCLUDED.chart_data,
-                        status = EXCLUDED.status
-                    '''
-                    for r in cleaned_reviews:
-                        cur.execute(q, (
-                            r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                            r['category'], r['severity'], r['title'],
-                            json.dumps(r['ui_text']),
-                            r['impact_value'],
-                            json.dumps(r['impact_metrics']),
-                            json.dumps(r['chart_data']),
-                            r['status']
-                        ))
+                    if org_id:
+                        q = '''
+                            INSERT INTO anomaly_review
+                            (organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                             title, ui_text, impact_value, impact_metrics, chart_data, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
+                            detected_at = EXCLUDED.detected_at,
+                            severity = EXCLUDED.severity,
+                            title = EXCLUDED.title,
+                            ui_text = EXCLUDED.ui_text,
+                            impact_value = EXCLUDED.impact_value,
+                            impact_metrics = EXCLUDED.impact_metrics,
+                            chart_data = EXCLUDED.chart_data,
+                            status = EXCLUDED.status
+                        '''
+                        for r in cleaned_reviews:
+                            cur.execute(q, (
+                                org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                                r['category'], r['severity'], r['title'],
+                                json.dumps(r['ui_text']),
+                                r['impact_value'],
+                                json.dumps(r['impact_metrics']),
+                                json.dumps(r['chart_data']),
+                                r['status']
+                            ))
+                    else:
+                        q = '''
+                            INSERT INTO anomaly_review
+                            (well_id, event_date, detected_at, anomaly_code, category, severity,
+                             title, ui_text, impact_value, impact_metrics, chart_data, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
+                            detected_at = EXCLUDED.detected_at,
+                            severity = EXCLUDED.severity,
+                            title = EXCLUDED.title,
+                            ui_text = EXCLUDED.ui_text,
+                            impact_value = EXCLUDED.impact_value,
+                            impact_metrics = EXCLUDED.impact_metrics,
+                            chart_data = EXCLUDED.chart_data,
+                            status = EXCLUDED.status
+                        '''
+                        for r in cleaned_reviews:
+                            cur.execute(q, (
+                                r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                                r['category'], r['severity'], r['title'],
+                                json.dumps(r['ui_text']),
+                                r['impact_value'],
+                                json.dumps(r['impact_metrics']),
+                                json.dumps(r['chart_data']),
+                                r['status']
+                            ))
                 conn.commit()
         except Exception as e:
             logger.error(f"PostgreSQL Save failed: {e}")
@@ -601,43 +640,82 @@ def save_reviews(reviews):
     try:
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            update_q = """
-                UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
-                    impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s
-                WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
-            """
-            insert_q = """
-                INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                (id, well_id, event_date, detected_at, anomaly_code, category, severity,
-                 title, ui_text, impact_value, impact_metrics, chart_data, status)
-                SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
-                       PARSE_JSON(%s), PARSE_JSON(%s), %s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+            if org_id:
+                update_q = """
+                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
+                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s, organization_id = %s
+                    WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
+                """
+                insert_q = """
+                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    (id, organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                     title, ui_text, impact_value, impact_metrics, chart_data, status)
+                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
+                           PARSE_JSON(%s), PARSE_JSON(%s), %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
+                    )
+                """
+                for r in cleaned_reviews:
+                    cur.execute(update_q, (
+                        r['detected_at'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'], org_id,
+                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
+                    ))
+                    cur.execute(insert_q, (
+                        org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                        r['category'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
+                    ))
+            else:
+                update_q = """
+                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
+                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s
                     WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
-                )
-            """
-            for r in cleaned_reviews:
-                cur.execute(update_q, (
-                    r['detected_at'], r['severity'], r['title'],
-                    json.dumps(r['ui_text']),
-                    r['impact_value'],
-                    json.dumps(r['impact_metrics']),
-                    json.dumps(r['chart_data']),
-                    r['status'],
-                    r['well_id'], r['anomaly_code'], r['event_date']
-                ))
-                cur.execute(insert_q, (
-                    r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                    r['category'], r['severity'], r['title'],
-                    json.dumps(r['ui_text']),
-                    r['impact_value'],
-                    json.dumps(r['impact_metrics']),
-                    json.dumps(r['chart_data']),
-                    r['status'],
-                    r['well_id'], r['anomaly_code'], r['event_date']
-                ))
+                """
+                insert_q = """
+                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    (id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                     title, ui_text, impact_value, impact_metrics, chart_data, status)
+                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
+                           PARSE_JSON(%s), PARSE_JSON(%s), %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
+                    )
+                """
+                for r in cleaned_reviews:
+                    cur.execute(update_q, (
+                        r['detected_at'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date']
+                    ))
+                    cur.execute(insert_q, (
+                        r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                        r['category'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date']
+                    ))
             conn.commit()
     except Exception as e:
         logger.error(f"Snowflake Save failed: {e}")
