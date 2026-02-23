@@ -164,10 +164,11 @@ def get_historical_anomalies(limit=200):
         logging.warning(f"Could not fetch historical anomalies: {e}")
         return pd.DataFrame()
 
-def find_similar_anomalies(current_readings, current_violations, historical_df=None, current_well_id=None, lift_type=None, similarity_threshold=None, max_deviation_percent=20.0, exclude_anomaly_id=None):
+def find_similar_anomalies(current_readings, current_violations, historical_df=None, current_well_id=None, lift_type=None, similarity_threshold=None, max_deviation_percent=20.0, exclude_anomaly_id=None, conn=None):
     """
     Find similar anomalies.
     Restricted to ONLY check the SAME well ID.
+    If conn is provided, it is reused and not closed; otherwise a new connection is created and closed.
     """
     if not current_violations:
         return []
@@ -196,7 +197,10 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
     if not violation_criteria:
         return []
 
-    conn = get_db_connection()
+    own_conn = False
+    if conn is None:
+        conn = get_db_connection()
+        own_conn = True
 
     # --- INTERNAL HELPER ---
     def fetch_candidates(is_same_well):
@@ -320,7 +324,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
         logging.error(f"Top Level Error in Similarity Search: {e}")
         return []
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
         
 def init_postgres():
     create_operation_suggestion_table()
@@ -394,10 +399,11 @@ def _readings_from_row(row, lift_type):
     return readings
 
 
-def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, readings, anomaly_details, well_status):
+def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, readings, anomaly_details, well_status, reuse_pg_conn=None):
     """
     Insert anomaly into well_anomalies + anomaly_violations_new, then generate AI suggestion
     and store in PostgreSQL anomaly_suggestions. Same flow as after inserting a reading.
+    If reuse_pg_conn is provided, it is used for the insert and not closed; otherwise a new PG connection is used and closed.
     Returns suggestion_result dict or None.
     """
     def convert_for_db(val):
@@ -462,7 +468,8 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
             current_well_id=well_id,
             lift_type=lift_type,
             max_deviation_percent=20.0,
-            exclude_anomaly_id=current_anomaly_id
+            exclude_anomaly_id=current_anomaly_id,
+            conn=conn
         )
 
         augmented_anomaly_details = anomaly_details.copy()
@@ -503,7 +510,7 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
         except Exception as conf_err:
             logging.warning(f"Error calculating confidence: {conf_err}")
 
-        pg_conn_insert = get_pg_connection()
+        pg_conn_insert = reuse_pg_conn if reuse_pg_conn is not None else get_pg_connection()
         if pg_conn_insert:
             try:
                 with pg_conn_insert.cursor() as cur:
@@ -530,7 +537,8 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
                 logging.error(f"Error storing suggestion: {pg_e}")
                 pg_conn_insert.rollback()
             finally:
-                pg_conn_insert.close()
+                if reuse_pg_conn is None:
+                    pg_conn_insert.close()
 
         return suggestion_result
     finally:
@@ -1151,17 +1159,23 @@ def insert_reading():
         return jsonify({"error": f"Database error: {str(e)}"}), 500
 
 
+def _ts_str(ts):
+    """Normalize timestamp for set membership (well_id, timestamp_str)."""
+    return ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+
+
 @app.route('/api/scan-recent-readings', methods=['GET', 'POST'])
 def scan_recent_readings():
     """
     Fetch the last N (default 200) rows from well_sensor_readings, run anomaly detection
     on each, and for any detected anomaly record it and generate suggestion (same flow as
     after inserting a reading). Skips readings that already have an anomaly record.
+    Uses a single Snowflake connection and batched "already exists" check for speed.
     """
     limit = request.args.get('limit', 200)
     try:
         limit = int(limit)
-        limit = max(1, min(limit, 10000))
+        limit = max(1, min(limit, 100000))
     except (TypeError, ValueError):
         limit = 200
 
@@ -1183,93 +1197,122 @@ def scan_recent_readings():
             return jsonify({
                 "success": True,
                 "scanned": 0,
+                "readings_checked": 0,
                 "anomalies_detected": 0,
                 "anomalies_recorded": 0,
                 "message": "No readings found",
                 "details": []
             }), 200
 
-        # Build list of dicts for each row
         readings_list = [dict(zip(cols, r)) for r in rows]
         conn.close()
     except Exception as e:
         logging.error(f"Error fetching recent readings: {e}")
         return jsonify({"error": f"Database error: {str(e)}"}), 500
 
-    anomalies_detected = 0
-    anomalies_recorded = 0
-    details = []
-
+    # Build list of (well_id, timestamp_str) for candidates (valid lift_type only)
+    candidates = []
     for row in readings_list:
-        well_id = row.get('well_id')
-        ts = row.get('timestamp')
         lift_type = row.get('lift_type') or (str(row.get('lift_type', '')).strip())
         if not lift_type or lift_type.lower() in ('none', 'null', ''):
             continue
-        timestamp_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+        candidates.append((row.get('well_id'), _ts_str(row.get('timestamp'))))
 
-        readings = _readings_from_row(row, lift_type)
-
-        # Skip if this reading already has an anomaly record
+    # Batch: which of these (well_id, timestamp) already have an anomaly?
+    existing_anomalies = set()
+    if candidates:
+        conn = get_db_connection()
+        cur = conn.cursor()
         try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT 1 FROM well_anomalies WHERE well_id = %s AND timestamp = %s LIMIT 1",
-                (well_id, timestamp_str)
-            )
-            already = cur.fetchone() is not None
+            chunk_size = 200
+            for i in range(0, len(candidates), chunk_size):
+                chunk = candidates[i : i + chunk_size]
+                placeholders = ", ".join(["(%s, %s)"] * len(chunk))
+                flat = [x for p in chunk for x in p]
+                cur.execute(
+                    "SELECT well_id, timestamp FROM well_anomalies WHERE (well_id, timestamp) IN (" + placeholders + ")",
+                    flat
+                )
+                for r in cur.fetchall():
+                    existing_anomalies.add((r[0], _ts_str(r[1])))
+        finally:
             cur.close()
             conn.close()
-            if already:
-                continue
-        except Exception as e:
-            logging.warning(f"Check existing anomaly failed for {well_id} {timestamp_str}: {e}")
-            continue
 
-        anomaly_details = check_anomaly(readings, well_id=well_id, lift_type=lift_type)
+    anomalies_detected = 0
+    anomalies_recorded = 0
+    readings_checked = 0  # how many readings we actually ran detection on (excl. skipped)
+    details = []
+    sf_conn = get_db_connection()
+    pg_conn = get_pg_connection()
+
+    try:
+        for row in readings_list:
+            well_id = row.get('well_id')
+            ts = row.get('timestamp')
+            lift_type = row.get('lift_type') or (str(row.get('lift_type', '')).strip())
+            if not lift_type or lift_type.lower() in ('none', 'null', ''):
+                continue
+            timestamp_str = _ts_str(ts)
+            if (well_id, timestamp_str) in existing_anomalies:
+                continue
+
+            readings_checked += 1
+            readings = _readings_from_row(row, lift_type)
+
+            anomaly_details = check_anomaly(readings, well_id=well_id, lift_type=lift_type)
+            try:
+                from anomaly_detection.detector import ML_ONLY_ANOMALY_THRESHOLD
+                if (not anomaly_details.get('violations')) and float(anomaly_details.get('anomaly_score', 0)) < ML_ONLY_ANOMALY_THRESHOLD:
+                    anomaly_details = {**anomaly_details, 'is_anomaly': False}
+            except Exception:
+                pass
+
+            if not anomaly_details.get('is_anomaly'):
+                continue
+
+            anomalies_detected += 1
+            well_status = row.get('well_status') or get_status_for_reading(well_id, lift_type, readings)
+
+            try:
+                suggestion_result = _record_anomaly_and_suggestion(
+                    sf_conn, well_id, timestamp_str, lift_type, readings, anomaly_details, well_status,
+                    reuse_pg_conn=pg_conn
+                )
+                anomalies_recorded += 1
+                details.append({
+                    "well_id": well_id,
+                    "timestamp": timestamp_str,
+                    "lift_type": lift_type,
+                    "anomaly_score": anomaly_details.get('anomaly_score'),
+                    "alert_title": suggestion_result.get('alert_title') if suggestion_result else None,
+                })
+            except Exception as e:
+                logging.error(f"Error recording anomaly for {well_id} {timestamp_str}: {e}")
+                details.append({
+                    "well_id": well_id,
+                    "timestamp": timestamp_str,
+                    "lift_type": lift_type,
+                    "error": str(e),
+                })
+    finally:
         try:
-            from anomaly_detection.detector import ML_ONLY_ANOMALY_THRESHOLD
-            if (not anomaly_details.get('violations')) and float(anomaly_details.get('anomaly_score', 0)) < ML_ONLY_ANOMALY_THRESHOLD:
-                anomaly_details = {**anomaly_details, 'is_anomaly': False}
+            sf_conn.close()
         except Exception:
             pass
-
-        if not anomaly_details.get('is_anomaly'):
-            continue
-
-        anomalies_detected += 1
-        well_status = row.get('well_status') or get_status_for_reading(well_id, lift_type, readings)
-
-        try:
-            conn = get_db_connection()
-            suggestion_result = _record_anomaly_and_suggestion(
-                conn, well_id, timestamp_str, lift_type, readings, anomaly_details, well_status
-            )
-            conn.close()
-            anomalies_recorded += 1
-            details.append({
-                "well_id": well_id,
-                "timestamp": timestamp_str,
-                "lift_type": lift_type,
-                "anomaly_score": anomaly_details.get('anomaly_score'),
-                "alert_title": suggestion_result.get('alert_title') if suggestion_result else None,
-            })
-        except Exception as e:
-            logging.error(f"Error recording anomaly for {well_id} {timestamp_str}: {e}")
-            details.append({
-                "well_id": well_id,
-                "timestamp": timestamp_str,
-                "lift_type": lift_type,
-                "error": str(e),
-            })
+        if pg_conn:
+            try:
+                pg_conn.close()
+            except Exception:
+                pass
 
     return jsonify({
         "success": True,
         "scanned": len(readings_list),
+        "readings_checked": readings_checked,
         "anomalies_detected": anomalies_detected,
         "anomalies_recorded": anomalies_recorded,
-        "message": f"Scanned {len(readings_list)} readings; detected {anomalies_detected} anomalies, recorded {anomalies_recorded}.",
+        "message": f"Scanned {len(readings_list)} readings; ran detection on {readings_checked}; detected {anomalies_detected} anomalies, recorded {anomalies_recorded}.",
         "details": details,
     }), 200
 
