@@ -53,26 +53,17 @@ BATCH_CONFIG = DEFAULT_BATCH_CONFIG
 # =============================================================================
 
 def get_all_active_wells() -> List[str]:
-    """Fetch list of wells with data in last 7 days."""
+    """Fetch list of wells that have any sensor data. Data per well uses that well's real last N days."""
     try:
         conn = get_snowflake_conn()
         cursor = conn.cursor()
-
-        query = """
-            SELECT DISTINCT well_id
-            FROM well_sensor_readings
-            WHERE timestamp >= DATEADD(day, -7, CURRENT_DATE())
-            ORDER BY well_id
-        """
-
-        cursor.execute(query)
+        cursor.execute("""
+            SELECT DISTINCT well_id FROM well_sensor_readings ORDER BY well_id
+        """)
         wells = [row[0] for row in cursor.fetchall()]
-
         cursor.close()
         conn.close()
-
         return wells
-
     except Exception as e:
         logger.error(f"Failed to fetch well list: {e}")
         return []
@@ -124,11 +115,10 @@ def run_batch(config=None):
 
     start_time = time.time()
 
-    # Fetch wells
+    # Fetch wells: any well with sensor data; each well's data uses that well's real last N days
     wells = get_all_active_wells()
-
     if not wells:
-        logger.error("No active wells found. Exiting.")
+        logger.error("No wells found in well_sensor_readings. Exiting.")
         return
 
     # Test mode logic

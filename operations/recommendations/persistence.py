@@ -151,18 +151,21 @@ def save_recommendation_to_snowflake(
         
         tn = table_name.upper()
 
-        # Column definitions
+        # Column definitions (ORGANIZATION_ID added for tenant scoping)
+        import os
+        org_id = os.getenv("ORGANIZATION_ID")
         orig_cols = [
-            "ID", "WELL_ID", "CATEGORY", "ACTION", "PRIORITY", "STATUS", 
+            "ID", "ORGANIZATION_ID", "WELL_ID", "CATEGORY", "ACTION", "PRIORITY", "STATUS",
             "REASON", "EXPECTED_IMPACT", "CONFIDENCE", "PREDICTION_SOURCE", "PROBABILITY",
             "OIL_VOLUME_SLOPE", "OIL_VOLUME_ROLL_MEAN", "GAS_VOLUME_SLOPE", "GAS_VOLUME_ROLL_MEAN",
-            "MOTOR_CURRENT_ROLL_MEAN", "MOTOR_TEMP_ROLL_MEAN", "SURFACE_PRESSURE_ROLL_MEAN", 
+            "MOTOR_CURRENT_ROLL_MEAN", "MOTOR_TEMP_ROLL_MEAN", "SURFACE_PRESSURE_ROLL_MEAN",
             "DETAILS", "CREATED_AT"
         ]
 
-        # Build params tuple
+        # Build params tuple (omit ORGANIZATION_ID value when column not in existing_cols below)
         params = (
             rec_id,
+            org_id,
             rec.get('well_id') or '',
             rec.get('category') or 'Production',
             rec.get('action') or '',
@@ -205,11 +208,15 @@ def save_recommendation_to_snowflake(
         if not insert_cols:
             insert_cols = orig_cols
 
+        # Params must match insert_cols order (table may not have ORGANIZATION_ID yet)
+        param_by_col = dict(zip(orig_cols, params))
+        params_for_insert = tuple(param_by_col[c] for c in insert_cols)
+
         insert_cols_sql = ', '.join([f'"{c}"' for c in insert_cols])
         placeholders = ', '.join(['%s'] * len(insert_cols))
         insert_sql = f'INSERT INTO "{tn}" ({insert_cols_sql}) VALUES ({placeholders})'
 
-        safe_params = tuple(to_native_type(p) for p in params)
+        safe_params = tuple(to_native_type(p) for p in params_for_insert)
         
         def _execute_insert():
             # Log types of parameters to diagnose binding issues
@@ -226,7 +233,8 @@ def save_recommendation_to_snowflake(
             result = _retry_db_operation(_execute_insert, max_retries=3, delay=0.5)
             return result
         except Exception:
-            return _fallback_insert(cur, conn, tn, params, safe_params, orig_cols, rec_id)
+            full_safe_params = tuple(to_native_type(p) for p in params)
+            return _fallback_insert(cur, conn, tn, params, full_safe_params, orig_cols, rec_id)
 
     except Exception:
         raise
@@ -266,7 +274,7 @@ def _ensure_columns_exist(cur, conn, tn: str, orig_cols: List[str], existing_col
     pass
     
     col_types = {
-        "ID": "VARCHAR", "WELL_ID": "VARCHAR", "CATEGORY": "VARCHAR",
+        "ID": "VARCHAR", "ORGANIZATION_ID": "VARCHAR(36)", "WELL_ID": "VARCHAR", "CATEGORY": "VARCHAR",
         "ACTION": "VARCHAR", "PRIORITY": "VARCHAR", "STATUS": "VARCHAR",
         "REASON": "VARCHAR", "EXPECTED_IMPACT": "VARCHAR", "CONFIDENCE": "FLOAT",
         "PREDICTION_SOURCE": "VARCHAR", "PROBABILITY": "FLOAT",

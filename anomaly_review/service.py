@@ -34,6 +34,9 @@ load_dotenv()
 # Import from anomaly_review submodules
 from anomaly_review.config import (
     DETECTION_WINDOW_DAYS,
+    ANOMALY_REVIEW_FETCH_DAYS,
+    PATTERN_SHIFT_SUPPRESS_DAYS,
+    ANOMALY_CODES_UPDATE_WHEN_RECENT,
     SUPPRESSION_RULES,
     ANOMALY_PRIORITY,
 )
@@ -44,6 +47,8 @@ from anomaly_review.data import (
     fetch_all_active_wells,
     calculate_rolling_baseline,
     get_recent_anomaly_history,
+    has_recent_anomaly,
+    get_existing_anomaly_event_date,
     fetch_sensor_metadata,
     get_snowflake_conn,
     get_db_url,
@@ -67,6 +72,7 @@ from anomaly_review.checkers import (
 )
 
 from anomaly_review.models import (
+    engineer_physics_features,
     get_or_train_model,
     predict_with_lstm,
     detect_autoencoder_anomalies,
@@ -77,6 +83,50 @@ from anomaly_review.llm import generate_llm_content
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('AnomalyReviewService')
+
+
+def _clean_for_json(obj):
+    """Sanitize for JSON: replace NaN/Inf and numpy types so chart_data and impact_metrics serialize cleanly."""
+    if obj is None:
+        return None
+    if isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        f = float(obj)
+        return None if (np.isnan(f) or np.isinf(f)) else f
+    if isinstance(obj, np.ndarray):
+        return [_clean_for_json(x) for x in obj.tolist()]
+    if isinstance(obj, dict):
+        return {k: _clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_for_json(v) for v in obj]
+    if pd.isna(obj):
+        return None
+    return obj
+
+
+def _parse_history_str_to_timeline(history_str: str, limit: int = 5) -> List[Dict]:
+    """Parse get_recent_anomaly_history output into history_timeline for ui_text."""
+    import re
+    out = []
+    for line in (history_str or "").strip().splitlines():
+        line = line.strip()
+        if not line or not line.startswith("-"):
+            continue
+        # Format: "- Date: 2025-01-15, Severity: Moderate, Title: ..."
+        m = re.match(r"-\s*Date:\s*([^,]+),\s*Severity:\s*([^,]+),\s*Title:\s*(.+)", line, re.I)
+        if m:
+            date_val, severity, title = m.group(1).strip(), m.group(2).strip(), (m.group(3) or "").strip()
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_val[:10], "%Y-%m-%d")
+                date_formatted = dt.strftime("%m/%d/%Y")
+            except Exception:
+                date_formatted = date_val[:10] if len(date_val) >= 10 else date_val
+            out.append({"date": date_formatted, "severity": severity or "N/A", "title": title or "Previous event"})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def select_top_anomalies_per_well(anomalies: List[Dict]) -> List[Dict]:
@@ -121,15 +171,14 @@ def select_top_anomalies_per_well(anomalies: List[Dict]) -> List[Dict]:
 def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int = DETECTION_WINDOW_DAYS, save_to_db: bool = True) -> List[Dict]:
     logger.info(f"Starting anomaly detection for {well_id}...")
     
-    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
-    # 1. Fetch Data (Fetch ~6 months to ensure valid baselines)
+    # 1. Fetch Data (fetch ANOMALY_REVIEW_FETCH_DAYS for baselines and models)
     if df is not None:
-        full_df = df
+        full_df = df.copy() if hasattr(df, 'copy') else df
     else:
-        full_df = fetch_well_data(well_id, days=180)
-    
-    if full_df.empty or len(full_df) < 5:
-        logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df)})")
+        full_df = fetch_well_data(well_id, days=ANOMALY_REVIEW_FETCH_DAYS)
+
+    if full_df is None or full_df.empty or len(full_df) < 5:
+        logger.warning(f"Insufficient data for {well_id} (Rows: {len(full_df) if full_df is not None else 0})")
         return []
 
     # --- ALARM GATEKEEPER ---
@@ -157,33 +206,24 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     except Exception as e:
         logger.error(f"Alarm Gatekeeper failed for {well_id}: {e}")
 
-    # --- FLATLINE DETECTION ---
-    # Detect sensors stuck at a single value (Variance = 0) over last 24 hours
-    try:
-        # Define sensors to check
-        flatline_sensors = ['tubing_pressure', 'casing_pressure', 'motor_current', 'pump_fillage', 'strokes_per_minute']
-        
-        # Get data for last 24 hours
-        if not full_df.empty and 'timestamp' in full_df.columns:
-            last_ts = full_df['timestamp'].max()
-            start_ts = last_ts - pd.Timedelta(hours=24)
-            
-            # Mask for recent data
-            recent_mask = full_df['timestamp'] >= start_ts
-            recent_data = full_df.loc[recent_mask]
-            
-            if len(recent_data) > 2: # Need at least a few points to compute std
-                for sensor in flatline_sensors:
-                    if sensor in recent_data.columns:
-                        std_dev = recent_data[sensor].std()
-                        
-                        # Check strictly for 0.0 (or extremely close)
-                        if pd.notna(std_dev) and std_dev == 0.0:
-                            logger.warning(f"Flatline detected for {sensor} on {well_id} (StdDev=0). Masking recent values.")
-                            # Mask values in the main dataframe for the recent period
-                            full_df.loc[recent_mask, sensor] = np.nan
-    except Exception as e:
-        logger.error(f"Flatline detection failed for {well_id}: {e}")
+    # --- FLATLINE DETECTION (DISABLED) ---
+    # Synthetic / perfect data often repeats values for 24h; treating that as "broken sensor" and
+    # converting to NaN kills Physics checkers. Re-enable only when real SCADA variance is available.
+    # try:
+    #     flatline_sensors = ['tubing_pressure', 'casing_pressure', 'motor_current', 'pump_fillage', 'strokes_per_minute']
+    #     if not full_df.empty and 'timestamp' in full_df.columns:
+    #         last_ts = full_df['timestamp'].max()
+    #         start_ts = last_ts - pd.Timedelta(hours=24)
+    #         recent_mask = full_df['timestamp'] >= start_ts
+    #         recent_data = full_df.loc[recent_mask]
+    #         if len(recent_data) > 2:
+    #             for sensor in flatline_sensors:
+    #                 if sensor in recent_data.columns:
+    #                     std_dev = recent_data[sensor].std()
+    #                     if pd.notna(std_dev) and std_dev == 0.0:
+    #                         full_df.loc[recent_mask, sensor] = np.nan
+    # except Exception as e:
+    #     logger.error(f"Flatline detection failed for {well_id}: {e}")
     # --------------------------
 
     # Ensure lift_type exists (Forward fill to handle intermittent metadata)
@@ -194,7 +234,9 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
 
     # 2. Pre-Processing & Rolling Baselines
     full_df = calculate_rolling_baseline(full_df)
-    
+    # Add derived features (water_cut, gas_oil_ratio, pressure_diff) so prediction uses them
+    full_df = engineer_physics_features(full_df, lift_type=current_lift_type)
+
     # 3. Model Training (Predictive Efficiency)
     full_df['predicted_oil'] = np.nan
     full_df['efficiency'] = 100.0
@@ -251,8 +293,11 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                         model_art.get('threshold', 0.5)
                     )
                     if not ae_results.empty:
-                         full_df['reconstruction_error'] = ae_results['reconstruction_error']
-                         autoencoder_threshold = model_art.get('threshold', 0.5)
+                        # Align by index so rows without ae result keep 0.0 (avoid NaNs breaking ML check)
+                        full_df.loc[ae_results.index, 'reconstruction_error'] = ae_results['reconstruction_error'].values
+                        if 'top_contributing_features' in ae_results.columns:
+                            full_df.loc[ae_results.index, 'top_contributing_features'] = ae_results['top_contributing_features'].values
+                        autoencoder_threshold = model_art.get('threshold', 0.5)
                 except Exception as e:
                     logger.error(f"Autoencoder detection failed: {e}")
 
@@ -272,10 +317,33 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             logger.error(f"ML Prediction failed for {well_id}: {e}")
 
     # 4. Run Checkers on the Detection Window
-    # We fetch 180 days for context, but only scan the last `lookback_days` for new alerts.
     check_window_start = full_df['timestamp'].max() - pd.Timedelta(days=lookback_days)
     window_df = full_df[full_df['timestamp'] >= check_window_start].copy()
-    
+    if window_df.empty:
+        logger.warning(f"Empty detection window for {well_id}; skipping checkers.")
+        return []
+
+    # Diagnostic: why 0 anomalies? (data health + ML stats)
+    ts_min, ts_max = full_df['timestamp'].min(), full_df['timestamp'].max()
+    logger.info(
+        f"[ANOMALY_DEBUG] {well_id}: data rows={len(full_df)}, window rows={len(window_df)}, "
+        f"window={ts_min.date()} to {ts_max.date()} (last {lookback_days}d)"
+    )
+    if 'reconstruction_error' in window_df.columns:
+        rec = window_df['reconstruction_error']
+        above = (rec > autoencoder_threshold).sum()
+        # NaN-safe stats
+        valid = rec.replace(0, np.nan).dropna()
+        logger.info(
+            f"[ANOMALY_DEBUG] {well_id}: reconstruction_error in window: "
+            f"min={rec.min():.4f}, max={rec.max():.4f}, mean={rec.mean():.4f}, "
+            f"threshold={autoencoder_threshold:.4f}, count_above_threshold={above}"
+        )
+        if above == 0 and valid.empty:
+            logger.info(f"[ANOMALY_DEBUG] {well_id}: all reconstruction_error are 0 in window (check index alignment with ae_results).")
+    else:
+        logger.info(f"[ANOMALY_DEBUG] {well_id}: no reconstruction_error column (autoencoder not used).")
+
     # Checkers aligned with Anomaly Review: pattern change, production inconsistency, unexpected events
     all_checkers = [
         check_model_divergence,           # Production inconsistency: sensors normal, production drops vs expected
@@ -313,21 +381,6 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     res = check(ctx)
             except Exception as e:
                 logger.error(f"Checker '{check.__name__}' failed: {e}")
-            
-            # ML Anomaly Check (Special case - requires reconstruction error)
-            if res is None and 'reconstruction_error' in ctx:
-                try:
-                    from anomaly_review.checkers import check_ml_anomaly
-                    rec_error = ctx.get('reconstruction_error', 0.0)
-                    res = check_ml_anomaly(
-                        ctx,
-                        rec_error,
-                        autoencoder_threshold
-                    )
-                    if res:
-                        logger.info(f"[ML_CHECK] Row {idx}: ANOMALY DETECTED recon_error={rec_error:.4f}, threshold={autoencoder_threshold:.4f}")
-                except Exception as e:
-                    logger.error(f"ML Anomaly checker failed: {e}")
 
             if res:
                 # Calculate severity based on specific metric thresholds
@@ -351,6 +404,37 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
                     "chart_payload": res.get('chart_payload', {})
                 })
 
+        # ML Anomaly Check once per row (not inside checker loop to avoid duplicate findings and log spam)
+        if 'reconstruction_error' in ctx:
+            try:
+                from anomaly_review.checkers import check_ml_anomaly
+                rec_error = ctx.get('reconstruction_error', 0.0)
+                res_ml = check_ml_anomaly(ctx, rec_error, autoencoder_threshold)
+                if res_ml:
+                    logger.info(f"[ML_CHECK] Row {idx}: ANOMALY DETECTED recon_error={rec_error:.4f}, threshold={autoencoder_threshold:.4f}")
+                    severity = determine_severity(res_ml['code'], res_ml.get('severity_metrics', {}))
+                    raw_findings.append({
+                        "well_id": well_id,
+                        "event_date": str(row['timestamp'].date()),
+                        "timestamp": row['timestamp'],
+                        "detected_at": datetime.now(timezone.utc).isoformat(),
+                        "anomaly_code": res_ml['code'],
+                        "category": res_ml['category'],
+                        "severity": severity,
+                        "raw_data": res_ml['raw_data'],
+                        "chart_metric": res_ml['chart_metric'],
+                        "impact_value": res_ml['impact_value'],
+                        "impact_payload": res_ml['impact_payload'],
+                        "lift_type": str(current_lift_type),
+                        "diagnosis": res_ml.get('diagnosis'),
+                        "severity_metrics": res_ml.get('severity_metrics', {}),
+                        "chart_payload": res_ml.get('chart_payload', {})
+                    })
+            except Exception as e:
+                logger.error(f"ML Anomaly checker failed: {e}")
+
+    logger.info(f"[ANOMALY_DEBUG] {well_id}: raw_findings before suppression: {len(raw_findings)}")
+
     # 1. FATAL OVERRIDE: Data Mismatch (prev Ghost Production) implies sensor failure or critical break.
     # If this exists, it invalidates physics checks like Fluid Pound.
     ghost = next((a for a in raw_findings if a['anomaly_code'] == 'DATA_MISMATCH'), None)
@@ -358,61 +442,96 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         # If ghost exists, return ONLY ghost (and maybe other criticals), filter out operational noise
         raw_findings = [a for a in raw_findings if a['anomaly_code'] in ['DATA_MISMATCH' , 'ENERGY_DIV' , 'PATTERN_SHIFT']]
 
-    # 5. Filter & Deduplicate (The Truth Hierarchy)
+    # 5. Filter & Deduplicate (The Truth Hierarchy) — suppress first to avoid costly LLM calls for discarded alerts
     final_anomalies = select_top_anomalies_per_well(raw_findings)
-    
-    # 6. Generate Content & Save
+    logger.info(f"[ANOMALY_DEBUG] {well_id}: after suppression/dedup: {len(final_anomalies)} anomalies")
+
+    # 6. Generate Content & Save — OpenRouter/LLM is called only for anomalies we keep (after suppression)
     enriched_results = []
     for finding in final_anomalies:
-        # Fetch History
         history_str = get_recent_anomaly_history(well_id, finding['anomaly_code'], exclude_date=finding['event_date'])
-        
-        # Generate LLM Text
-        llm_content = generate_llm_content(
-            finding['raw_data'], 
-            finding['lift_type'], 
-            finding['chart_metric'], 
-            history_str, 
-            finding['detected_at'],
-            diagnosis=finding.get('diagnosis'),
-            impact_metrics=finding['impact_payload'],
-            anomaly_code=finding['anomaly_code']
-        )
-        
-        # Check validation result (New Feature)
+        try:
+            llm_content = generate_llm_content(
+                finding['raw_data'],
+                finding['lift_type'],
+                finding['chart_metric'],
+                history_str,
+                finding['detected_at'],
+                diagnosis=finding.get('diagnosis'),
+                impact_metrics=finding.get('impact_payload'),
+                anomaly_code=finding['anomaly_code']
+            )
+        except Exception as e:
+            logger.warning(f"LLM/content failed for {finding.get('anomaly_code')} on {well_id}: {e}; using fallback.")
+            llm_content = {'title': 'Anomaly Detected', 'is_valid_anomaly': True}
+
+        # Ensure historical_context has history_timeline when we have prior history (LLM may leave it empty)
+        if history_str and "No prior history found" not in history_str and "History check unavailable" not in history_str:
+            hctx = llm_content.get("historical_context") or {}
+            if not (hctx.get("history_timeline") or []):
+                timeline = _parse_history_str_to_timeline(history_str)
+                if timeline:
+                    llm_content["historical_context"] = {
+                        **hctx,
+                        "recurrence_status": hctx.get("recurrence_status") or "Recurring Deviation",
+                        "history_timeline": timeline,
+                    }
+
         if not llm_content.get('is_valid_anomaly', True):
-             logger.info(f"LLM Validation Rejected: {finding['anomaly_code']} on {finding['event_date']} for {well_id}")
-             continue
-        
-        # User-friendly title: avoid showing jargon like "Model Divergence" to end users
+            logger.info(f"LLM Validation Rejected: {finding['anomaly_code']} on {finding['event_date']} for {well_id}")
+            continue
+
+        code = finding['anomaly_code']
+        if code in ANOMALY_CODES_UPDATE_WHEN_RECENT and has_recent_anomaly(well_id, code, PATTERN_SHIFT_SUPPRESS_DAYS):
+            existing_date = get_existing_anomaly_event_date(well_id, code, PATTERN_SHIFT_SUPPRESS_DAYS)
+            if existing_date:
+                finding['event_date'] = existing_date
+                logger.info(f"Updating existing {code} for {well_id} (event_date={existing_date}) so it stays visible with current severity.")
+
         title = llm_content.get('title', 'Anomaly Detected')
         if finding['anomaly_code'] == 'MODEL_DIVERGENCE' and title and ('divergence' in title.lower() or 'model performance' in title.lower()):
             title = "Production Below Expected"
             llm_content = {**llm_content, 'title': title}
-        
-        # Generate Chart Configuration
-        chart_config = generate_chart_config(
-            finding['raw_data'], 
-            finding['chart_metric'], 
-            full_df,
-            anomaly_code=finding['anomaly_code'],
-            severity_metrics=finding.get('severity_metrics', {}),
-            chart_payload=finding.get('chart_payload', {})
-        )
-        
+
+        try:
+            chart_payload = dict(finding.get('chart_payload') or {})
+            chart_payload['event_date'] = finding.get('event_date')
+            chart_config = generate_chart_config(
+                finding.get('raw_data', ''),
+                finding.get('chart_metric', ''),
+                full_df,
+                anomaly_code=finding.get('anomaly_code'),
+                severity_metrics=finding.get('severity_metrics') or {},
+                chart_payload=chart_payload
+            )
+        except Exception as e:
+            logger.warning(f"Chart config failed for {finding.get('anomaly_code')} on {well_id}: {e}")
+            chart_config = {}
+
+        try:
+            impact_val = float(finding.get('impact_value') or 0)
+        except (TypeError, ValueError):
+            impact_val = 0.0
+        if np.isnan(impact_val) or np.isinf(impact_val):
+            impact_val = 0.0
+
+        # Sanitize chart and impact so JSON has no NaN/Inf and UI shows clear values
+        safe_chart = _clean_for_json(chart_config) if chart_config else {}
+        safe_impact_metrics = _clean_for_json(finding.get('impact_payload') or {})
+
         enriched_results.append({
             "well_id": well_id,
-            "event_date": finding['event_date'],
+            "event_date": str(finding['event_date']),
             "detected_at": finding['detected_at'],
             "anomaly_code": finding['anomaly_code'],
-            "category": finding['category'],
-            "severity": finding['severity'],
-            "title": title,
+            "category": finding.get('category', 'OPERATIONAL'),
+            "severity": finding.get('severity', 'Moderate'),
+            "title": title or "Anomaly Detected",
             "status": "ACTIVE",
-            "ui_text": llm_content,
-            "impact_metrics": finding['impact_payload'],
-            "impact_value": float(finding['impact_value']), # Ensure native float for DB
-            "chart_data": chart_config
+            "ui_text": llm_content or {},
+            "impact_metrics": safe_impact_metrics,
+            "impact_value": impact_val,
+            "chart_data": safe_chart
         })
 
     if enriched_results:
@@ -428,17 +547,28 @@ def save_reviews(reviews):
     if not reviews: 
         return
 
-    # Helper to clean numpy types for JSON serialization
+    # Helper to clean numpy types for JSON serialization and DB
     def clean_json(obj):
+        if obj is None: return None
         if isinstance(obj, (np.integer, np.int64)): return int(obj)
-        elif isinstance(obj, (np.floating, np.float64, np.float32)): return float(obj)
-        elif isinstance(obj, np.ndarray): return obj.tolist()
-        elif isinstance(obj, dict): return {k: clean_json(v) for k, v in obj.items()}
-        elif isinstance(obj, list): return [clean_json(v) for v in obj]
-        elif pd.isna(obj): return None
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            f = float(obj)
+            return None if np.isnan(f) else f
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        if isinstance(obj, dict): return {k: clean_json(v) for k, v in obj.items()}
+        if isinstance(obj, list): return [clean_json(v) for v in obj]
+        if pd.isna(obj): return None
         return obj
 
-    cleaned_reviews = [clean_json(r) for r in reviews]
+    cleaned_reviews = []
+    for r in reviews:
+        cleaned = clean_json(r)
+        if cleaned.get('impact_value') is None or (isinstance(cleaned.get('impact_value'), float) and np.isnan(cleaned['impact_value'])):
+            cleaned['impact_value'] = 0.0
+        cleaned_reviews.append(cleaned)
+
+    from anomaly_review.config import get_organization_id
+    org_id = get_organization_id()
 
     # ------------------------------------------------------------------
     # --- POSTGRES SAVE (ACTIVE) ---
@@ -448,24 +578,58 @@ def save_reviews(reviews):
         try:
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    q = '''
-                        INSERT INTO anomaly_review
-                        (well_id, event_date, detected_at, anomaly_code, category, severity, 
-                         title, ui_text, impact_value, impact_metrics, chart_data, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE 
-                        SET ui_text = EXCLUDED.ui_text, chart_data = EXCLUDED.chart_data
-                    '''
-                    for r in cleaned_reviews:
-                        cur.execute(q, (
-                            r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                            r['category'], r['severity'], r['title'],
-                            json.dumps(r['ui_text']),
-                            r['impact_value'],
-                            json.dumps(r['impact_metrics']),
-                            json.dumps(r['chart_data']),
-                            r['status']
-                        ))
+                    if org_id:
+                        q = '''
+                            INSERT INTO anomaly_review
+                            (organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                             title, ui_text, impact_value, impact_metrics, chart_data, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
+                            detected_at = EXCLUDED.detected_at,
+                            severity = EXCLUDED.severity,
+                            title = EXCLUDED.title,
+                            ui_text = EXCLUDED.ui_text,
+                            impact_value = EXCLUDED.impact_value,
+                            impact_metrics = EXCLUDED.impact_metrics,
+                            chart_data = EXCLUDED.chart_data,
+                            status = EXCLUDED.status
+                        '''
+                        for r in cleaned_reviews:
+                            cur.execute(q, (
+                                org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                                r['category'], r['severity'], r['title'],
+                                json.dumps(r['ui_text']),
+                                r['impact_value'],
+                                json.dumps(r['impact_metrics']),
+                                json.dumps(r['chart_data']),
+                                r['status']
+                            ))
+                    else:
+                        q = '''
+                            INSERT INTO anomaly_review
+                            (well_id, event_date, detected_at, anomaly_code, category, severity,
+                             title, ui_text, impact_value, impact_metrics, chart_data, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
+                            detected_at = EXCLUDED.detected_at,
+                            severity = EXCLUDED.severity,
+                            title = EXCLUDED.title,
+                            ui_text = EXCLUDED.ui_text,
+                            impact_value = EXCLUDED.impact_value,
+                            impact_metrics = EXCLUDED.impact_metrics,
+                            chart_data = EXCLUDED.chart_data,
+                            status = EXCLUDED.status
+                        '''
+                        for r in cleaned_reviews:
+                            cur.execute(q, (
+                                r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                                r['category'], r['severity'], r['title'],
+                                json.dumps(r['ui_text']),
+                                r['impact_value'],
+                                json.dumps(r['impact_metrics']),
+                                json.dumps(r['chart_data']),
+                                r['status']
+                            ))
                 conn.commit()
         except Exception as e:
             logger.error(f"PostgreSQL Save failed: {e}")
@@ -476,29 +640,82 @@ def save_reviews(reviews):
     try:
         with get_snowflake_conn() as conn:
             cur = conn.cursor()
-            insert_q = """
-                INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                (id, well_id, event_date, detected_at, anomaly_code, category, severity, 
-                 title, ui_text, impact_value, impact_metrics, chart_data, status)
-                SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, 
-                       PARSE_JSON(%s), PARSE_JSON(%s), %s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW 
+            if org_id:
+                update_q = """
+                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
+                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s, organization_id = %s
+                    WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
+                """
+                insert_q = """
+                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    (id, organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                     title, ui_text, impact_value, impact_metrics, chart_data, status)
+                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
+                           PARSE_JSON(%s), PARSE_JSON(%s), %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
+                    )
+                """
+                for r in cleaned_reviews:
+                    cur.execute(update_q, (
+                        r['detected_at'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'], org_id,
+                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
+                    ))
+                    cur.execute(insert_q, (
+                        org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                        r['category'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
+                    ))
+            else:
+                update_q = """
+                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
+                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s
                     WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
-                )
-            """
-            for r in cleaned_reviews:
-                cur.execute(insert_q, (
-                    r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                    r['category'], r['severity'], r['title'],
-                    json.dumps(r['ui_text']),
-                    r['impact_value'],
-                    json.dumps(r['impact_metrics']),
-                    json.dumps(r['chart_data']),
-                    r['status'],
-                    # WHERE params
-                    r['well_id'], r['anomaly_code'], r['event_date']
-                ))
+                """
+                insert_q = """
+                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                    (id, well_id, event_date, detected_at, anomaly_code, category, severity,
+                     title, ui_text, impact_value, impact_metrics, chart_data, status)
+                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
+                           PARSE_JSON(%s), PARSE_JSON(%s), %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
+                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
+                    )
+                """
+                for r in cleaned_reviews:
+                    cur.execute(update_q, (
+                        r['detected_at'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date']
+                    ))
+                    cur.execute(insert_q, (
+                        r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                        r['category'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_value'],
+                        json.dumps(r['impact_metrics']),
+                        json.dumps(r['chart_data']),
+                        r['status'],
+                        r['well_id'], r['anomaly_code'], r['event_date']
+                    ))
             conn.commit()
     except Exception as e:
         logger.error(f"Snowflake Save failed: {e}")

@@ -57,12 +57,19 @@ def generate_chart_config(
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df['date_only'] = df['timestamp'].dt.date
         
-        # Prefer payload date, fallback to extract
-        detection_date = extract_detection_date(anomaly_data)
+        # Prefer event_date from payload (set by service), then extract from raw text
+        detection_date = chart_payload.get('event_date')
+        if detection_date is not None:
+            detection_date = str(detection_date)
+        else:
+            detection_date = extract_detection_date(anomaly_data)
         
         # Route to anomaly-specific chart generators
         if anomaly_code == "MECHANICAL_FAILURE" or chart_metric == "mechanical_failure_view":
             return generate_mechanical_failure_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
+
+        if anomaly_code == "ML_PATTERN_ANOMALY" and "reconstruction_error" in df.columns:
+            return generate_ml_reconstruction_chart(df, anomaly_data, detection_date, chart_payload)
 
         if chart_metric == "monthly_production":
             return generate_monthly_decline_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
@@ -149,6 +156,11 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict
     labels = [d.strftime('%Y-%m-%d') for d in daily_df['date_only']]
     
     return daily_df, labels
+
+
+def _filter_annotations(annotations: List[Dict]) -> List[Dict]:
+    """Remove empty annotation dicts so Chart.js plugin does not receive [{}]."""
+    return [a for a in annotations if a]
 
 
 def create_anomaly_zone_annotation(detection_date: str, labels: List[str]) -> Dict:
@@ -278,7 +290,11 @@ def generate_mechanical_failure_chart(
     daily_df, labels = prepare_daily_aggregation(df, days=30, custom_agg=custom_agg)
 
     oil_data = pd.to_numeric(daily_df["oil_volume"], errors="coerce").fillna(0).round(1).tolist()
-    if "motor_current" in daily_df.columns:
+    use_motor = (
+        "motor_current" in daily_df.columns
+        and pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0).gt(0).any()
+    )
+    if use_motor:
         sensor_data = pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0).round(1).tolist()
         sensor_label = "Peak motor current (A)"
         sensor_color = CHART_COLORS["alert"]
@@ -290,9 +306,10 @@ def generate_mechanical_failure_chart(
         sensor_label = "Peak tubing pressure (psi)"
         sensor_color = CHART_COLORS["warning"]
 
-    annotations = [create_anomaly_zone_annotation(detection_date, labels)]
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {
         "display": True,
         "text": "Energy input vs production",
@@ -379,9 +396,11 @@ def generate_efficiency_chart(
     annotations = [create_anomaly_zone_annotation(detection_date, labels)]
     if 0 < baseline_efficiency < 900:
         annotations.append(create_threshold_band(labels, baseline_efficiency, f"Normal ({baseline_efficiency:.0f}%)"))
+    annotations = _filter_annotations(annotations)
 
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": title_text, "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {
         "display": True,
@@ -462,9 +481,11 @@ def generate_baseline_shift_chart(
     if decline_pct > 25:
         current_level = baseline_val * (1 - (decline_pct / 100))
         annotations.append(create_threshold_band(labels, current_level, "New level", CHART_COLORS["alert"]))
+    annotations = _filter_annotations(annotations)
 
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": "Production vs baseline", "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {
         "display": True,
@@ -516,11 +537,12 @@ def generate_pressure_instability_chart(
     lower_band = [max(0, avg - 2 * std) for avg, std in zip(pressure_avg, pressure_std)]
     oil_production = pd.to_numeric(daily_df["oil_volume"], errors="coerce").fillna(0).round(1).tolist()
 
-    annotations = [create_anomaly_zone_annotation(detection_date, labels)]
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
     volatility_pct = (severity_metrics or {}).get("volatility_pct", 0) or (chart_payload or {}).get("volatility_pct", 0)
 
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": "Pressure stability & production", "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {
         "display": True,
@@ -602,6 +624,83 @@ def generate_monthly_decline_chart(
     }
 
 
+def generate_ml_reconstruction_chart(
+    df: pd.DataFrame,
+    anomaly_data: str,
+    detection_date: str,
+    chart_payload: Dict = None,
+) -> Dict:
+    """Reconstruction error over time with threshold line. Used for ML_PATTERN_ANOMALY so the chart shows what was actually flagged."""
+    chart_payload = chart_payload or {}
+    threshold = chart_payload.get("threshold")
+    if threshold is None:
+        threshold = 0.0
+    threshold = float(threshold)
+
+    df = df.copy()
+    df["date_only"] = pd.to_datetime(df["timestamp"]).dt.date
+    daily = (
+        df.groupby("date_only")["reconstruction_error"]
+        .max()
+        .reset_index()
+        .sort_values("date_only")
+    )
+    if daily.empty:
+        return create_fallback_chart(df, "No reconstruction error data")
+    labels = [d.strftime("%Y-%m-%d") for d in daily["date_only"]]
+    rec_data = pd.to_numeric(daily["reconstruction_error"], errors="coerce").fillna(0).round(1).tolist()
+
+    options = get_common_options()
+    options["plugins"]["title"] = {
+        "display": True,
+        "text": "How much does the sensor pattern match 'normal'?",
+        "font": {"size": 16, "weight": "bold"},
+    }
+    options["plugins"]["subtitle"] = {
+        "display": True,
+        "text": f"Reconstruction error = how much today's sensor pattern deviates from the learned normal. Values above the red line ({threshold:,.0f}) mean the well is behaving unusually—see the report for which sensors to check.",
+        "font": {"size": 11},
+        "color": "#64748b",
+    }
+    options["scales"]["y"] = {
+        "type": "linear",
+        "position": "left",
+        "beginAtZero": True,
+        "title": {"display": True, "text": "Reconstruction error (deviation from normal pattern)"},
+        "grid": {"color": CHART_COLORS["grid"]},
+    }
+
+    annotations = []
+    if detection_date and detection_date in labels:
+        ann = create_anomaly_zone_annotation(detection_date, labels)
+        if ann:
+            annotations.append(ann)
+    if threshold is not None and threshold > 0:
+        annotations.append(
+            create_threshold_band(labels, threshold, f"Threshold ({threshold:,.0f})", CHART_COLORS["alert"])
+        )
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
+
+    return {
+        "type": "line",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "label": "Reconstruction error",
+                    "data": rec_data,
+                    "borderColor": CHART_COLORS["predicted"],
+                    "backgroundColor": "rgba(100, 116, 139, 0.12)",
+                    "borderWidth": 2,
+                    "fill": True,
+                },
+            ],
+        },
+        "options": options,
+    }
+
+
 def generate_pattern_shift_chart(
     df: pd.DataFrame,
     anomaly_data: str,
@@ -618,21 +717,32 @@ def generate_pattern_shift_chart(
     if "tubing" in anomaly_data.lower() or "pressure" in anomaly_data.lower():
         sensor_col = "tubing_pressure"
         sensor_label = "Peak tubing pressure (psi)"
+    # If motor_current is present but all zeros, use tubing_pressure for a meaningful chart
+    if (
+        sensor_col == "motor_current"
+        and "motor_current" in daily_df.columns
+        and "tubing_pressure" in daily_df.columns
+    ):
+        mc_series = pd.to_numeric(daily_df["motor_current"], errors="coerce").fillna(0)
+        if not mc_series.gt(0).any():
+            sensor_col = "tubing_pressure"
+            sensor_label = "Peak tubing pressure (psi)"
 
     sensor_data = (
         pd.to_numeric(daily_df[sensor_col], errors="coerce").fillna(0).round(1).tolist()
         if sensor_col in daily_df.columns else [0] * len(labels)
     )
 
-    annotations = [create_anomaly_zone_annotation(detection_date, labels)]
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
     freq_increase = (severity_metrics or {}).get("frequency_increase_pct", 0) or (chart_payload or {}).get("increase_pct", 0)
 
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": "Operational pattern (daily peak)", "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {
         "display": True,
-        "text": f"Peak {sensor_label.lower()} per day. Frequency increase: {freq_increase:.0f}%.",
+        "text": f"{sensor_label} per day. Frequency increase: {freq_increase:.0f}%.",
         "font": {"size": 11},
         "color": "#64748b",
     }
@@ -674,9 +784,10 @@ def generate_ghost_production_chart(
     max_vol = max(sum([oil_data, water_data, gas_data], []) + [10])
     pump_running_scaled = [pr * max_vol * 0.12 for pr in pump_running]
 
-    annotations = [create_anomaly_zone_annotation(detection_date, labels)]
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": "Production vs equipment activity", "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {
         "display": True,
@@ -710,9 +821,10 @@ def generate_default_enhanced_chart(
     daily_df, labels = prepare_daily_aggregation(df, days=45)
     oil_data = pd.to_numeric(daily_df["oil_volume"], errors="coerce").fillna(0).round(1).tolist()
 
-    annotations = [create_anomaly_zone_annotation(detection_date, labels)]
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
     options = get_common_options()
-    options["plugins"]["annotation"] = {"annotations": annotations}
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
     options["plugins"]["title"] = {"display": True, "text": "Oil production trend", "font": {"size": 16, "weight": "bold"}}
     options["plugins"]["subtitle"] = {"display": True, "text": "Daily oil (bbl/day). Red line = when anomaly was detected.", "font": {"size": 11}, "color": "#64748b"}
     options["scales"]["y"] = {"beginAtZero": True, "title": {"display": True, "text": "Oil (bbl/day)"}, "grid": {"color": CHART_COLORS["grid"]}}

@@ -22,7 +22,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES
+from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES, AUTOENCODER_THRESHOLD_SIGMA
 
 logger = logging.getLogger('AnomalyReviewModels')
 
@@ -35,11 +35,11 @@ try:
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
     TORCH_AVAILABLE = True
-except ImportError:
+except Exception as e:
     TORCH_AVAILABLE = False
     torch = None
     nn = None
-    logger.warning("PyTorch not available; LSTM models disabled")
+    logger.warning("PyTorch not available; LSTM/Autoencoder disabled (%s)", e)
 
 
 # =============================================================================
@@ -125,7 +125,12 @@ def prepare_sequences(
     if len(df) <= window_size:
         return None, None
     
-    data = df[features].values
+    # Coerce to float64 so PyTorch FloatTensor never sees object dtype (e.g. from Snowflake/digital twin)
+    block = df[features].copy()
+    for c in block.columns:
+        block[c] = pd.to_numeric(block[c], errors="coerce")
+    block = block.fillna(0).astype(np.float64)
+    data = block.values
     X, y = [], []
     
     for i in range(len(data) - window_size):
@@ -151,17 +156,17 @@ def engineer_physics_features(df: pd.DataFrame, lift_type: str = "Unknown") -> p
     # 1. Energy Intensity (Amps per Barrel) – only if we have liquid production and motor_current
     if 'oil_volume' in df.columns and 'water_volume' in df.columns and 'motor_current' in df.columns:
         total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
-        df['energy_intensity'] = (df['motor_current'] / total_liquid).fillna(0.0)
+        df['energy_intensity'] = (df['motor_current'] / total_liquid).fillna(0.0).infer_objects(copy=False)
 
     # 2. Water Cut (Water / Total Liquid)
     if 'oil_volume' in df.columns and 'water_volume' in df.columns:
         total_liquid = (df['oil_volume'] + df['water_volume']).replace(0, np.nan)
-        df['water_cut'] = (df['water_volume'] / total_liquid).fillna(0.0)
+        df['water_cut'] = (df['water_volume'] / total_liquid).fillna(0.0).infer_objects(copy=False)
 
     # 3. Gas-Oil Ratio
     if 'gas_volume' in df.columns and 'oil_volume' in df.columns:
         denom = df['oil_volume'].replace(0, np.nan)
-        df['gas_oil_ratio'] = (df['gas_volume'] / denom).fillna(0.0)
+        df['gas_oil_ratio'] = (df['gas_volume'] / denom).fillna(0.0).infer_objects(copy=False)
 
     # 4. Pressure Differential (Casing - Tubing)
     if 'casing_pressure' in df.columns and 'tubing_pressure' in df.columns:
@@ -183,8 +188,8 @@ def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], targ
         if not valid_feats:
             return []
             
-        X = df[valid_feats].fillna(0)
-        y = df[target_col].fillna(0)
+        X = df[valid_feats].apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float64)
+        y = df[target_col].apply(pd.to_numeric, errors="coerce").fillna(0)
         
         # Train lightweight RF
         rf = RandomForestRegressor(n_estimators=50, max_depth=5, n_jobs=-1, random_state=42)
@@ -204,10 +209,8 @@ def select_top_features_rf(df: pd.DataFrame, candidate_features: List[str], targ
 
 def safe_prepare_data(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
     """
-    Prepare DataFrame for prediction by ensuring all required features exist.
-    
-    If features are missing (e.g., failed sensor), they are created with 0 values
-    to prevent model crash.
+    Prepare DataFrame for prediction by ensuring all required features exist
+    and are numeric (avoids object dtype from DB/digital twin breaking scaler/torch).
     """
     df_safe = df.copy()
     missing = [f for f in features if f not in df_safe.columns]
@@ -216,9 +219,12 @@ def safe_prepare_data(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
         logger.warning(f"Missing features for prediction: {missing}. Imputing with Mean (via NaNs).")
         for f in missing:
             df_safe[f] = np.nan
-            
-    # Return features in exact order expected by model/scaler
-    return df_safe[features]
+
+    out = df_safe[features].copy()
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.fillna(0).astype(np.float64)
+    return out
 
 
 # =============================================================================
@@ -274,26 +280,45 @@ def train_lstm_model(df: pd.DataFrame, features: List[str], target: str) -> Opti
     }
 
 
-def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[Dict]:
+def train_autoencoder_model(
+    df: pd.DataFrame,
+    features: List[str],
+    scaler: Optional[StandardScaler] = None,
+    imputer: Optional[SimpleImputer] = None,
+) -> Optional[Dict]:
     """
     Train LSTM Autoencoder for unsupervised anomaly detection.
-    
+
+    Must be trained on the SAME scaled data used at inference, otherwise
+    threshold (from training MSE) and inference reconstruction error are in
+    different units and you get impossible ratios (e.g. 29× above threshold).
+
     Args:
         df: Training DataFrame with features
         features: List of feature column names
-        
+        scaler: Fitted StandardScaler (if None, trains on raw data - not recommended)
+        imputer: Fitted SimpleImputer (if None, uses raw data)
+
     Returns:
         Dict with model, type, features, threshold, and window_size or None if training fails
     """
     if not TORCH_AVAILABLE:
         return None
-    
+
     window_size = 7
-    X_np, _ = prepare_sequences(df, features, target=None, window_size=window_size)
-    
+    # Build sequences from SCALED data so threshold and inference errors are in the same units
+    if scaler is not None and imputer is not None:
+        safe_df = safe_prepare_data(df, features)
+        scaled_data = scaler.transform(imputer.transform(safe_df))
+        scaled_df = pd.DataFrame(scaled_data, columns=features)
+        X_np, _ = prepare_sequences(scaled_df, features, target=None, window_size=window_size)
+    else:
+        X_np, _ = prepare_sequences(df, features, target=None, window_size=window_size)
+
     if X_np is None or len(X_np) < 50:
         return None
-    
+
+    X_np = np.asarray(X_np, dtype=np.float64)
     X_tensor = torch.FloatTensor(X_np)
     dataset = TensorDataset(X_tensor)
     loader = DataLoader(dataset, batch_size=16, shuffle=True)
@@ -312,12 +337,12 @@ def train_autoencoder_model(df: pd.DataFrame, features: List[str]) -> Optional[D
             loss.backward()
             optimizer.step()
     
-    # Calculate threshold (Mean + 2 Sigma on training data for better sensitivity)
+    # Calculate threshold (Mean + N*Sigma); N from config so you can lower for digital twin / testing
     model.eval()
     with torch.no_grad():
         reconstructions = model(X_tensor)
         train_loss = torch.mean((X_tensor - reconstructions) ** 2, dim=[1, 2])
-        threshold = torch.mean(train_loss) + 2 * torch.std(train_loss)
+        threshold = torch.mean(train_loss) + float(AUTOENCODER_THRESHOLD_SIGMA) * torch.std(train_loss)
         
         # Safety: If threshold is NaN (e.g., from constant input), use default
         if torch.isnan(threshold) or threshold == 0:
@@ -391,9 +416,10 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
     # Ensure 'oil_volume' is available for target, even if not a feature
     required_cols = list(set(selected_features + ['oil_volume']))
     train_df = df[required_cols].copy()
-    
-    # Handle missing values for training
-    train_df = train_df.ffill().bfill().fillna(0)  # Fill NaNs before scaling
+    # Coerce to float first to avoid object dtype and FutureWarning from fillna/ffill downcasting
+    for c in train_df.columns:
+        train_df[c] = pd.to_numeric(train_df[c], errors="coerce")
+    train_df = train_df.ffill().bfill().fillna(0).astype(np.float64)
 
     # Filter for valid training data (e.g., positive oil volume)
     train_df_filtered = train_df[train_df['oil_volume'] > 0.1].copy()
@@ -419,11 +445,9 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
         logger.error(f"RF training failed: {e}")
 
     # B. LSTM Autoencoder (For Anomaly Detection)
+    # Train on SCALED data so threshold and inference MSE are in the same units (avoids 29× impossible ratios)
     try:
-        # Train Autoencoder on the same filtered/imputed data
-        # We re-use 'train_df_filtered' but need to pass the full original DF pattern for sequences
-        # ideally. However, train_autoencoder_model takes (df, features).
-        ae_artifact = train_autoencoder_model(df, selected_features)
+        ae_artifact = train_autoencoder_model(df, selected_features, scaler=scaler, imputer=imputer)
         
         if ae_artifact:
             models['autoencoder'] = ae_artifact['model']
@@ -667,6 +691,12 @@ def detect_autoencoder_anomalies(
     try:
         # Create missing columns if needed
         safe_df = safe_prepare_data(df, features)
+        # Clip to prevent massive Z-scores when synthetic/data spikes (e.g. 0 from high mean)
+        mean_ = safe_df.mean()
+        std_ = safe_df.std().replace(0, np.nan)
+        lower = mean_ - 5 * std_
+        upper = mean_ + 5 * std_
+        safe_df = safe_df.clip(lower=lower.fillna(safe_df.min()), upper=upper.fillna(safe_df.max()), axis=1)
         scaled_data = scaler.transform(imputer.transform(safe_df))
         X_list = []
         indices = []
@@ -684,11 +714,36 @@ def detect_autoencoder_anomalies(
         with torch.no_grad():
             model.eval()
             reconstructions = model(X_tensor)
-            errors = torch.mean((X_tensor - reconstructions) ** 2, dim=[1, 2]).numpy()
+            sq_err = (X_tensor - reconstructions) ** 2
+            errors = torch.mean(sq_err, dim=[1, 2]).numpy()
+            # Per-feature MSE (mean over time) for attribution
+            per_feature_mse = torch.mean(sq_err, dim=1).numpy()
         
         results = pd.DataFrame(index=indices)
         results['reconstruction_error'] = errors
+        th = max(threshold, 1e-9)
+        results['anomaly_score'] = errors / th
         results['is_ml_anomaly'] = errors > threshold
+        # Feature attribution: % contribution per feature, top 3 as "Tubing Pressure (85%), Motor Current (10%)"
+        def _feature_display_name(name: str) -> str:
+            return str(name).replace("_", " ").title()
+        top_k = min(3, len(features))
+        top_contrib = []
+        for i in range(len(indices)):
+            contrib = per_feature_mse[i]
+            total = contrib.sum()
+            if total <= 0:
+                top_contrib.append("")
+                continue
+            pct = 100.0 * contrib / total
+            order = np.argsort(contrib)[::-1]
+            parts = []
+            for j in order[:top_k]:
+                if contrib[j] <= 0:
+                    continue
+                parts.append(f"{_feature_display_name(features[j])} ({pct[j]:.0f}%)")
+            top_contrib.append(", ".join(parts) if parts else "")
+        results['top_contributing_features'] = top_contrib
         return results
         
     except Exception as e:

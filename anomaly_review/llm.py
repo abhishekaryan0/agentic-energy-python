@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 from anomaly_review.data import get_openai_client
 
-logger = logging.getLogger('AnomalyReviewLLM')
+logger = logging.getLogger("AnomalyReviewLLM")
 
 
 def generate_llm_content(
@@ -22,11 +22,11 @@ def generate_llm_content(
     detected_at_str: str,
     diagnosis: Dict = None,
     impact_metrics: Dict = None,
-    anomaly_code: str = None
+    anomaly_code: str = None,
 ) -> Dict:
     """
     Generate detailed anomaly report using LLM.
-    
+
     Args:
         anomaly_data: Raw metrics and indicators
         lift_type: Well lift type (Rod Pump, ESP, Gas Lift)
@@ -35,28 +35,30 @@ def generate_llm_content(
         detected_at_str: Detection timestamp
         diagnosis: Root cause assessment
         impact_metrics: Financial and production impact
-        
+
     Returns:
         Dict with title, description, why_is_this_an_anomaly,
         suspected_root_cause, economic_impact, risk_analysis, historical_context
     """
     # Clean NaN strings
-    anomaly_data = str(anomaly_data).replace('nan', 'Unknown')
+    anomaly_data = str(anomaly_data).replace("nan", "Unknown")
     if diagnosis:
-        diagnosis = {k: str(v).replace('nan', 'Unknown') for k, v in diagnosis.items()}
+        diagnosis = {k: str(v).replace("nan", "Unknown") for k, v in diagnosis.items()}
 
     try:
         client = get_openai_client()
         if not client:
             raise Exception("No OpenAI Client")
-        
+
         # Format detection timestamp
         try:
-            if 'T' in str(detected_at_str):
-                dt_obj = datetime.fromisoformat(str(detected_at_str).replace('Z', '+00:00'))
+            if "T" in str(detected_at_str):
+                dt_obj = datetime.fromisoformat(
+                    str(detected_at_str).replace("Z", "+00:00")
+                )
             else:
-                dt_obj = datetime.strptime(str(detected_at_str), '%Y-%m-%d %H:%M:%S.%f')
-            formatted_date = dt_obj.strftime('%m/%d/%Y %H:%M:%S')
+                dt_obj = datetime.strptime(str(detected_at_str), "%Y-%m-%d %H:%M:%S.%f")
+            formatted_date = dt_obj.strftime("%m/%d/%Y %H:%M:%S")
         except Exception:
             formatted_date = str(detected_at_str)
 
@@ -88,9 +90,9 @@ def generate_llm_content(
             """
             if diagnosis:
                 diagnosis_context = f"DETECTED PATTERN: {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
-        
+
         if diagnosis and not root_cause_unknown:
-            if diagnosis.get('confidence') == 'Low':
+            if diagnosis.get("confidence") == "Low":
                 diagnosis_context = f"POTENTIAL ISSUE (LOW CONFIDENCE): {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
                 if not confidence_instruction:
                     confidence_instruction = """
@@ -108,12 +110,12 @@ def generate_llm_content(
                     """
         elif diagnosis:
             diagnosis_context = f"DETECTED PATTERN: {diagnosis['type']} (Indicators: {diagnosis['indicators']})"
-        
+
         # Construct Impact Context
         impact_context = ""
         if impact_metrics:
-            fin = impact_metrics.get('financial', {})
-            prod = impact_metrics.get('production', {})
+            fin = impact_metrics.get("financial", {})
+            prod = impact_metrics.get("production", {})
             impact_context = f"""
             CALCULATED IMPACT METRICS (Use EXACTLY these values, DO NOT re-calculate or guess):
             - Financial Loss: {fin.get('label', 'N/A')} (Value: {fin.get('value', 0)})
@@ -122,8 +124,10 @@ def generate_llm_content(
 
         # VALIDATION MODE PROMPT (For ML Anomalies)
         # We trigger validation if the code is explicitly ML_PATTERN_ANOMALY or if diagnosis implies uncertainty
-        is_validation = (anomaly_code == 'ML_PATTERN_ANOMALY') or ('Unclassified' in str(diagnosis))
-        
+        is_validation = (anomaly_code == "ML_PATTERN_ANOMALY") or (
+            "Unclassified" in str(diagnosis)
+        )
+
         validation_instruction = ""
         if is_validation:
             validation_instruction = """
@@ -136,6 +140,27 @@ def generate_llm_content(
             If "is_valid_anomaly": false, you may leave other fields empty. 
             """
 
+        data_mismatch_instruction = ""
+        if anomaly_code == "DATA_MISMATCH":
+            data_mismatch_instruction = """
+            DATA_MISMATCH (CRITICAL): This is a sensor/data consistency issue, NOT a mechanical well failure.
+            - Root cause: Pump state (Amps/SPM) says "running" but flow meter reads zero. Likely meter calibration, data sync, or sensor fault.
+            - Do NOT invent mechanical causes (pump failure, fluid pound, etc.). Frame as "data or meter issue—verify sensors and data pipeline."
+            - Title: e.g. "Sensor state mismatch (meter or data)" or "Pump active but zero flow (verify meter)".
+            - recommended_actions: 1. Verify flow meter calibration and wiring. 2. Check data sync between SCADA and production system. 3. Compare with well test or manual gauge.
+            """
+
+        ml_pattern_instruction = ""
+        if anomaly_code == "ML_PATTERN_ANOMALY":
+            ml_pattern_instruction = """
+            ML PATTERN ANOMALY (CRITICAL - READ FIRST):
+            Use the "READABLE SUMMARY" and "*** ROOT CAUSE ANALYSIS (Feature Contribution) ***" in the ANOMALY DATA. Your output must be concrete and non-generic.
+            - Lead with the "X× above threshold" from READABLE SUMMARY (e.g. "The error is 29× above threshold—the sensor pattern does not match the learned normal."). Do NOT lead with the raw number (e.g. 155,209) without context.
+            - TITLE and DESCRIPTION must name the exact sensors from ROOT CAUSE ANALYSIS (e.g. "Pattern deviation (Injection Pressure, Casing Pressure)" and "Driven mainly by Injection Pressure and Casing Pressure").
+            - You MUST NOT invent or imply root causes that are not in the data. FORBIDDEN: "gas lift", "pressure management malfunction", "flow instability", "well dynamics", "lift efficiency"—unless the ANOMALY DATA explicitly states them. The model only provides which sensors deviated (with %); say "pattern deviated; check these sensors" and list the sensors. suspected_root_cause must be limited to: "Deviation driven mainly by [sensor names from ROOT CAUSE ANALYSIS]; recommend reviewing their trends to identify cause."
+            - RECOMMENDED_ACTIONS: Numbered steps that reference the named sensors (e.g. "1. Review trend for Injection Pressure. 2. Review trend for Casing Pressure. 3. Compare to baseline or prior week.").
+            """
+
         prompt = f"""
 ROLE: Senior Production Engineer / Optimization Specialist with deep expertise in rod pumping and anomaly diagnostics.
 TASK: Generate a COMPREHENSIVE technical investigation report for a well performance deviation. The output must be rich in engineering detail, explaining the *mechanics* of the issue, not just stating the metrics.
@@ -143,9 +168,14 @@ TONE: Investigative, highly analytical, professional.
 
 ANOMALY REVIEW CONTEXT: This is an Anomaly Review item—the middle layer between normal operations and At-Risk events. Purpose is to flag "this is unusual / we didn't expect this" for human investigation—NOT to declare a failure or trigger an automatic At-Risk alarm. Something is not normal but not necessarily bad or broken; frame everything as "recommend review" and "worth investigating" rather than "failure" or "critical alarm".
 
-PLAIN LANGUAGE (CRITICAL): Users see this report—avoid internal or ML jargon. Never use phrases like "Model Divergence", "Model Performance Divergence", "divergence detected", or "model vs actual" in the title or as the main way you describe the issue. Instead describe the REAL problem in operational terms: e.g. "Production Below Expected", "Well Underperforming vs Forecast", "Oil Output Lower Than Predicted". Same for other types: use what the engineer cares about (e.g. "Pump Not Filling Fully" not "Fluid Pound Detected"; "High Amps With Low Flow" not "Energy/Production Divergence"). Keep titles and descriptions clear and problem-focused.
+PLAIN LANGUAGE AND REAL CAUSE (CRITICAL): Users need to know WHAT IS WRONG and the REAL CAUSE so they can fix it.
+- TITLE: Keep it short and scannable (4–7 words). Use a simple format: "[Problem] ([brief cause])" or "[Problem]: [one short phrase]". Use a normal hyphen (-) or parentheses, NOT em dash (—). Good: "Pressure volatility (slugging risk)", "Pump not filling (gas or valve)", "More shutdowns than usual", "Production below expected". Avoid long compound titles like "High pressure volatility—likely slugging or flowline restriction"; prefer "Pressure volatility (slugging or restriction)".
+- DESCRIPTION: Explain the mechanics and root cause. Use evidence from ANOMALY DATA. Avoid jargon; use operational language.
+- SUSPECTED_ROOT_CAUSE: Explain the REAL cause so an engineer can act. Do not leave this vague.
 
 {validation_instruction}
+{data_mismatch_instruction}
+{ml_pattern_instruction}
 
 {confidence_instruction}
 
@@ -182,15 +212,14 @@ Generate a JSON response with these EXACT keys and STRICT formats:
 
 1. "is_valid_anomaly": (boolean) - See critical verification task above.
 2. "title": 
-   - Max 6 words. No $ symbols. Use plain operational language (see PLAIN LANGUAGE above).
-   - Good: "Production Below Expected", "High Amps With Low Flow", "Pump Not Filling Fully", "Pressure Swings Increasing".
-   - Avoid: "Model Divergence", "Model Performance Divergence", "Energy Efficiency Drift Detected", or other jargon.
+   - Short and scannable: 4–7 words. Format "[Problem] ([brief cause])" or "[Problem]: [short phrase]". Use hyphen or parentheses, NOT em dash (—). No $ symbols.
+   - Good: "Pressure volatility (slugging risk)", "Pump not filling (gas or valve)", "More shutdowns than usual", "Production below expected".
+   - Avoid: long compound titles with em dashes, vague labels like "Pressure Swings Increasing" or "Model Divergence".
 
 3. "description": 
-   - A detailed, 3-5 sentence paragraph.
-   - Combine exact data points with mechanical application. 
-   - Explain HOW the deviation is occurring (e.g., "The 18% increase in energy intensity suggests the pump is overcoming increased friction or restrictions...").
-   - Explicitly mention the financial/production impact using 'CALCULATED_REVENUE_LOSS'.
+   - A detailed, 3-5 sentence paragraph. State WHAT is broken or misbehaving and the LIKELY CAUSE using evidence from ANOMALY DATA.
+   - Explain the mechanics: HOW the deviation is occurring (e.g., "Tubing pressure volatility indicates flow instability—likely slugging or a restriction in the flowline...").
+   - Include financial/production impact when provided (use exact values from CALCULATED IMPACT METRICS).
 
 4. "why_is_this_an_anomaly": 
    - ONE clear sentence stating the deviation math.
@@ -203,8 +232,9 @@ Generate a JSON response with these EXACT keys and STRICT formats:
    - Do NOT invent sensor correlations (e.g. "high amperage and low flow") unless the ANOMALY DATA explicitly includes and supports those metrics.
 
 6. "economic_impact": 
-   ONE sentence: "This deviation represents an opportunity cost of estimated $[X]/day due to [inefficiency/production gap]."
-   - CRITICAL: You MUST extract $[X] from 'CALCULATED_REVENUE_LOSS'.
+   ONE sentence. If CALCULATED IMPACT METRICS above give a dollar value > 0: "This deviation represents an opportunity cost of estimated $[X]/day due to [inefficiency/production gap]." Use the exact value from the metrics.
+   - If the impact value is 0 or "Operational Review": write "Operational risk identified; estimated financial impact requires field assessment. Early intervention recommended to avoid escalation."
+   - Never leave economic_impact empty or generic; always state either the $/day or that field assessment is needed.
 
 7. "risk_analysis": 
    - You MUST follow this EXACT two-paragraph structure, no objects just string:
@@ -235,25 +265,25 @@ Generate a JSON response with these EXACT keys and STRICT formats:
 
 Return ONLY valid JSON. Ensure all fields are populated based on data provided.
 """
-        
+
         # Call OpenAI with explicit timeout
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                timeout=15  # 15-second timeout
+                timeout=15,  # 15-second timeout
             )
-            
+
             raw_content = response.choices[0].message.content
             # Cleanup Markdown code blocks if present
             if "```json" in raw_content:
                 raw_content = raw_content.split("```json")[1].split("```")[0].strip()
             elif "```" in raw_content:
                 raw_content = raw_content.split("```")[1].split("```")[0].strip()
-                
+
             content = json.loads(raw_content)
-            
+
         except Exception as e:
             # Handle Timeout or API Error by returning structured fallback
             logger.warning(f"LLM Call failed or timed out: {e}")
@@ -265,20 +295,25 @@ Return ONLY valid JSON. Ensure all fields are populated based on data provided.
                 "economic_impact": "Impact calculation pending.",
                 "risk_analysis": "Please conduct manual review of the attached charts.",
                 "recommended_actions": "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence.",
-                "historical_context": {"recurrence_status": "Unknown", "history_timeline": []},
-                "is_valid_anomaly": True
+                "historical_context": {
+                    "recurrence_status": "Unknown",
+                    "history_timeline": [],
+                },
+                "is_valid_anomaly": True,
             }
-        
+
         # Default recommended_actions if missing
         if "recommended_actions" not in content:
-            content["recommended_actions"] = "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence."
+            content["recommended_actions"] = (
+                "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence."
+            )
 
         # Default is_valid to True if not present (legacy support)
         if "is_valid_anomaly" not in content:
             content["is_valid_anomaly"] = True
-            
+
         return content
-        
+
     except Exception as e:
         logger.error(f"LLM content generation critical failure: {e}")
         return {
@@ -288,6 +323,9 @@ Return ONLY valid JSON. Ensure all fields are populated based on data provided.
             "suspected_root_cause": "Pending automated investigation.",
             "economic_impact": "Impact calculation pending.",
             "risk_analysis": "Please conduct manual review of the attached charts.",
-            "historical_context": {"recurrence_status": "Unknown", "history_timeline": []},
-            "is_valid_anomaly": True
+            "historical_context": {
+                "recurrence_status": "Unknown",
+                "history_timeline": [],
+            },
+            "is_valid_anomaly": True,
         }

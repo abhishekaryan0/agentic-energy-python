@@ -33,6 +33,16 @@ from anomaly_review.config import (
     MONTHLY_DECLINE_MIN_PCT,
     PATTERN_SHIFT_MULTIPLIER,
     PATTERN_SHIFT_MIN_EVENTS,
+    PATTERN_SHIFT_SHUTDOWN_AMPS_MAX,
+    PATTERN_SHIFT_MIN_SHUTDOWN_HOURS,
+    PATTERN_SHIFT_BASELINE_DAYS,
+    PATTERN_SHIFT_RECENT_DAYS,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP,
+    PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP,
+    PATTERN_SHIFT_PRESSURE_SPIKE_ABOVE_BASELINE_RATIO,
+    PATTERN_SHIFT_FILLAGE_DROP_BELOW_BASELINE_RATIO,
+    PATTERN_SHIFT_SPM_DROP_BELOW,
     DATA_MISMATCH_AMPS_ACTIVE_MIN,
     DATA_MISMATCH_ZERO_VOL_MAX,
     DATA_MISMATCH_BASELINE_VOL_MIN,
@@ -116,7 +126,16 @@ def diagnose_mechanics(ctx: Dict) -> Dict:
             'indicators': f'Motor Current dropped significantly ({amps_ratio:.2f}x)'
         }
 
-    # Seized Pump / Locked Rotor
+    # Seized Pump / Locked Rotor (High Amps + Zero SPM)
+    spm = ctx.get('strokes_per_minute', 0)
+    if amps > 5 and (spm is None or float(spm) < 0.1):
+        return {
+            'type': 'Seized Pump / Locked Rotor',
+            'confidence': 'High',
+            'indicators': f'High Amps ({amps:.1f}) with Zero SPM'
+        }
+
+    # Seized Pump / Locked Rotor (high amps ratio, near-zero flow)
     elif amps_ratio > 1.5 and efficiency < 20:
         return {
             'type': 'Seized Pump / Locked Rotor',
@@ -168,9 +187,11 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     """
     lift_type = str(ctx.get('lift_type', '')).lower().replace(' ', '')
     if 'rod' not in lift_type:
+        logger.debug(f"[FLUID_POUND] skip: lift_type='{lift_type}' (not rod pump)")
         return None
 
     if pd.isna(ctx.get('pump_fillage')) or pd.isna(ctx.get('strokes_per_minute')):
+        logger.debug(f"[FLUID_POUND] skip: pump_fillage or strokes_per_minute missing/NaN")
         return None
     
     # Use rolling average fillage to avoid false positives from transient sensor noise
@@ -187,13 +208,18 @@ def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     baseline_fillage = ctx.get('fillage_avg_3d', ctx.get('fillage_avg_24h'))
     
     if baseline_fillage is None:
+        logger.debug(f"[FLUID_POUND] skip: no fillage baseline (fillage_avg_3d/24h)")
         return None
 
     # Anomaly if fillage drops below baseline band AND is below absolute max (configurable "unusual" range)
     threshold_fillage = baseline_fillage * FLUID_POUND_FILLAGE_BELOW_BASELINE
-    would_trigger = spm > 4.0 and fillage < threshold_fillage and fillage < FLUID_POUND_FILLAGE_ABSOLUTE_MAX
+    would_trigger = spm >= 0.0 and fillage < threshold_fillage and fillage < FLUID_POUND_FILLAGE_ABSOLUTE_MAX
     logger.debug(f"[FLUID_POUND_CHECK] Fillage: {fillage}%, Baseline: {baseline_fillage}%, SPM: {spm} (trigger={would_trigger})")
 
+    if not would_trigger:
+        logger.debug(
+            f"[FLUID_POUND] skip: fillage={fillage}% >= threshold {threshold_fillage:.0f}% or >= absolute max {FLUID_POUND_FILLAGE_ABSOLUTE_MAX}"
+        )
     if would_trigger:
         severity_score = 100 - fillage
         revenue_loss = ctx.get('oil_avg_7d', 0) * ((100 - fillage) / 100) * OIL_PRICE
@@ -497,6 +523,7 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
             DETECTION TYPE: Pressure Volatility
             VOLATILITY (CV): {cv:.1f}% (High)
             STD DEV: {tp_std:.1f} psi (Mean Pressure: {tp_avg:.0f} psi)
+            CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day
             """
 
             return {
@@ -524,61 +551,144 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
     return None
 
 
+def _count_events_min_hours(series: pd.Series, min_hours: int) -> int:
+    """
+    Count contiguous runs where value is True, only if run length >= min_hours.
+    Use this so we don't count sensor glitches (e.g. 1 hour of 0) as shutdown;
+    only sustained low reading (e.g. 4+ or 24+ hours) counts as one event.
+    """
+    if series.empty or not series.any():
+        return 0
+    padded = np.concatenate([[False], series.values.astype(bool), [False]])
+    diff = np.diff(padded.astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    if len(starts) != len(ends):
+        return 0
+    lengths = ends - starts
+    if min_hours < 1:
+        return len(lengths)
+    return int(np.sum(lengths >= min_hours))
+
+
 def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[Dict]:
     """
-    Detects change in operational pattern frequency.
-    Checks frequency of 'Shutdowns' (Amps == 0) in last 30d vs previous.
+    Detects change in operational pattern by comparing counts: e.g. "it used to happen
+    once (in baseline window), now it happened 3 times (in recent window)". When the
+    anomaly happened (calendar date) does not matter; the count does.
+
+    Shutdown: We only count "shutdown" when motor_current is low for at least 24 hours
+    (PATTERN_SHIFT_MIN_SHUTDOWN_HOURS). So sensor down for a day = one event; brief
+    glitch or hourly blip does not count.
+
+    Baseline = previous PATTERN_SHIFT_BASELINE_DAYS (90d). Recent = last PATTERN_SHIFT_RECENT_DAYS (30d).
+    We compare event counts (recent count vs baseline count normalized to per-30d).
     """
     if full_df is None or 'motor_current' not in full_df.columns:
         return None
-        
-    # Define "Event": Motor Current < 1.0 (Shutdown)
-    full_df['is_shutdown'] = full_df['motor_current'] < 1.0
-    
-    # Last 30 days
-    last_30_start = full_df['timestamp'].max() - pd.Timedelta(days=30)
-    recent = full_df[full_df['timestamp'] >= last_30_start]
-    
-    # Previous window (30d to 120d ago)
-    prev_start = last_30_start - pd.Timedelta(days=90)
-    previous = full_df[(full_df['timestamp'] < last_30_start) & (full_df['timestamp'] >= prev_start)]
-    
-    recent_count = recent['is_shutdown'].sum()
-    prev_count_avg = previous['is_shutdown'].sum() / 3 # Monthly avg over 3 months
-    
-    # Trigger: recent events clearly above baseline (configurable "unusual" multiplier)
-    if recent_count >= PATTERN_SHIFT_MIN_EVENTS and recent_count > (prev_count_avg * PATTERN_SHIFT_MULTIPLIER):
-        increase_pct = ((recent_count - prev_count_avg) / prev_count_avg) * 100 if prev_count_avg > 0 else 100
-        
+
+    full_df = full_df.sort_values('timestamp').copy()
+    last_ts = full_df['timestamp'].max()
+    recent_start = last_ts - pd.Timedelta(days=PATTERN_SHIFT_RECENT_DAYS)
+    prev_start = recent_start - pd.Timedelta(days=PATTERN_SHIFT_BASELINE_DAYS)
+    baseline_label = f"previous {PATTERN_SHIFT_BASELINE_DAYS}d"
+
+    # Add derived columns to full_df before slicing so recent/previous have them
+    full_df['is_shutdown'] = full_df['motor_current'] < PATTERN_SHIFT_SHUTDOWN_AMPS_MAX
+    if 'tubing_pressure' in full_df.columns:
+        tp_median = full_df['tubing_pressure'].median()
+        thresh = tp_median * PATTERN_SHIFT_PRESSURE_SPIKE_ABOVE_BASELINE_RATIO
+        full_df['is_pressure_spike'] = full_df['tubing_pressure'] > thresh
+    if 'pump_fillage' in full_df.columns:
+        fill_median = full_df['pump_fillage'].median()
+        thresh = fill_median * PATTERN_SHIFT_FILLAGE_DROP_BELOW_BASELINE_RATIO
+        full_df['is_fillage_drop'] = full_df['pump_fillage'] < thresh
+    if 'strokes_per_minute' in full_df.columns:
+        full_df['is_spm_drop'] = full_df['strokes_per_minute'] < PATTERN_SHIFT_SPM_DROP_BELOW
+
+    recent = full_df[full_df['timestamp'] >= recent_start]
+    previous = full_df[(full_df['timestamp'] < recent_start) & (full_df['timestamp'] >= prev_start)]
+
+    # 1) Shutdown: only count when low amps last >= 24h (sensor down for a day)
+    recent_shutdown = _count_events_min_hours(recent['is_shutdown'], PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
+    prev_shutdown = _count_events_min_hours(previous['is_shutdown'], PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
+    prev_shutdown_per_30d = prev_shutdown / 3.0  # 90d = 3 × 30d
+
+    # 2) Pressure spike, fillage drop, SPM drop (sustained events)
+    events_detected = []
+    if 'is_pressure_spike' in full_df.columns:
+        r_ps = _count_events_min_hours(recent['is_pressure_spike'], PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE)
+        p_ps = _count_events_min_hours(previous['is_pressure_spike'], PATTERN_SHIFT_MIN_EVENT_HOURS_PRESSURE_SPIKE)
+        p_ps_per = p_ps / 3.0
+        if r_ps >= 1 and (p_ps_per == 0 or r_ps > PATTERN_SHIFT_MULTIPLIER * p_ps_per):
+            events_detected.append(("pressure spike", r_ps, p_ps_per))
+    if 'is_fillage_drop' in full_df.columns:
+        r_fd = _count_events_min_hours(recent['is_fillage_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP)
+        p_fd = _count_events_min_hours(previous['is_fillage_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_FILLAGE_DROP)
+        p_fd_per = p_fd / 3.0
+        if r_fd >= 1 and (p_fd_per == 0 or r_fd > PATTERN_SHIFT_MULTIPLIER * p_fd_per):
+            events_detected.append(("fillage drop", r_fd, p_fd_per))
+    if 'is_spm_drop' in full_df.columns:
+        r_spm = _count_events_min_hours(recent['is_spm_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP)
+        p_spm = _count_events_min_hours(previous['is_spm_drop'], PATTERN_SHIFT_MIN_EVENT_HOURS_SPM_DROP)
+        p_spm_per = p_spm / 3.0
+        if r_spm >= 1 and (p_spm_per == 0 or r_spm > PATTERN_SHIFT_MULTIPLIER * p_spm_per):
+            events_detected.append(("SPM drop", r_spm, p_spm_per))
+
+    # Estimate operational risk impact (so every anomaly has a non-zero impact for UI/clarity)
+    recent_oil = float(recent["oil_volume"].mean()) if "oil_volume" in recent.columns and not recent["oil_volume"].empty else 0.0
+    pattern_impact = recent_oil * 0.10 * OIL_PRICE if recent_oil > 0 else 50.0 * OIL_PRICE  # 10% risk or ~$3750 placeholder
+    impact_label = f"${format_number(pattern_impact)}/day (Operational Risk)" if pattern_impact > 0 else "Operational Review"
+
+    # Trigger on shutdown increase (sustained events only)
+    shutdown_trigger = recent_shutdown >= 1 and (
+        (prev_shutdown_per_30d == 0 and recent_shutdown >= PATTERN_SHIFT_MIN_EVENTS)
+        or (prev_shutdown_per_30d > 0 and recent_shutdown > PATTERN_SHIFT_MULTIPLIER * prev_shutdown_per_30d)
+    )
+    if shutdown_trigger:
+        increase_pct = ((recent_shutdown - prev_shutdown_per_30d) / prev_shutdown_per_30d) * 100 if prev_shutdown_per_30d > 0 else 100
+        event_desc = "Pump shutdowns (sustained low amps ≥{}h)".format(PATTERN_SHIFT_MIN_SHUTDOWN_HOURS)
         data_summary = f"""
-        DETECTION TYPE: Recurring Operational Events
-        EVENT: Pump Shutdowns
-        RECENT COUNT (30d): {recent_count}
-        HISTORICAL AVG: {prev_count_avg:.1f} per month
-        FREQUENCY CHANGE: +{increase_pct:.0f}%
+        DETECTION TYPE: Operational pattern change (event frequency)
+        EVENT: {event_desc}
+        RECENT (30d): {recent_shutdown} event(s)
+        BASELINE ({baseline_label}): {prev_shutdown_per_30d:.2f} per 30d
+        CHANGE: Activity that was rare is now happening more often (e.g. twice a year → monthly).
+        CALCULATED_REVENUE_LOSS: ${format_number(pattern_impact)}/day (operational risk estimate)
         """
-        
+        if events_detected:
+            data_summary += "\n        Also increased: " + ", ".join(f"{n} (recent {r}, baseline {p:.1f})" for n, r, p in events_detected)
         return {
             "code": "PATTERN_SHIFT",
             "category": "OPERATIONAL",
-            "raw_data": data_summary,
-            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': 0},
-            "impact_value": 0,
-            "impact_payload": {
-                "financial": {"value": 0, "label": "Operational Review"},
-                "production": {"value": 0, "label": "N/A"}
-            },
-            "chart_metric": "mechanical_failure_view", # Visualize amps
-            "diagnosis": {
-                "type": "Recurring Operational Events",
-                "confidence": "High",
-                "indicators": f"Shutdowns jumped to {recent_count}/mo from {prev_count_avg:.1f}/mo"
-            },
-            "chart_payload": {
-                "recent_count": recent_count,
-                "historical_avg": prev_count_avg,
-                "increase_pct": increase_pct
-            }
+            "raw_data": data_summary.strip(),
+            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
+            "impact_value": pattern_impact,
+            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "chart_metric": "mechanical_failure_view",
+            "diagnosis": {"type": "Recurring Operational Events", "confidence": "High", "indicators": f"Shutdown: {recent_shutdown}/30d vs {prev_shutdown_per_30d:.2f}/30d"},
+            "chart_payload": {"recent_count": recent_shutdown, "historical_avg": prev_shutdown_per_30d, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
+        }
+    # Trigger on other event types only (no shutdown increase)
+    if events_detected:
+        name, r, p = events_detected[0]
+        increase_pct = ((r - p) / p) * 100 if p > 0 else 100
+        data_summary = f"""
+        DETECTION TYPE: Operational pattern change
+        EVENT: {name} (sustained events)
+        RECENT (30d): {r} | BASELINE ({baseline_label}): {p:.1f} per 30d
+        CALCULATED_REVENUE_LOSS: ${format_number(pattern_impact)}/day (operational risk estimate)
+        Also: """ + ", ".join(f"{n}=recent {r2}" for n, r2, _ in events_detected)
+        return {
+            "code": "PATTERN_SHIFT",
+            "category": "OPERATIONAL",
+            "raw_data": data_summary.strip(),
+            "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
+            "impact_value": pattern_impact,
+            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "chart_metric": "mechanical_failure_view",
+            "diagnosis": {"type": "Recurring Operational Events", "confidence": "Moderate", "indicators": f"Increased: {', '.join(e[0] for e in events_detected)}"},
+            "chart_payload": {"recent_count": r, "historical_avg": p, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
         }
     return None
 
@@ -612,12 +722,19 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
         if decline_pct > MONTHLY_DECLINE_MIN_PCT:
             revenue_loss = max(0, previous['oil_rate'] - latest['oil_rate']) * OIL_PRICE
             boe_loss = max(0, previous['oil_rate'] - latest['oil_rate'])
-            data_summary = f"Monthly Decline: {format_number(decline_pct)}%"
+            data_summary = f"""
+        DETECTION TYPE: Monthly Production Decline
+        PREVIOUS MONTH RATE: {format_number(previous['oil_rate'])} bbl/day
+        CURRENT MONTH RATE: {format_number(latest['oil_rate'])} bbl/day
+        DECLINE: {format_number(decline_pct)}%
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day. Production gap: {format_number(boe_loss)} BOE/day.
+        ROOT CAUSE: Cannot be determined from production data alone. Field investigation recommended (pump, inflow, or surface equipment).
+        """
             
             return {
                 "code": "MONTHLY_DECLINE",
                 "category": "PRODUCTION",
-                "raw_data": data_summary,
+                "raw_data": data_summary.strip(),
                 "severity_metrics": {'decline_pct': decline_pct, 'impact_value': revenue_loss},
                 "impact_value": revenue_loss,
                 "impact_payload": {
@@ -626,10 +743,10 @@ def check_monthly_production_decline(ctx: Dict, df: pd.DataFrame) -> Optional[Di
                 },
                 "chart_metric": "monthly_production",
                 "diagnosis": {
-                "type": "Monthly Production Decline",
-                "confidence": "High",
-                "indicators": "Comparison of monthly production rates."
-            },
+                    "type": "Monthly Production Decline",
+                    "confidence": "High",
+                    "indicators": f"Month-over-month decline {decline_pct:.1f}%. Previous: {format_number(previous['oil_rate'])} bbl/day, current: {format_number(latest['oil_rate'])} bbl/day."
+                },
                 "chart_payload": {
                     "decline_pct": decline_pct,
                     "previous_rate": previous['oil_rate'],
@@ -649,21 +766,55 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
     
     Triggers when reconstruction error exceeds threshold.
     """
-    # Goldilocks Filter: Ignore massive errors (Sensor Failures)
-    # If error is > 10x the threshold, it's likely a sensor blowout, not a subtle pattern.
-    ceiling = threshold * 10
-    
-    if threshold < reconstruction_error < ceiling:
-        severity_score = min(100, (reconstruction_error / threshold) * 50)
+    if reconstruction_error is None:
+        return None
+    try:
+        rec_error = float(reconstruction_error)
+    except (TypeError, ValueError):
+        return None
+    if rec_error != rec_error:  # NaN
+        return None
+    # Goldilocks Filter: Ignore only absurdly massive errors (sensor blowout).
+    # Use a large multiple so normal "high" errors (e.g. 25k when threshold=95) still get flagged.
+    ceiling = threshold * 1000
+
+    if threshold < rec_error < ceiling:
+        severity_score = min(100, (rec_error / threshold) * 50)
         oil_loss = ctx.get('oil_avg_7d', 0) * 0.2  # Assume 20% risk
         revenue_loss = oil_loss * OIL_PRICE
-        
+
+        top_sensors = (ctx.get('top_contributing_features') or "").strip()
+        if top_sensors:
+            sensor_line = f"\nTOP CONTRIBUTING SENSORS (by reconstruction error): {top_sensors}\nRecommend reviewing trends for these sensors to identify root cause."
+            root_cause_section = f"""
+        *** ROOT CAUSE ANALYSIS (Feature Contribution) ***
+        {top_sensors}
+        """
+        else:
+            sensor_line = "\nRecommend trend review to identify which sensors drove the deviation."
+            root_cause_section = "\n*** ROOT CAUSE ANALYSIS (Feature Contribution) ***\n(No feature attribution available.)"
+
+        times_above = (rec_error / threshold) if threshold and threshold > 0 else 0
+        readable_summary = f"In plain numbers: the error is **{times_above:.0f}× above threshold** ({format_number(rec_error)} vs {format_number(threshold)}). The model does NOT diagnose root cause—it only shows which sensors contributed most. Use the ROOT CAUSE ANALYSIS list below to know what to check. Do NOT invent causes (e.g. 'gas lift', 'pressure management', 'flow instability'); only report the sensor list and recommend reviewing those trends."
+
         data_summary = f"""
         DETECTION TYPE: ML Pattern Anomaly (Autoencoder)
-        ERROR: {reconstruction_error:.4f} (Threshold: {threshold:.4f})
-        ROOT CAUSE: Unsupervised model detected a sensor pattern deviation not covered by standard physics rules.
+
+        WHAT THIS ERROR MEANS (explain this to the user in plain language):
+        The model learned the normal pattern of how this well's sensors (pressure, amps, production, etc.) typically move together. "Reconstruction error" measures how much the current readings deviate from that normal; a high value means the well is behaving differently than usual. This metric does not tell you the root cause—only which sensors contributed most.
+
+        READABLE SUMMARY (use this in your description):
+        {readable_summary}
+
+        ERROR: {rec_error:.4f} (Threshold: {threshold:.4f})  →  {times_above:.0f}× above threshold
+        {sensor_line}
+        {root_cause_section}
         """
-        
+
+        diagnosis_indicators = f"Reconstruction Error {rec_error:.2f} > {threshold:.2f}"
+        if top_sensors:
+            diagnosis_indicators += f". Root cause (feature contribution): {top_sensors}"
+
         return {
             "code": "ML_PATTERN_ANOMALY",
             "category": "PROCESS",
@@ -678,11 +829,13 @@ def check_ml_anomaly(ctx: Dict, reconstruction_error: float, threshold: float) -
             "diagnosis": {
                 "type": "ML Pattern Anomaly",
                 "confidence": "Low",
-                "indicators": f"Reconstruction Error {reconstruction_error:.2f} > {threshold:.2f}"
+                "indicators": diagnosis_indicators,
+                "top_contributing_sensors": top_sensors or None,
             },
             "chart_payload": {
                 "threshold": threshold,
-                "reconstruction_error": reconstruction_error
+                "reconstruction_error": rec_error,
+                "top_contributing_features": top_sensors or None,
             }
         }
     return None
@@ -698,10 +851,16 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
     oil_baseline = ctx.get('oil_baseline_90d_1d_ago') if not pd.isna(ctx.get('oil_baseline_90d_1d_ago')) else ctx.get('oil_baseline_90d')
     amps_avg = ctx.get('amps_avg_1d_ago') if not pd.isna(ctx.get('amps_avg_1d_ago')) else ctx.get('amps_avg')
     if any(pd.isna(ctx.get(k)) for k in ['motor_current', 'oil_volume']) or pd.isna(oil_baseline) or pd.isna(amps_avg):
+        logger.debug(
+            f"[ENERGY_DIV] skip: motor_current={ctx.get('motor_current')}, oil_volume={ctx.get('oil_volume')}, "
+            f"oil_baseline={oil_baseline}, amps_avg={amps_avg} (missing or NaN)"
+        )
         return None
 
     amps_current = ctx['motor_current']
     oil_current = ctx['oil_volume']
+    amps_ratio = amps_current / amps_avg if amps_avg and amps_avg > 0 else 0
+    oil_ratio = oil_current / oil_baseline if oil_baseline and oil_baseline > 0 else 1
 
     # High Amps (working hard) but Low Production (no results)
     # Thresholds from config: only flag when clearly outside normal range
@@ -714,6 +873,8 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
         ENERGY INPUT: {format_number(amps_current)} Amps (Baseline: {format_number(amps_avg)})
         PRODUCTION OUTPUT: {format_number(oil_current)} bbl (Baseline: {format_number(oil_baseline)})
         DIVERGENCE: Input +{format_number((amps_current/amps_avg - 1)*100)}%, Output -{format_number((1 - oil_current/oil_baseline)*100)}%
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day (Potential). Production gap: {format_number(boe_loss)} BOE/day.
+        ROOT CAUSE: High energy input with low production suggests mechanical inefficiency (pump, drive, or wellbore). Use diagnosis below.
         """
 
         diagnosis = diagnose_mechanics(ctx)
@@ -721,7 +882,7 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
         return {
             "code": "ENERGY_DIV",
             "category": "OPERATIONAL",
-            "raw_data": f"Significant divergence detected between Energy Input (Amps: {format_number(amps_current)}) and Production Output ({format_number(oil_current)} bbl)",
+            "raw_data": data_summary.strip(),
             "severity_metrics": {'severity_score': 70, 'impact_value': revenue_loss},
             "impact_value": revenue_loss,
             "impact_payload": {
@@ -736,6 +897,10 @@ def check_energy_production_divergence(ctx: Dict) -> Optional[Dict]:
                 "efficiency": (oil_current / amps_current) if amps_current > 0 else 0
             }
         }
+    logger.debug(
+        f"[ENERGY_DIV] skip: amps_ratio={amps_ratio:.2f} (need >{ENERGY_DIV_AMPS_RATIO}) or "
+        f"oil_ratio={oil_ratio:.2f} (need <{ENERGY_DIV_OIL_MAX_RATIO})"
+    )
     return None
 
 def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
@@ -756,15 +921,17 @@ def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
         revenue_loss = _f(ctx.get('oil_baseline_90d')) * OIL_PRICE
         
         data_summary = f"""
-        DETECTION TYPE: Sensor State Mismatch
-        STATUS: Pump is Running (Amps {amps:.1f}, SPM {spm:.1f})
-        FLOW: No Flow Recorded ({total_vol:.2f} bbl)
+        DETECTION TYPE: Sensor State Mismatch (Ghost Production)
+        STATUS: Pump is Running (Amps {format_number(amps)}, SPM {format_number(spm)})
+        FLOW: No Flow Recorded ({format_number(total_vol)} bbl). Baseline expected: {format_number(baseline_vol)} bbl.
+        ROOT CAUSE: Operational state indicates active pump but flow meter reads zero. Likely meter calibration, data sync, or sensor fault—not a mechanical well failure.
+        CALCULATED_REVENUE_LOSS: ${format_number(revenue_loss)}/day (Risk)
         """
         
         return {
             "code": "DATA_MISMATCH",
             "category": "PRODUCTION",
-            "raw_data": "Operational State is 'Active' but Flow Meter reads zero. Potential meter calibration or data synchronization issue.",
+            "raw_data": data_summary.strip(),
             "severity_metrics": {'impact_value': revenue_loss, 'severity_score': 60},
             "impact_value": revenue_loss,
             "impact_payload": {
