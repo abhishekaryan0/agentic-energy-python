@@ -1,9 +1,10 @@
 version: "3.8"
 
+# Run from repo root: docker-compose -f deploy/docker-compose.yml up --build
 services:
   web:
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile
     container_name: at-risk-assets-web
     ports:
@@ -19,7 +20,7 @@ services:
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1
     volumes:
-      - ./:/app
+      - ../:/app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]

@@ -30,7 +30,7 @@ DETECTION_WINDOW_DAYS = 5
 TRAINING_CUTOFF_DAYS = 7
 ROLLING_BASELINE_DAYS = 90
 MODEL_CACHE_DAYS = 7
-MODEL_DIR = "models"
+MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 # Autoencoder anomaly threshold = mean + (this * std) on training reconstruction error. Lower = more sensitive (e.g. 1.0 for digital twin / testing).
 AUTOENCODER_THRESHOLD_SIGMA = 1.5
 # How many days of well data we fetch for anomaly review (baselines, models, pattern-shift).

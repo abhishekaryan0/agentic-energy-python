@@ -811,6 +811,54 @@ def _create_prediction_record(
 
 
 # =============================================================================
+# DETECTOR: RECOMMEND FROM METRICS (NO DB – for SageMaker / stateless inference)
+# =============================================================================
+
+def recommend_from_metrics(
+    well_id: str,
+    lift_type: str,
+    metrics: Dict[str, Any],
+    confidence_threshold: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """
+    Generate operational recommendations from pre-computed metrics only (no Snowflake).
+    Use this for stateless inference (e.g. SageMaker endpoint).
+
+    Args:
+        well_id: Well identifier
+        lift_type: Lift type (Rod Pump, ESP, Gas Lift)
+        metrics: Dict of computed metrics (slopes, roll_means, etc.)
+        confidence_threshold: Minimum confidence for recommendations (0-1)
+
+    Returns:
+        List of recommendation dicts (no persistence)
+    """
+    if joblib is None:
+        return []
+    models_dir = str(get_models_dir())
+    base_name = 'decision_tree_alldata'
+    fallback_path = os.path.join(models_dir, f'{base_name}.joblib')
+    try:
+        mdl = get_model_for_lift_type(lift_type, models_dir, base_name, fallback_path)
+    except FileNotFoundError:
+        try:
+            mdl = load_model(fallback_path)
+        except Exception:
+            return []
+    clf = mdl['model'] if isinstance(mdl, dict) else mdl
+    model_features = mdl.get('features') if isinstance(mdl, dict) else None
+    feats, _ = _features_from_metrics(metrics, lift_type=lift_type, feature_list=model_features)
+    candidates = _get_prediction_candidates(clf, feats, confidence_threshold)
+    if not candidates or not _has_detection_signal(metrics):
+        return []
+    results = []
+    for pred_action, proba in candidates:
+        rec = _create_prediction_record(well_id, pred_action, proba, metrics, lift_type)
+        results.append(rec)
+    return results
+
+
+# =============================================================================
 # WELL-SPECIFIC RECOMMENDATIONS
 # =============================================================================
 

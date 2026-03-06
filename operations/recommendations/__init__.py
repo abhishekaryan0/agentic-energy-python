@@ -54,6 +54,7 @@ from operations.recommendations.persistence import (
     # Persistence
     save_recommendation_to_snowflake,
     generate_recommendations_for_well,
+    recommend_from_metrics,
     detect_and_persist,
     
     # Training (delegated)
@@ -115,6 +116,7 @@ __all__ = [
     # Persistence
     'save_recommendation_to_snowflake',
     'generate_recommendations_for_well',
+    'recommend_from_metrics',
     'detect_and_persist',
     
     # Training

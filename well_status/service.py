@@ -19,9 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Logging disabled - set to WARNING to suppress INFO logs
-# Change to logging.INFO if you need to see detailed logs
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set to logging.WARNING to suppress INFO logs in production/cron
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Configuration

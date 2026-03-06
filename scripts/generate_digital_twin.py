@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -275,7 +276,148 @@ def generate_well_timeline(well):
     )
 
 
-# --- 4. SNOWFLAKE UPLOAD (same tables as generate_sample_data.py) ---
+# --- 4a. S3 UPLOAD (tenant-wise parquet, same bucket as deploy) ---
+# Bucket layout: only under organization_id. No top-level models/.
+#   s3://BUCKET/{organization_id}/model/   <- single model (or model artifacts) per org
+#   s3://BUCKET/{organization_id}/sensor_data/  <- parquet (this script)
+# Writes under sensor_data: daily_production.parquet, well_metadata.parquet, well_sensor_readings.parquet
+S3_SENSOR_DATA_PREFIX = "sensor_data"  # under {organization_id}/
+HOURLY_NOISE_PCT = 0.01  # ±1% per hour so 24h has small variance (same as Snowflake path)
+
+
+def _uniform_production_df(master_df):
+    """Return a copy with uniform dtypes and column names for parquet."""
+    df = master_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for col in df.columns:
+        if col == "date":
+            continue
+        if df[col].dtype == "float64":
+            df[col] = df[col].astype("float32")
+    return df
+
+
+def _uniform_well_metadata(well_meta):
+    """Convert well_meta list of dicts to a uniform DataFrame for parquet."""
+    rows = []
+    for w in well_meta:
+        rows.append({
+            "asset_id": w["asset_id"],
+            "lease": w["lease"],
+            "facility_id": w.get("facility_id"),
+            "lift_type": w["lift_type"],
+            "orientation": w.get("orientation"),
+            "spud_date": w["spud_date"].strftime("%Y-%m-%d") if w.get("spud_date") else None,
+            "current_status_goal": w.get("current_status_goal"),
+            "base_rate": float(w.get("base_rate", 0)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_well_sensor_readings_df(master_df, organization_id):
+    """Build hourly well_sensor_readings from daily master_df (same logic as Snowflake path).
+    Returns a DataFrame with canonical sensor columns for parquet.
+    """
+    # Canonical columns for S3 parquet (aligned with TWIN_TO_SENSOR_COL + ids)
+    sensor_cols = [
+        "organization_id", "well_id", "timestamp", "lift_type",
+        "tubing_pressure", "casing_pressure", "strokes_per_minute", "pump_fillage",
+        "motor_current", "pump_intake_pressure", "motor_temp", "freq_hz",
+        "injection_rate", "surface_stroke_length", "downhole_net_stroke",
+        "injection_pressure", "well_status",
+    ]
+    twin_to_sensor = {
+        "avg_tubing_pressure": "tubing_pressure",
+        "avg_casing_pressure": "casing_pressure",
+        "spm": "strokes_per_minute",
+        "pump_fillage_pct": "pump_fillage",
+        "avg_motor_amps": "motor_current",
+        "pump_intake_pressure": "pump_intake_pressure",
+        "motor_temp_f": "motor_temp",
+        "freq_hz": "freq_hz",
+        "injection_rate_mcf": "injection_rate",
+        "gross_stroke_len": "surface_stroke_length",
+        "net_stroke_len": "downhole_net_stroke",
+    }
+    rows = []
+    for _, row in master_df.iterrows():
+        base_ts = pd.Timestamp(row["date"])
+        for hour in range(24):
+            ts = base_ts + pd.Timedelta(hours=hour)
+            rec = {c: None for c in sensor_cols}
+            rec["organization_id"] = organization_id
+            rec["well_id"] = row["asset_id"]
+            rec["timestamp"] = ts
+            rec["lift_type"] = row["lift_type"]
+            rec["well_status"] = str(row["status"]) if row.get("status") else None
+            for twin_col, out_col in twin_to_sensor.items():
+                if twin_col in row.index:
+                    val = _clean_val(row[twin_col])
+                    if val is not None:
+                        noise = 1.0 + np.random.uniform(-HOURLY_NOISE_PCT, HOURLY_NOISE_PCT)
+                        rec[out_col] = round(val * noise, 2)
+            if row["lift_type"] == "Gas Lift" and rec.get("injection_pressure") is None:
+                rec["injection_pressure"] = _clean_val(row.get("avg_casing_pressure"))
+            rows.append(rec)
+    df = pd.DataFrame(rows, columns=sensor_cols)
+    # Uniform dtypes for parquet
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    for col in ["tubing_pressure", "casing_pressure", "strokes_per_minute", "pump_fillage",
+                "motor_current", "pump_intake_pressure", "motor_temp", "freq_hz",
+                "injection_rate", "surface_stroke_length", "downhole_net_stroke", "injection_pressure"]:
+        if col in df.columns:
+            df[col] = df[col].astype("float32")
+    return df
+
+
+def upload_to_s3(master_df, well_meta, organization_id=None):
+    """Write digital twin data to S3 under org's sensor_data folder (same bucket as deploy).
+    Bucket has only org-level folders: {organization_id}/model/ (one model per org), {organization_id}/sensor_data/.
+    Writes: s3://BUCKET/{organization_id}/sensor_data/daily_production.parquet, well_metadata.parquet, well_sensor_readings.parquet
+    """
+    organization_id = organization_id or os.getenv("ORGANIZATION_ID")
+    if not organization_id:
+        print("ORGANIZATION_ID not set (env or argument). Skipping S3 upload.")
+        return
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        print("S3_BUCKET not set (.env). Skipping S3 upload.")
+        return
+    try:
+        import boto3
+    except ImportError:
+        print("boto3 not installed. pip install boto3")
+        return
+
+    # Under bucket: only {organization_id}/model/ and {organization_id}/sensor_data/
+    sensor_prefix = f"{organization_id}/{S3_SENSOR_DATA_PREFIX}"
+
+    prod_df = _uniform_production_df(master_df)
+    meta_df = _uniform_well_metadata(well_meta)
+    sensor_df = _build_well_sensor_readings_df(master_df, organization_id)
+
+    buf_prod = io.BytesIO()
+    buf_meta = io.BytesIO()
+    buf_sensor = io.BytesIO()
+    prod_df.to_parquet(buf_prod, index=False)
+    buf_prod.seek(0)
+    meta_df.to_parquet(buf_meta, index=False)
+    buf_meta.seek(0)
+    sensor_df.to_parquet(buf_sensor, index=False)
+    buf_sensor.seek(0)
+
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/daily_production.parquet", Body=buf_prod.getvalue())
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/well_metadata.parquet", Body=buf_meta.getvalue())
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/well_sensor_readings.parquet", Body=buf_sensor.getvalue())
+
+    print(f"SUCCESS: Sensor data parquet uploaded to s3://{bucket}/{sensor_prefix}/")
+    print(f"  - daily_production.parquet ({len(prod_df):,} rows)")
+    print(f"  - well_metadata.parquet ({len(meta_df):,} rows)")
+    print(f"  - well_sensor_readings.parquet ({len(sensor_df):,} rows)")
+
+
+# --- 4b. SNOWFLAKE UPLOAD (same tables as generate_sample_data.py) ---
 # BOE = Barrel of Oil Equivalent. Client formula: BOE = (bbl oil) + (mcf gas / 6)
 # Example: 20 bbl oil + 372 mcf gas -> BOE = 20 + 62 = 82
 def compute_boe(oil_bbl, gas_mcf):
@@ -569,14 +711,16 @@ def upload_to_snowflake(master_df, well_meta, organization_id=None):
 
 
 # --- 5. MASTER SIMULATION ---
-def run_simulation(upload_snowflake=False, write_json=True):
+def run_simulation(upload_snowflake=False, upload_s3=False, write_json=True, organization_id=None):
     print("Generating Engineering-Grade Digital Twin (v3.1)...")
     well_meta, fac_meta = build_hierarchy()
 
     all_dfs = []
     for w in well_meta:
-        all_dfs.append(generate_well_timeline(w))
-    master_df = pd.concat(all_dfs).sort_values(["date", "facility_id"])
+        df = generate_well_timeline(w)
+        if not df.empty:
+            all_dfs.append(df)
+    master_df = pd.concat(all_dfs, ignore_index=True).sort_values(["date", "facility_id"])
 
     output = {"company": "Apex Permian", "assets": {}}
     for w in well_meta:
@@ -642,13 +786,21 @@ def run_simulation(upload_snowflake=False, write_json=True):
             json.dump(output, f, indent=2, default=str)
         print("Done: apex_permian_v3_1_engineering.json")
 
+    org_id = organization_id or os.getenv("ORGANIZATION_ID")
+    if upload_s3:
+        upload_to_s3(master_df, well_meta, organization_id=org_id)
     if upload_snowflake:
-        upload_to_snowflake(master_df, well_meta, organization_id=os.getenv("ORGANIZATION_ID"))
+        upload_to_snowflake(master_df, well_meta, organization_id=org_id)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate digital twin data (JSON and/or Snowflake)."
+        description="Generate digital twin data (JSON, S3 parquet, and/or Snowflake)."
+    )
+    parser.add_argument(
+        "--s3",
+        action="store_true",
+        help="Upload parquet to S3 under {ORGANIZATION_ID}/sensor_data/; uses S3_BUCKET and ORGANIZATION_ID from .env",
     )
     parser.add_argument(
         "--snowflake",
@@ -663,9 +815,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--organization-id",
         default=os.getenv("ORGANIZATION_ID"),
-        help="Organization UUID (from organizations Postgres). Default: ORGANIZATION_ID env.",
+        help="Organization/tenant UUID. Default: ORGANIZATION_ID env.",
     )
     args = parser.parse_args()
     if args.organization_id:
         os.environ["ORGANIZATION_ID"] = args.organization_id
-    run_simulation(upload_snowflake=args.snowflake, write_json=args.json)
+    run_simulation(
+        upload_snowflake=args.snowflake,
+        upload_s3=args.s3,
+        write_json=args.json,
+        organization_id=args.organization_id,
+    )

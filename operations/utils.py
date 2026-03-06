@@ -7,6 +7,7 @@ including path resolution, database operations, and type conversion.
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
@@ -21,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 # Project root for consistent path resolution
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = _PROJECT_ROOT / 'models'
+_DEFAULT_MODELS_DIR = _PROJECT_ROOT / 'models'
+MODELS_DIR = _DEFAULT_MODELS_DIR  # backward compat; use get_models_dir() for env override
 
 
 def get_project_root() -> Path:
@@ -30,34 +32,27 @@ def get_project_root() -> Path:
 
 
 def get_models_dir() -> Path:
-    """Get the models directory path."""
-    return MODELS_DIR
+    """Get the models directory path. Uses OPERATIONS_MODELS_DIR env if set (e.g. SageMaker /opt/ml/model)."""
+    return Path(os.environ.get("OPERATIONS_MODELS_DIR", str(_DEFAULT_MODELS_DIR)))
 
 
 def get_model_path(relative_path: str) -> str:
     """
-    Convert a relative model path to an absolute path based on project root.
+    Convert a relative model path to an absolute path. Uses get_models_dir() so OPERATIONS_MODELS_DIR is respected.
     
     Args:
         relative_path: Path to the model file (can be relative or absolute)
         
     Returns:
         Absolute path to the model file
-        
-    Examples:
-        >>> get_model_path('models/classifier.joblib')
-        '/path/to/project/models/classifier.joblib'
-        
-        >>> get_model_path('classifier.joblib')
-        '/path/to/project/models/classifier.joblib'
     """
     p = Path(relative_path)
     if p.is_absolute():
         return str(p)
-    # If path starts with 'models/', resolve from project root
+    models_dir = get_models_dir()
     if relative_path.startswith('models/'):
-        return str(_PROJECT_ROOT / relative_path)
-    return str(MODELS_DIR / p.name)
+        return str(models_dir / relative_path.replace('models/', '', 1))
+    return str(models_dir / p.name)
 
 
 # ============================================================================

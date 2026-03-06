@@ -47,6 +47,20 @@ def convert_to_serializable(obj):
     else:
         return obj
 
+
+def convert_for_db(val):
+    """Convert a value to a DB-serializable type (used for Snowflake/Postgres inserts)."""
+    if isinstance(val, (np.integer, int)):
+        return int(val)
+    if isinstance(val, (np.floating, float)):
+        return float(val)
+    if isinstance(val, (np.bool_, bool)):
+        return bool(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    return val
+
+
 try:
     from snowflake.connector import connect as snowflake_connect
 except Exception:
@@ -71,17 +85,18 @@ except ImportError:
     generate_recommendations_for_well = None
 
 try:
-    from anomaly_detection.detector import get_detector, check_anomaly as detector_check_anomaly
+    from anomaly_detection.detector import get_detector
     ANOMALY_DETECTOR_AVAILABLE = True
 except ImportError:
     ANOMALY_DETECTOR_AVAILABLE = False
     logging.warning("anomaly_detector module not available")
 
 try:
-    from config.sensor_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields
+    from config.sensor_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields, get_features_for_lift_type
     DYNAMIC_CONFIG_AVAILABLE = True
 except ImportError:
     DYNAMIC_CONFIG_AVAILABLE = False
+    get_features_for_lift_type = None
     logging.warning("sensor_config module not available")
 
 load_dotenv()
@@ -196,7 +211,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
                     'min': min(min_bound, max_bound),
                     'max': max(min_bound, max_bound)
                 })
-            except:
+            except Exception as e:
+                logging.debug("find_similar_anomalies: skip violation value %s: %s", val, e)
                 continue
 
     if not violation_criteria:
@@ -261,8 +277,11 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
                 key = f"{r[0]}_{str(r[1])}"
                 if key not in grouped:
                     raw_val_str = r[4]
-                    try: full_readings = json.loads(raw_val_str) if raw_val_str else {}
-                    except: full_readings = {}
+                    try:
+                        full_readings = json.loads(raw_val_str) if raw_val_str else {}
+                    except Exception as e:
+                        logging.debug("find_similar_anomalies: parse raw_values %s: %s", raw_val_str, e)
+                        full_readings = {}
 
                     grouped[key] = {
                         "well_id": r[0],
@@ -299,7 +318,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
                             if crit['field'] == h_field:
                                 if crit['min'] <= h_val <= crit['max']:
                                     matched_keys_in_this_record.add(h_field)
-                    except:
+                    except Exception as e:
+                        logging.debug("find_similar_anomalies: match value %s: %s", hv.get('raw_value'), e)
                         continue
 
                 # Same Well: Relaxed (Keep if ANY matched)
@@ -384,7 +404,14 @@ def init_postgres():
 init_postgres()
 
 def _get_sensor_field_list(lift_type):
-    """Return list of sensor field names for the given lift type (for building readings dict)."""
+    """Return list of sensor field names for the given lift type (single source: config or fallback)."""
+    if DYNAMIC_CONFIG_AVAILABLE and get_features_for_lift_type:
+        try:
+            fields = get_features_for_lift_type(lift_type)
+            if fields:
+                return fields
+        except Exception as e:
+            logging.warning("Could not get sensor fields from config for %s: %s", lift_type, e)
     if lift_type == 'Rod Pump':
         return ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure']
     if lift_type == 'ESP':
@@ -411,13 +438,6 @@ def _record_anomaly_and_suggestion(conn, well_id, timestamp_str, lift_type, read
     If reuse_pg_conn is provided, it is used for the insert and not closed; otherwise a new PG connection is used and closed.
     Returns suggestion_result dict or None.
     """
-    def convert_for_db(val):
-        if isinstance(val, (np.integer, int)): return int(val)
-        elif isinstance(val, (np.floating, float)): return float(val)
-        elif isinstance(val, (np.bool_, bool)): return bool(val)
-        elif isinstance(val, np.ndarray): return val.tolist()
-        return val
-
     cursor = conn.cursor()
     try:
         try:
@@ -838,7 +858,8 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
                 if isinstance(raw_data, str):
                     try:
                         raw_data = json.loads(raw_data)
-                    except:
+                    except Exception as e:
+                        logging.debug("generate_suggestion: parse raw_anomaly_data: %s", e)
                         raw_data = {}
                 
                 past_violations_list = []
@@ -1136,13 +1157,6 @@ def insert_reading():
         cursor = conn.cursor()
         
         try:
-            def convert_for_db(val):
-                if isinstance(val, (np.integer, int)): return int(val)
-                elif isinstance(val, (np.floating, float)): return float(val)
-                elif isinstance(val, (np.bool_, bool)): return bool(val)
-                elif isinstance(val, np.ndarray): return val.tolist()
-                return val
-            
             # --- 1. INSERT RAW READING ---
             org_id = _get_organization_id()
             field_names = (['organization_id'] if org_id else []) + ['well_id', 'timestamp', 'lift_type', 'well_status'] + list(readings.keys())

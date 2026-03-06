@@ -22,8 +22,10 @@ import pandas as pd
 import numpy as np
 import logging
 import os
+import re
+import tarfile
+import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import joblib
 
@@ -32,14 +34,13 @@ import joblib
 # ============================================================================
 
 try:
-    from config.sensor_config import get_sensor_ranges, get_anomaly_rules, get_features_for_lift_type, get_lift_types
+    from config.sensor_config import get_sensor_ranges, get_features_for_lift_type, get_lift_types
     SENSOR_CONFIG_AVAILABLE = True
 except ImportError:
     SENSOR_CONFIG_AVAILABLE = False
     get_features_for_lift_type = None
     get_lift_types = None
     get_sensor_ranges = None
-    get_anomaly_rules = None
     logging.warning("sensor_config module not available; using fallback rules")
 
 try:
@@ -67,6 +68,50 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
+def _ensure_models_from_s3(models_dir_abs: str) -> bool:
+    """
+    If S3_BUCKET (and optionally S3_PREFIX, MODEL_VERSION) are set in env,
+    download anomaly_detection tarball from S3 and extract into models_dir_abs.
+    Returns True if extraction succeeded and anomaly_detection/ exists, else False.
+    """
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return False
+    try:
+        import boto3
+    except ImportError:
+        logger.warning("boto3 not installed; cannot download models from S3. pip install boto3")
+        return False
+    prefix = (os.environ.get("S3_PREFIX") or "models/anomaly").rstrip("/")
+    version = os.environ.get("MODEL_VERSION") or "v1"
+    key = f"{prefix}/anomaly_detection_{version}.tar.gz"
+    logger.info("Downloading anomaly detection models from s3://%s/%s", bucket, key)
+    try:
+        s3 = boto3.client("s3")
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as f:
+            tmp_path = f.name
+        try:
+            s3.download_file(bucket, key, tmp_path)
+        except Exception as e:
+            logger.warning("S3 download failed: %s", e)
+            return False
+        os.makedirs(models_dir_abs, exist_ok=True)
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            tar.extractall(path=models_dir_abs)
+        logger.info("Extracted models to %s", models_dir_abs)
+        base = os.path.join(models_dir_abs, "anomaly_detection")
+        return os.path.isdir(base)
+    except Exception as e:
+        logger.warning("Failed to fetch models from S3: %s", e)
+        return False
+    finally:
+        if "tmp_path" in dir() and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
 @dataclass
 class AnomalyConfig:
     """
@@ -85,6 +130,8 @@ class AnomalyConfig:
         rule_base_contrib: Base contribution for rule violations
         rule_extra_cap: Maximum extra contribution from deviation
         rule_dev_scale: Scaling factor for deviation contribution
+        rule_deviation_pct: Percentage band around average for rule checks
+        rule_use_client_bounds: Whether to clip average band to client min/max
     """
     # Detection thresholds
     anomaly_threshold: float = 0.75
@@ -114,10 +161,21 @@ class AnomalyConfig:
     rule_base_contrib: float = 0.35
     rule_extra_cap: float = 0.7
     rule_dev_scale: float = 0.9
+    rule_deviation_pct: float = 50.0
+    rule_use_client_bounds: bool = True
     
-    # Models directory
+    # Models directory: models/anomaly_detection/wells/<safe_id>/, well_types/<type>/
     models_dir: str = 'models'
-    
+    anomaly_detection_subdir: str = 'anomaly_detection'
+    wells_subdir: str = 'wells'
+    well_types_subdir: str = 'well_types'
+    # Fixed filenames inside each well (or well_type) folder
+    iso_filename: str = 'isolation_forest.joblib'
+    stat_filename: str = 'statistical_model.joblib'
+    lstm_pt_filename: str = 'lstm_autoencoder.pt'
+    lstm_scaler_filename: str = 'lstm_scaler.joblib'
+    lstm_meta_filename: str = 'lstm_metadata.joblib'
+
     def validate(self) -> None:
         """Validate configuration values."""
         if not 0 < self.anomaly_threshold <= 1:
@@ -208,6 +266,15 @@ else:
         def forward(self, x):
             return x
 
+def well_id_to_safe(well_id: Optional[str], normalize_lower: bool = True) -> str:
+    """Convert well_id to a safe filename/key segment (alphanumeric and underscores, max 64 chars)."""
+    if not well_id:
+        return "well"
+    safe = re.sub(r"[^\w\-]", "_", str(well_id).strip())[:64]
+    safe = safe.strip("_") or "well"
+    return safe.lower() if normalize_lower else safe
+
+
 def get_safe_value(d: Dict, k: str, default: float = 0.0) -> float:
     """Safely get a float value from dict, handling None and conversion errors."""
     val = d.get(k)
@@ -220,7 +287,15 @@ def get_safe_value(d: Dict, k: str, default: float = 0.0) -> float:
 
 # Dynamic rules loader function
 def get_well_type_rules(lift_type: str) -> Dict:
-    """Get sensor rules for a well type from dynamic config (Snowflake)."""
+    """
+    Get sensor rules for a well type from dynamic config (Snowflake).
+    
+    Returns a dict of client-provided ranges that can be used as hard bounds
+    around the statistically learned average band. In SageMaker (no Snowflake),
+    this returns an empty dict and rule-based checks rely purely on model stats.
+    """
+    if os.environ.get("SAGEMAKER_REGION"):
+        return {}
     if not SENSOR_CONFIG_AVAILABLE:
         raise ValueError("Dynamic config not available. Ensure Snowflake is configured and tables are created.")
     
@@ -230,7 +305,8 @@ def get_well_type_rules(lift_type: str) -> Dict:
         for field_name, range_info in ranges.items():
             rules[field_name] = {
                 "min": range_info.get('min'),
-                "max": range_info.get('max')
+                "max": range_info.get('max'),
+                "unit": range_info.get('unit'),
             }
         return rules
     except Exception as e:
@@ -273,7 +349,7 @@ class AnomalyDetector:
         self.config = config or DEFAULT_CONFIG
         self.config.validate()
         
-        if not SENSOR_CONFIG_AVAILABLE:
+        if not SENSOR_CONFIG_AVAILABLE and not os.environ.get("SAGEMAKER_REGION"):
             raise RuntimeError(
                 "Dynamic config (Snowflake) is required. "
                 "Run: python setup_production_db.py\n"
@@ -289,107 +365,300 @@ class AnomalyDetector:
             logger.info(f"✓ Loaded trained models: {', '.join(self.trained_models.keys())}")
     
     def _load_trained_models(self) -> Dict[str, Any]:
-        """Load pre-trained models from models/ directory."""
+        """Load pre-trained models from models/anomaly_detection/ (wells/<safe_id>/ and well_types/<type>/).
+        Uses ANOMALY_MODELS_DIR env var if set (e.g. /opt/ml/model in SageMaker).
+        If local models are missing and S3_BUCKET is set in env, downloads from S3 and uses them."""
         trained_models: Dict[str, Any] = {}
-        models_dir = self.config.models_dir
-        
-        if not os.path.exists(models_dir):
-            logger.warning(f"Models directory not found at {models_dir}. Run: python -m anomaly_detection.train_models")
+        models_root = os.environ.get("ANOMALY_MODELS_DIR", self.config.models_dir)
+        # Resolve to absolute path when using default local models dir (for S3 download target)
+        if models_root == self.config.models_dir:
+            _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            models_root = os.path.join(_project_root, self.config.models_dir)
+        # Base path for anomaly detection: models/anomaly_detection/
+        base_dir = os.path.join(models_root, self.config.anomaly_detection_subdir)
+        wells_dir = os.path.join(base_dir, self.config.wells_subdir)
+        well_types_dir = os.path.join(base_dir, self.config.well_types_subdir)
+
+        # When S3_BUCKET is set, always load from S3 (download and use). Skip only in SageMaker (ANOMALY_MODELS_DIR set).
+        if os.environ.get("S3_BUCKET") and not os.environ.get("ANOMALY_MODELS_DIR"):
+            if not _ensure_models_from_s3(models_root):
+                logger.warning("S3 download failed or no object; no models loaded.")
+            if not os.path.exists(base_dir):
+                return trained_models
+        elif not os.path.exists(base_dir):
+            logger.warning(f"Models directory not found at {base_dir}. Set S3_BUCKET in .env or run: python -m anomaly_detection.train_models")
             return trained_models
-        
-        # Load models for each well type
+
+        def _load_well_type_from_folder(type_dir: str, well_type: str) -> None:
+            """Load iso/stat/lstm from a folder with fixed filenames."""
+            iso_f = os.path.join(type_dir, self.config.iso_filename)
+            stat_f = os.path.join(type_dir, self.config.stat_filename)
+            if os.path.exists(iso_f):
+                try:
+                    d = joblib.load(iso_f)
+                    if isinstance(d, dict) and 'model' in d and 'scaler' in d:
+                        trained_models[f'iso_{well_type}'] = d
+                        logger.info(f"✓ Loaded isolation forest model for {well_type}")
+                except Exception as e:
+                    logger.error(f"Failed to load {iso_f}: {e}")
+            if os.path.exists(stat_f):
+                try:
+                    d = joblib.load(stat_f)
+                    if isinstance(d, dict) and 'mean' in d and 'std' in d:
+                        trained_models[f'stat_{well_type}'] = d
+                        logger.info(f"✓ Loaded statistical model for {well_type}")
+                except Exception as e:
+                    logger.error(f"Failed to load {stat_f}: {e}")
+            if TORCH_AVAILABLE:
+                lstm_pt = os.path.join(type_dir, self.config.lstm_pt_filename)
+                lstm_meta = os.path.join(type_dir, self.config.lstm_meta_filename)
+                lstm_sc = os.path.join(type_dir, self.config.lstm_scaler_filename)
+                if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
+                    try:
+                        meta = joblib.load(lstm_meta)
+                        scaler = joblib.load(lstm_sc)
+                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
+                        model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                        model.eval()
+                        trained_models[f'lstm_{well_type}'] = {
+                            'model': model, 'scaler': scaler,
+                            'seq_len': meta.get('seq_len', SEQ_LEN),
+                            'features': meta.get('features', [])
+                        }
+                        logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
+                    except Exception as e:
+                        logger.error(f"Failed to load LSTM for {well_type}: {e}")
+
+        def _load_well_from_folder(well_dir: str, safe_id: str) -> None:
+            """Load iso/stat/lstm for one well from its folder."""
+            iso_f = os.path.join(well_dir, self.config.iso_filename)
+            stat_f = os.path.join(well_dir, self.config.stat_filename)
+            if os.path.exists(iso_f):
+                try:
+                    d = joblib.load(iso_f)
+                    if isinstance(d, dict) and 'model' in d and 'scaler' in d:
+                        trained_models[f'iso_well_{safe_id}'] = d
+                        logger.info(f"✓ Loaded isolation forest model for well {safe_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load {iso_f}: {e}")
+            if os.path.exists(stat_f):
+                try:
+                    d = joblib.load(stat_f)
+                    if isinstance(d, dict) and 'mean' in d and 'std' in d:
+                        trained_models[f'stat_well_{safe_id}'] = d
+                        logger.info(f"✓ Loaded statistical model for well {safe_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load {stat_f}: {e}")
+            if TORCH_AVAILABLE:
+                lstm_pt = os.path.join(well_dir, self.config.lstm_pt_filename)
+                lstm_meta = os.path.join(well_dir, self.config.lstm_meta_filename)
+                lstm_sc = os.path.join(well_dir, self.config.lstm_scaler_filename)
+                if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
+                    try:
+                        meta = joblib.load(lstm_meta)
+                        scaler = joblib.load(lstm_sc)
+                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
+                        model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                        model.eval()
+                        trained_models[f'lstm_well_{safe_id}'] = {
+                            'model': model, 'scaler': scaler,
+                            'seq_len': meta.get('seq_len', SEQ_LEN),
+                            'features': meta.get('features', [])
+                        }
+                        logger.info(f"✓ Loaded LSTM autoencoder for well {safe_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to load LSTM for well {safe_id}: {e}")
+
+        # 1) Load well-type fallback: first from well_types/<type>/, then flat (backward compat)
         well_types = ['rod_pump', 'esp', 'gas_lift']
         for well_type in well_types:
-            iso_file = os.path.join(models_dir, f'isolation_forest_{well_type}.joblib')
-            stat_file = os.path.join(models_dir, f'statistical_model_{well_type}.joblib')
-            lstm_file = os.path.join(models_dir, f'lstm_autoencoder_{well_type}.pt') if TORCH_AVAILABLE else None
-            
-            if os.path.exists(iso_file):
-                try:
-                    model_data = joblib.load(iso_file)
-                    if isinstance(model_data, dict) and 'model' in model_data and 'scaler' in model_data:
-                        trained_models[f'iso_{well_type}'] = model_data
-                        logger.info(f"✓ Loaded isolation forest model for {well_type}")
-                    else:
-                        logger.warning(f"Invalid isolation forest model structure for {well_type}")
-                except Exception as e:
-                    logger.error(f"Failed to load {iso_file}: {e}")
-            
-            if os.path.exists(stat_file):
-                try:
-                    model_data = joblib.load(stat_file)
-                    if isinstance(model_data, dict) and 'mean' in model_data and 'std' in model_data:
-                        trained_models[f'stat_{well_type}'] = model_data
-                        logger.info(f"✓ Loaded statistical model for {well_type}")
-                    else:
-                        logger.warning(f"Invalid statistical model structure for {well_type}")
-                except Exception as e:
-                    logger.error(f"Failed to load {stat_file}: {e}")
-            
-            lstm_meta_file = os.path.join(models_dir, f'lstm_metadata_{well_type}.joblib')
-            if lstm_file and os.path.exists(lstm_file) and os.path.exists(lstm_meta_file):
-                try:
-                    meta = joblib.load(lstm_meta_file)
-                    input_dim = meta['input_dim']
-                    features = meta.get('features', [])
-                    seq_len_saved = meta.get('seq_len', SEQ_LEN)  # use training-time seq_len
-                    scaler = joblib.load(os.path.join(models_dir, f'lstm_scaler_{well_type}.joblib'))
-                    model = LSTMAutoencoder(input_dim=input_dim)
-                    model.load_state_dict(torch.load(lstm_file, map_location='cpu'))
-                    model.eval()
-                    trained_models[f'lstm_{well_type}'] = {
-                        'model': model, 'scaler': scaler, 'seq_len': seq_len_saved,
-                        'features': features
-                    }
-                    logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
-                except Exception as e:
-                    logger.error(f"Failed to load LSTM for {well_type}: {e}")
-        
+            type_dir = os.path.join(well_types_dir, well_type)
+            if os.path.isdir(type_dir):
+                _load_well_type_from_folder(type_dir, well_type)
+            else:
+                # Flat files (backward compat) under models/anomaly_detection/
+                iso_file = os.path.join(base_dir, f'isolation_forest_{well_type}.joblib')
+                stat_file = os.path.join(base_dir, f'statistical_model_{well_type}.joblib')
+                lstm_file = os.path.join(base_dir, f'lstm_autoencoder_{well_type}.pt')
+                lstm_meta_file = os.path.join(base_dir, f'lstm_metadata_{well_type}.joblib')
+                lstm_scaler_file = os.path.join(base_dir, f'lstm_scaler_{well_type}.joblib')
+                if os.path.exists(iso_file):
+                    try:
+                        d = joblib.load(iso_file)
+                        if isinstance(d, dict) and 'model' in d and 'scaler' in d:
+                            trained_models[f'iso_{well_type}'] = d
+                            logger.info(f"✓ Loaded isolation forest model for {well_type}")
+                    except Exception as e:
+                        logger.error(f"Failed to load {iso_file}: {e}")
+                if os.path.exists(stat_file):
+                    try:
+                        d = joblib.load(stat_file)
+                        if isinstance(d, dict) and 'mean' in d and 'std' in d:
+                            trained_models[f'stat_{well_type}'] = d
+                            logger.info(f"✓ Loaded statistical model for {well_type}")
+                    except Exception as e:
+                        logger.error(f"Failed to load {stat_file}: {e}")
+                if TORCH_AVAILABLE and os.path.exists(lstm_file) and os.path.exists(lstm_meta_file) and os.path.exists(lstm_scaler_file):
+                    try:
+                        meta = joblib.load(lstm_meta_file)
+                        scaler = joblib.load(lstm_scaler_file)
+                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
+                        model.load_state_dict(torch.load(lstm_file, map_location='cpu'))
+                        model.eval()
+                        trained_models[f'lstm_{well_type}'] = {
+                            'model': model, 'scaler': scaler,
+                            'seq_len': meta.get('seq_len', SEQ_LEN),
+                            'features': meta.get('features', [])
+                        }
+                        logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
+                    except Exception as e:
+                        logger.error(f"Failed to load LSTM for {well_type}: {e}")
+
+        # 2) Load per-well models from models/wells/<safe_id>/ (use lowercase key for consistent lookup)
+        if os.path.isdir(wells_dir):
+            try:
+                for name in os.listdir(wells_dir):
+                    well_dir = os.path.join(wells_dir, name)
+                    if os.path.isdir(well_dir):
+                        _load_well_from_folder(well_dir, name.lower())
+            except OSError as e:
+                logger.warning(f"Could not list wells directory: {e}")
+
         return trained_models
     
-    def _compute_rule_based_score(self, readings: Dict, active_rules: Dict, lift_type: str) -> Tuple[List, float]:
-        """Compute rule-based anomaly score and violations."""
-        violations = []
-        rule_anomaly_score = 0.0
+    def _compute_rule_based_score(
+        self,
+        readings: Dict,
+        active_rules: Dict,
+        lift_type: str,
+        well_id: Optional[str] = None
+    ) -> Tuple[List, float]:
+        """
+        Compute rule-based anomaly score and violations using an average-based band.
         
+        Primary logic:
+            - Use statistical model mean per sensor as the "average" value.
+            - Build a band: mean ± (rule_deviation_pct %).
+            - Optionally clip that band to client-provided min/max (active_rules).
+            - Flag values that fall outside this band.
+        
+        Fallback:
+            - If no statistical model is available for a sensor, fall back to
+              direct client min/max checks (legacy behavior).
+        """
+        violations: List[Dict[str, Any]] = []
+        rule_anomaly_score = 0.0
+
+        # Look up statistical model (prefer per-well, then per lift-type)
+        well_type_clean = lift_type.lower().replace(" ", "_")
+        safe_well = well_id_to_safe(well_id) if well_id else None
+        stat_key = None
+        if safe_well and f'stat_well_{safe_well}' in self.trained_models:
+            stat_key = f'stat_well_{safe_well}'
+        elif f'stat_{well_type_clean}' in self.trained_models:
+            stat_key = f'stat_{well_type_clean}'
+
+        stat_model = self.trained_models.get(stat_key) if stat_key else None
+        feature_means: Dict[str, float] = {}
+        if stat_model is not None and 'mean' in stat_model:
+            means = np.array(stat_model['mean'])
+            stat_features = stat_model.get('features')
+            # Only build mapping when features metadata is available and lengths match
+            if stat_features and len(stat_features) == len(means):
+                feature_means = {
+                    str(f): float(means[idx])
+                    for idx, f in enumerate(stat_features)
+                }
+
+        deviation_fraction = max(self.config.rule_deviation_pct / 100.0, 0.0)
+
         for field, value in readings.items():
-            if field not in active_rules or value is None:
+            if value is None:
                 continue
-            
-            rule = active_rules[field]
-            if rule is None or not isinstance(rule, dict):
+
+            rule = active_rules.get(field) or {}
+            client_min = rule.get("min")
+            client_max = rule.get("max")
+            sensor_unit = rule.get("unit") or ""
+
+            # Decide average to use for this field
+            avg = feature_means.get(field)
+
+            # If we have a valid average, build mean-based band
+            if avg is not None and not np.isnan(avg):
+                # Handle negative means by always taking numeric min/max of the endpoints
+                low_candidate = avg * (1.0 - deviation_fraction)
+                high_candidate = avg * (1.0 + deviation_fraction)
+                band_min = min(low_candidate, high_candidate)
+                band_max = max(low_candidate, high_candidate)
+
+                # Optionally clip band by client min/max
+                if self.config.rule_use_client_bounds:
+                    if client_min is not None:
+                        band_min = max(band_min, client_min)
+                    if client_max is not None:
+                        band_max = min(band_max, client_max)
+
+                # If band collapsed or invalid, fall back to client-only logic
+                if band_max <= band_min:
+                    band_min = client_min
+                    band_max = client_max
+            else:
+                # No statistical average available – rely purely on client bounds
+                band_min = client_min
+                band_max = client_max
+
+            # If we still don't have a usable band, skip this sensor
+            if band_min is None or band_max is None:
                 continue
-            
-            rule_min = rule.get("min")
-            rule_max = rule.get("max")
-            
-            if rule_min is None or rule_max is None:
-                continue
-            
-            if value < rule_min or value > rule_max:
-                range_width = rule_max - rule_min if rule_max != rule_min else 1e-8
-                deviation_pct = abs(value - (rule_min if value < rule_min else rule_max)) / range_width * 100
-                
-                sensor_unit = get_sensor_ranges(lift_type).get(field, {}).get('unit', '')
-                
-                min_str = self._format_value(rule_min)
-                max_str = self._format_value(rule_max)
+
+            # Check if current value is outside the allowed band
+            if value < band_min or value > band_max:
+                # Deviation as percentage beyond the band width
+                width = band_max - band_min if band_max != band_min else 1e-8
+                if value < band_min:
+                    deviation_pct = abs(band_min - value) / width * 100.0
+                else:
+                    deviation_pct = abs(value - band_max) / width * 100.0
+
+                min_str = self._format_value(band_min)
+                max_str = self._format_value(band_max)
                 val_str = self._format_value(value)
                 unit_str = f" {sensor_unit}" if sensor_unit else ""
-                violation_text = f"Out of range. Expected {min_str}{unit_str} - {max_str}{unit_str}, got {val_str}{unit_str} ({deviation_pct:.1f}% deviation)"
+                if avg is not None and not np.isnan(avg):
+                    avg_str = self._format_value(avg)
+                    violation_text = (
+                        f"Outside expected band around average. "
+                        f"Avg {avg_str}{unit_str}, allowed {min_str}{unit_str} - {max_str}{unit_str}, "
+                        f"got {val_str}{unit_str} ({deviation_pct:.1f}% beyond band)"
+                    )
+                else:
+                    violation_text = (
+                        f"Out of range. Expected {min_str}{unit_str} - {max_str}{unit_str}, "
+                        f"got {val_str}{unit_str} ({deviation_pct:.1f}% deviation)"
+                    )
 
-                logger.info(f"[AnomalyDetector] lift_type={lift_type} field={field} min={rule_min} max={rule_max} unit={sensor_unit} value={value}")
+                logger.debug(
+                    "[AnomalyDetector] lift_type=%s field=%s avg=%s band=[%s, %s] value=%s unit=%s",
+                    lift_type,
+                    field,
+                    avg,
+                    band_min,
+                    band_max,
+                    value,
+                    sensor_unit,
+                )
 
                 violations.append({
                     "field": field,
                     "value": value,
-                    "min": rule_min,
-                    "max": rule_max,
+                    "min": band_min,
+                    "max": band_max,
                     "unit": sensor_unit,
                     "deviation_pct": round(deviation_pct, 2),
                     "violation": violation_text
                 })
-                
+
                 # Calculate contribution using configured scaling factors
                 dev_factor = deviation_pct / 100.0
                 contrib = self.config.rule_base_contrib + min(
@@ -397,7 +666,7 @@ class AnomalyDetector:
                     dev_factor * self.config.rule_dev_scale
                 )
                 rule_anomaly_score += contrib
-        
+
         rule_anomaly_score = min(1.0, rule_anomaly_score)
         return violations, rule_anomaly_score
     
@@ -455,28 +724,38 @@ class AnomalyDetector:
         
         active_rules = get_well_type_rules(lift_type)
         
-        # Rule-based detection
-        violations, rule_anomaly_score = self._compute_rule_based_score(readings, active_rules, lift_type)
+        # Rule-based detection (average-based band using statistical model + client ranges)
+        violations, rule_anomaly_score = self._compute_rule_based_score(
+            readings,
+            active_rules,
+            lift_type,
+            well_id=well_id,
+        )
         
-        # ML-based detection (Isolation Forest + stat)
+        # ML-based detection (Isolation Forest + stat); prefer per-well models
         detection_method = "statistical_rules"
         if self.trained_models:
-            ml_anomaly_score = self._detect_anomaly_with_trained_models(readings, lift_type)
+            ml_anomaly_score = self._detect_anomaly_with_trained_models(readings, lift_type, well_id=well_id)
             if ml_anomaly_score > 0.5:
                 detection_method += " + ml_model"
         
-        # LSTM on history if provided
+        # LSTM on history if provided; prefer per-well model then lift_type
         seq_len = self.config.seq_len
         if historical_data and TORCH_AVAILABLE and len(historical_data) >= seq_len - 1:
             try:
-                lstm_key = f'lstm_{lift_type.lower().replace(" ", "_")}'
+                well_type_clean = lift_type.lower().replace(" ", "_")
+                lstm_key = (f'lstm_well_{well_id_to_safe(well_id)}' if well_id else None)
+                if lstm_key and lstm_key not in self.trained_models:
+                    lstm_key = None
+                if not lstm_key:
+                    lstm_key = f'lstm_{well_type_clean}'
                 if lstm_key in self.trained_models:
                     lstm_data = self.trained_models[lstm_key]
                     model = lstm_data['model']
                     scaler = lstm_data['scaler']
                     model_seq_len = lstm_data.get('seq_len', seq_len)
                     features = lstm_data.get('features') or self._get_features_for_well_type(lift_type)
-                    if features:
+                    if features and hasattr(model, 'input_dim'):
                         history_df = pd.DataFrame(historical_data + [readings])
                         for f in features:
                             if f not in history_df.columns:
@@ -497,7 +776,7 @@ class AnomalyDetector:
         # Combine scores
         combined_score = self._combine_scores(rule_anomaly_score, ml_anomaly_score, lstm_anomaly_score)
 
-        logger.info(f"[AnomalyDetector] rule_score={rule_anomaly_score:.3f} ml_score={ml_anomaly_score:.3f} lstm_score={lstm_anomaly_score:.3f} combined_score={combined_score:.3f}")
+        logger.debug(f"[AnomalyDetector] rule_score={rule_anomaly_score:.3f} ml_score={ml_anomaly_score:.3f} lstm_score={lstm_anomaly_score:.3f} combined_score={combined_score:.3f}")
 
         is_anomaly = len(violations) > 0 or combined_score >= self.config.anomaly_threshold
 
@@ -512,11 +791,13 @@ class AnomalyDetector:
             "detection_method": detection_method
         }
     
-    def _detect_anomaly_with_trained_models(self, readings: Dict, lift_type: str) -> float:
-        """Use trained Isolation Forest and statistical models to detect anomalies."""
+    def _detect_anomaly_with_trained_models(self, readings: Dict, lift_type: str, well_id: Optional[str] = None) -> float:
+        """Use trained Isolation Forest and statistical models; prefer per-well models over lift_type."""
         well_type_clean = lift_type.lower().replace(" ", "_")
-        iso_key = f'iso_{well_type_clean}'
-        stat_key = f'stat_{well_type_clean}'
+        safe_well = well_id_to_safe(well_id) if well_id else None
+        # Prefer per-well models, then fall back to lift_type
+        iso_key = f'iso_well_{safe_well}' if (well_id and f'iso_well_{safe_well}' in self.trained_models) else f'iso_{well_type_clean}'
+        stat_key = f'stat_well_{safe_well}' if (well_id and f'stat_well_{safe_well}' in self.trained_models) else f'stat_{well_type_clean}'
         
         if iso_key not in self.trained_models and stat_key not in self.trained_models:
             return 0.0
@@ -632,6 +913,9 @@ class AnomalyDetector:
         if not TORCH_AVAILABLE:
             logger.warning("PyTorch not available; skipping LSTM training")
             return None
+        if not SKLEARN_AVAILABLE or StandardScaler is None:
+            logger.warning("scikit-learn not available; skipping LSTM training (scaler required)")
+            return None
         
         epochs = epochs or self.config.lstm_epochs
         seq_len = self.config.seq_len
@@ -673,6 +957,7 @@ class AnomalyDetector:
         self,
         readings: Dict[str, Any],
         historical_data: Optional[List[Dict]] = None,
+        well_id: Optional[str] = None,
         lift_type: Optional[str] = None
     ) -> Dict[str, Any]:
         """
@@ -681,6 +966,7 @@ class AnomalyDetector:
         Args:
             readings: Dict of current sensor values
             historical_data: Optional list of previous readings
+            well_id: Well identifier (for per-well model lookup)
             lift_type: Well type (required)
             
         Returns:
@@ -694,7 +980,7 @@ class AnomalyDetector:
         if historical_data is None:
             historical_data = []
         
-        result = self.check_anomaly(readings, historical_data, lift_type=lift_type)
+        result = self.check_anomaly(readings, historical_data, well_id=well_id, lift_type=lift_type)
         return {
             "final_score": result['anomaly_score'],
             "method_scores": {
@@ -800,6 +1086,7 @@ def check_anomaly(
 def ensemble_score(
     readings: Dict[str, Any],
     historical_data: Optional[List[Dict]] = None,
+    well_id: Optional[str] = None,
     lift_type: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -808,10 +1095,11 @@ def ensemble_score(
     Args:
         readings: Dict of current sensor values
         historical_data: Optional list of previous readings
+        well_id: Well identifier (for per-well model lookup)
         lift_type: Well type - REQUIRED
     
     Returns:
         Dict with ensemble scoring details
     """
     detector = get_detector()
-    return detector.ensemble_score(readings, historical_data, lift_type=lift_type)
+    return detector.ensemble_score(readings, historical_data, well_id=well_id, lift_type=lift_type)

@@ -1,0 +1,30 @@
+# SageMaker inference container for operational recommendations (detector).
+# Runs model_fn/input_fn/predict_fn/output_fn from deploy.sagemaker.operations_inference.
+# No Snowflake required: input must include pre-computed metrics.
+FROM python:3.11-slim
+
+# MMS (multi-model-server) started by sagemaker-inference requires Java
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libgomp1 default-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    scikit-learn joblib pandas numpy \
+    multi-model-server sagemaker-inference
+
+# App: operations, config, deploy (operations entrypoint only)
+COPY operations ./operations
+COPY config ./config
+COPY deploy/__init__.py ./deploy/__init__.py
+COPY deploy/sagemaker/__init__.py ./deploy/sagemaker/__init__.py
+COPY deploy/sagemaker/operations_inference.py ./deploy/sagemaker/operations_inference.py
+
+ENV PYTHONPATH=/app
+ENV SAGEMAKER_PROGRAM=deploy.sagemaker.operations_inference
+
+EXPOSE 8080
+ENTRYPOINT ["python", "-c", "from sagemaker_inference import model_server; model_server.start_model_server()"]
+CMD ["serve"]

@@ -39,6 +39,7 @@ from anomaly_detection.detector import (
     # Utility
     get_safe_value,
     get_well_type_rules,
+    well_id_to_safe,
     
     # Constants (for external configuration)
     ANOMALY_THRESHOLD,
@@ -57,8 +58,8 @@ from anomaly_detection.train_models import (
     train_isolation_forest,
     train_statistical_model,
     train_lstm_autoencoder,
-    load_training_data_from_snowflake,
-    load_training_data_from_csv,
+    get_well_ids_from_snowflake,
+    load_training_data_for_well_from_snowflake,
 )
 
 __all__ = [
@@ -83,12 +84,13 @@ __all__ = [
     'train_isolation_forest',
     'train_statistical_model',
     'train_lstm_autoencoder',
-    'load_training_data_from_snowflake',
-    'load_training_data_from_csv',
+    'get_well_ids_from_snowflake',
+    'load_training_data_for_well_from_snowflake',
     
     # Utilities
     'get_safe_value',
     'get_well_type_rules',
+    'well_id_to_safe',
     
     # Constants
     'ANOMALY_THRESHOLD',
