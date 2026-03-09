@@ -1,0 +1,25 @@
+# SageMaker training container: reads sensor_data channel (parquet), writes model to /opt/ml/model
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Training deps only (no Snowflake, no inference server)
+RUN pip install --no-cache-dir \
+    pandas pyarrow boto3 \
+    scikit-learn joblib numpy torch
+
+# App code needed for training
+COPY anomaly_detection ./anomaly_detection
+COPY config ./config
+COPY deploy/__init__.py ./deploy/__init__.py
+COPY deploy/sagemaker/__init__.py ./deploy/sagemaker/__init__.py
+COPY deploy/sagemaker/train.py ./deploy/sagemaker/train.py
+
+ENV PYTHONPATH=/app
+
+# SageMaker runs: docker run <image> train
+ENTRYPOINT ["python", "-m", "deploy.sagemaker.train"]

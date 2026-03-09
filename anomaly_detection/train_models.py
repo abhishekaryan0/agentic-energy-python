@@ -25,16 +25,18 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 import joblib
-from snowflake.connector import connect as snowflake_connect
-from dotenv import load_dotenv
 
-# Load .env from project root so S3_BUCKET / S3_PREFIX / MODEL_VERSION work from env
+# Optional: .env only needed for local runs (SageMaker training from parquet does not use it)
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_env_file = os.path.join(_project_root, ".env")
-if os.path.isfile(_env_file):
-    load_dotenv(_env_file)
-else:
-    load_dotenv()
+try:
+    from dotenv import load_dotenv
+    _env_file = os.path.join(_project_root, ".env")
+    if os.path.isfile(_env_file):
+        load_dotenv(_env_file)
+    else:
+        load_dotenv()
+except ImportError:
+    pass
 
 # Optional PyTorch imports
 try:
@@ -46,9 +48,6 @@ except ImportError:
     logging.warning("PyTorch not available; LSTM training disabled")
     torch = None
     nn = None
-
-# Load environment
-load_dotenv()
 
 # Configure logging (log file next to this module)
 _log_dir = os.path.dirname(os.path.abspath(__file__))
@@ -116,27 +115,34 @@ SNOWFLAKE_CONFIG = {
 
 # ===== UTILITY FUNCTIONS =====
 
-def create_models_dir():
-    """Ensure models/anomaly_detection/ and wells subdir exist."""
-    if not os.path.exists(MODELS_DIR):
-        os.makedirs(MODELS_DIR)
-        logger.info(f"Created {MODELS_DIR} directory")
-    if not os.path.exists(ANOMALY_DETECTION_MODELS_DIR):
-        os.makedirs(ANOMALY_DETECTION_MODELS_DIR)
-        logger.info(f"Created {MODELS_DIR}/{ANOMALY_DETECTION_SUBDIR} directory")
-    wells_dir = os.path.join(ANOMALY_DETECTION_MODELS_DIR, WELLS_SUBDIR)
+def create_models_dir(base_dir=None):
+    """Ensure anomaly_detection/ and wells subdir exist. If base_dir set, use base_dir/anomaly_detection/wells/."""
+    if base_dir is not None:
+        models_root = os.path.join(base_dir, ANOMALY_DETECTION_SUBDIR)
+    else:
+        if not os.path.exists(MODELS_DIR):
+            os.makedirs(MODELS_DIR)
+            logger.info(f"Created {MODELS_DIR} directory")
+        models_root = ANOMALY_DETECTION_MODELS_DIR
+    if not os.path.exists(models_root):
+        os.makedirs(models_root, exist_ok=True)
+        logger.info(f"Created {models_root} directory")
+    wells_dir = os.path.join(models_root, WELLS_SUBDIR)
     if not os.path.exists(wells_dir):
         os.makedirs(wells_dir)
-        logger.info(f"Created {MODELS_DIR}/{ANOMALY_DETECTION_SUBDIR}/{WELLS_SUBDIR} directory")
+        logger.info(f"Created {wells_dir} directory")
 
 
-def get_well_model_dir(safe_well_id):
-    """Return path to a well's model folder: models/anomaly_detection/wells/<safe_well_id>/."""
+def get_well_model_dir(safe_well_id, base_dir=None):
+    """Return path to a well's model folder. If base_dir set: base_dir/anomaly_detection/wells/<safe_well_id>/."""
+    if base_dir is not None:
+        return os.path.join(base_dir, ANOMALY_DETECTION_SUBDIR, WELLS_SUBDIR, safe_well_id)
     return os.path.join(ANOMALY_DETECTION_MODELS_DIR, WELLS_SUBDIR, safe_well_id)
 
 def connect_snowflake():
-    """Connect to Snowflake."""
+    """Connect to Snowflake (used only for local Snowflake-based training)."""
     try:
+        from snowflake.connector import connect as snowflake_connect
         conn = snowflake_connect(**SNOWFLAKE_CONFIG)
         logger.info("Connected to Snowflake")
         return conn
@@ -217,6 +223,52 @@ def load_training_data_for_well_from_snowflake(well_id, limit=None, conn=None):
     finally:
         if own_conn and conn:
             conn.close()
+
+
+def load_well_sensor_readings_from_parquet(path):
+    """
+    Load well_sensor_readings from a parquet file (local or S3).
+    path: local path or s3://bucket/key.
+    Returns DataFrame with well_id, timestamp, lift_type and sensor columns.
+    """
+    if path.startswith("s3://"):
+        try:
+            import boto3
+            from urllib.parse import urlparse
+            parsed = urlparse(path)
+            bucket, key = parsed.netloc, parsed.path.lstrip("/")
+            s3 = boto3.client("s3")
+            buf = __import__("io").BytesIO()
+            s3.download_fileobj(bucket, key, buf)
+            buf.seek(0)
+            return pd.read_parquet(buf)
+        except Exception as e:
+            logger.error(f"Failed to load parquet from S3 {path}: {e}")
+            raise
+    return pd.read_parquet(path)
+
+
+def get_well_ids_from_dataframe(df):
+    """Return list of distinct well_id from a sensor DataFrame."""
+    if "well_id" not in df.columns:
+        return []
+    return sorted(df["well_id"].dropna().astype(str).unique().tolist())
+
+
+def load_training_data_for_well_from_df(well_id, full_df, limit=None):
+    """
+    Get one well's last N rows from a full sensor DataFrame (by timestamp).
+    Returns DataFrame ordered by timestamp for training.
+    """
+    if limit is None:
+        limit = PER_WELL_TRAINING_LIMIT
+    well_df = full_df[full_df["well_id"].astype(str) == str(well_id)].copy()
+    if "timestamp" in well_df.columns:
+        well_df = well_df.sort_values("timestamp")
+    well_df = well_df.tail(limit)
+    if "timestamp" in well_df.columns:
+        well_df = well_df.sort_values("timestamp").reset_index(drop=True)
+    return well_df
 
 
 def prepare_data_for_training(df, well_type):
@@ -673,6 +725,108 @@ def train_all_models():
     logger.info("\n" + "="*60)
     logger.info("TRAINING COMPLETE - Per-well models saved and uploaded to S3")
     logger.info("="*60)
+
+
+def train_all_models_from_parquet(parquet_path, output_dir, per_well_limit=None):
+    """
+    Train per-well anomaly models from a parquet file (local or s3://), write to output_dir.
+    Used by SageMaker: data at parquet_path, artifacts under output_dir (e.g. /opt/ml/model).
+    output_dir will contain anomaly_detection/wells/<safe_well_id>/ and training_summary.json.
+    """
+    if per_well_limit is None:
+        per_well_limit = PER_WELL_TRAINING_LIMIT
+    logger.info("="*60)
+    logger.info(f"TRAINING FROM PARQUET: {parquet_path} -> {output_dir} (last {per_well_limit} rows/well)")
+    logger.info("="*60)
+
+    create_models_dir(base_dir=output_dir)
+
+    full_df = load_well_sensor_readings_from_parquet(parquet_path)
+    logger.info(f"Loaded {len(full_df):,} rows from parquet")
+
+    well_ids = get_well_ids_from_dataframe(full_df)
+    if not well_ids:
+        logger.error("No well_id column or no wells in parquet")
+        return
+
+    logger.info(f"Training per well: {len(well_ids)} wells")
+
+    all_metrics = {}
+    for well_id in well_ids:
+        well_df = load_training_data_for_well_from_df(well_id, full_df, limit=per_well_limit)
+        if well_df.empty or len(well_df) < 2:
+            continue
+        lift_type = well_df["lift_type"].dropna().iloc[0] if "lift_type" in well_df.columns else None
+        if not lift_type or str(lift_type).strip() == "":
+            continue
+        safe_id = well_id_to_safe(well_id)
+        label = f"well {well_id} ({lift_type})"
+
+        logger.info(f"\n{'='*60}\nTraining models for {label}\n{'='*60}")
+
+        try:
+            prepared = prepare_data_for_training(well_df, lift_type)
+            if prepared is None:
+                all_metrics[label] = {"error": "No training data available"}
+                continue
+            X_train, X_test, y_train, y_test, scaler, features = prepared
+
+            iso_model, scaler_iso, iso_metrics = train_isolation_forest(
+                X_train, X_test, y_test, label, scaler
+            )
+            stat_model, stat_metrics = train_statistical_model(
+                X_train, X_test, y_test, label, features
+            )
+            lstm_model, lstm_metrics = train_lstm_autoencoder(
+                X_train, X_test, label, features
+            )
+
+            well_dir = get_well_model_dir(safe_id, base_dir=output_dir)
+            os.makedirs(well_dir, exist_ok=True)
+            save_model(
+                {"model": iso_model, "scaler": scaler_iso, "features": features},
+                os.path.join(well_dir, ISO_FILENAME),
+            )
+            save_model(stat_model, os.path.join(well_dir, STAT_FILENAME))
+            if lstm_model:
+                torch.save(lstm_model["model"].state_dict(), os.path.join(well_dir, LSTM_PT_FILENAME))
+                joblib.dump(lstm_model["scaler"], os.path.join(well_dir, LSTM_SCALER_FILENAME))
+                meta = {"input_dim": lstm_model["model"].input_dim, "features": features, "seq_len": SEQ_LEN}
+                joblib.dump(meta, os.path.join(well_dir, LSTM_META_FILENAME))
+
+            all_metrics[label] = {
+                "isolation_forest": iso_metrics,
+                "statistical": stat_metrics,
+                "lstm": lstm_metrics if lstm_model else {"error": "Not trained"},
+                "training_samples": len(X_train),
+                "test_samples": len(X_test),
+                "features": features,
+                "well_id": str(well_id),
+                "lift_type": str(lift_type),
+                "timestamp": datetime.now().isoformat(),
+            }
+            save_metrics(all_metrics[label], safe_id, well_dir=well_dir)
+        except Exception as e:
+            logger.error(f"Error training {label}: {e}", exc_info=True)
+            all_metrics[label] = {"error": str(e)}
+
+    def _convert(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert(x) for x in obj]
+        return obj
+
+    summary_dir = os.path.join(output_dir, ANOMALY_DETECTION_SUBDIR)
+    summary_file = os.path.join(summary_dir, "training_summary.json")
+    with open(summary_file, "w") as f:
+        json.dump(_convert(all_metrics), f, indent=2)
+    logger.info(f"Saved training summary to {summary_file}")
+    logger.info("TRAINING FROM PARQUET COMPLETE - artifacts in %s", output_dir)
 
 
 def _upload_anomaly_models_to_s3(bucket: str) -> bool:

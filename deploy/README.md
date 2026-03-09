@@ -86,6 +86,32 @@ python -m anomaly_detection.train_models
 
 Upload goes to `s3://BUCKET/PREFIX/anomaly_detection_VERSION.tar.gz`. AWS CLI must be configured. Then deploy with `./deploy/deploy_sagemaker_lambda.sh` (it will use the uploaded tarball).
 
+## SageMaker training (sensor data from S3)
+
+To train anomaly detection **on SageMaker** using sensor data stored in S3 (e.g. from `scripts/generate_digital_twin.py --s3`):
+
+1. **Data:** Ensure parquet exists at `s3://BUCKET/{ORGANIZATION_ID}/sensor_data/well_sensor_readings.parquet`.
+2. **Run training job** (from repo root):
+
+   ```bash
+   export S3_BUCKET=agentic-energy-ml-models-200937443240
+   export ORGANIZATION_ID=147a92b9-f90a-473d-b443-e6e668c4fbb7
+   ./deploy/run_sagemaker_training.sh
+   ```
+
+3. **Output:** When the job completes, the model is at  
+   `s3://BUCKET/{ORGANIZATION_ID}/model/<training_job_name>/output/model.tar.gz`  
+   (same layout as local training: `anomaly_detection/wells/<safe_well_id>/`).
+
+Optional env: `TRAINING_JOB_NAME`, `INSTANCE_TYPE` (default `ml.m5.xlarge`), `PER_WELL_LIMIT` (default 5000), `AWS_REGION`.
+
+**Local training from parquet (no SageMaker):** You can also train from a parquet file (local or `s3://`) and write to a directory:
+
+```python
+from anomaly_detection.train_models import train_all_models_from_parquet
+train_all_models_from_parquet("/path/to/well_sensor_readings.parquet", output_dir="models", per_well_limit=5000)
+```
+
 ## Required
 
 - **S3_BUCKET** – Required for deploy and for training (training always uploads to S3 after saving models). All other variables have defaults.
