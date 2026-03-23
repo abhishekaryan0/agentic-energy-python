@@ -36,8 +36,45 @@ AUTOENCODER_THRESHOLD_SIGMA = 1.5
 # How many days of well data we fetch for anomaly review (baselines, models, pattern-shift).
 # Pattern-shift compares last 30d vs previous 90d within this window (no full-year history).
 ANOMALY_REVIEW_FETCH_DAYS = 180
-# Snowflake fully qualified table for anomaly_review (used for history / existence checks)
-SNOWFLAKE_ANOMALY_REVIEW_TABLE = "AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW"
+# S3 layout (aligned with operations and deploy): input/output prefixes
+# Input: s3://BUCKET/{ORG}/sensor_data/well_sensor_readings.parquet, daily_production.parquet
+# Output: s3://BUCKET/{ORG}/detections/anomaly_review/run_ts=.../anomaly_reviews.parquet
+def get_anomaly_review_s3_bucket() -> str:
+    """S3 bucket for anomaly review input/output (same as operations)."""
+    return os.getenv("S3_BUCKET", "")
+
+
+def get_anomaly_review_input_prefix() -> str:
+    """S3 prefix for sensor/production parquet (e.g. org_id/sensor_data)."""
+    org = get_organization_id()
+    if org:
+        return f"{org}/sensor_data"
+    return os.getenv("ANOMALY_REVIEW_INPUT_S3_PREFIX", "sensor_data")
+
+
+def get_anomaly_review_output_prefix() -> str:
+    """S3 prefix for anomaly review output parquet (e.g. org_id/detections/anomaly_review)."""
+    org = get_organization_id()
+    if org:
+        return f"{org}/detections/anomaly_review"
+    return os.getenv("ANOMALY_REVIEW_OUTPUT_S3_PREFIX", "detections/anomaly_review")
+
+
+def get_anomaly_review_model_s3_base() -> Optional[str]:
+    """
+    S3 base prefix for anomaly review trained model (SageMaker job output).
+    Uses ORGANIZATION_ID from env: s3://BUCKET/{ORGANIZATION_ID}/model/.
+    Returns None if S3_BUCKET or ORGANIZATION_ID not set.
+    Override with ANOMALY_REVIEW_MODEL_S3_URI to pin a specific model.tar.gz URI.
+    """
+    override = os.getenv("ANOMALY_REVIEW_MODEL_S3_URI", "").strip()
+    if override:
+        return override if override.startswith("s3://") else f"s3://{override}"
+    bucket = get_anomaly_review_s3_bucket()
+    org = get_organization_id()
+    if not bucket or not org:
+        return None
+    return f"s3://{bucket}/{org}/model"
 
 # =============================================================================
 # DETECTION THRESHOLDS (What counts as "unusual")
@@ -255,9 +292,9 @@ LIFT_TYPE_FEATURES: Dict[str, List[str]] = {
 
 @dataclass
 class BatchConfig:
-    """Configuration for batch processing."""
+    """Configuration for batch processing. Default: test_mode=False (process all wells)."""
 
-    test_mode: bool = True
+    test_mode: bool = False
     test_well_limit: int = 1
     test_well_id: str = "Mustang-12-3-V"
     max_workers: int = 10

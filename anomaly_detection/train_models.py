@@ -566,165 +566,230 @@ def save_metrics(metrics, safe_well_id, well_dir=None):
 
 def train_all_models():
     """
-    Main training pipeline: train models per well using each well's last 5k readings from Snowflake.
-    No CSV fallback; requires Snowflake. Saves under models/anomaly_detection/wells/<safe_id>/.
+    Main training pipeline: train models per well.
+    Prefers S3 parquet (sensor_data/well_sensor_readings.parquet) when available,
+    falls back to Snowflake when parquet is not configured.
     """
-    logger.info("="*60)
-    logger.info(f"STARTING MODEL TRAINING PIPELINE (per well, last {PER_WELL_TRAINING_LIMIT} rows per well, Snowflake only)")
-    logger.info("="*60)
+    logger.info("=" * 60)
+    logger.info(
+        f"STARTING MODEL TRAINING PIPELINE (per well, last {PER_WELL_TRAINING_LIMIT} rows per well)"
+    )
+    logger.info("=" * 60)
 
-    create_models_dir()
+    # ------------------------------------------------------------------
+    # 1) Prefer S3 parquet (same layout as digital twin / operations)
+    # ------------------------------------------------------------------
+    parquet_path = os.getenv("ANOMALY_SENSOR_PARQUET_S3", "").strip()
+    if not parquet_path:
+        bucket = os.getenv("S3_BUCKET", "").strip()
+        org = os.getenv("ORGANIZATION_ID", "").strip()
+        if bucket and org:
+            parquet_path = f"s3://{bucket}/{org}/sensor_data/well_sensor_readings.parquet"
 
-    try:
-        conn = connect_snowflake()
-    except Exception as e:
-        logger.error("Snowflake connection required. Cannot train without it: %s", e)
-        return
+    if parquet_path:
+        logger.info(
+            "Using S3 parquet for anomaly_detection training: %s (S3-only, no Snowflake)",
+            parquet_path,
+        )
+        # Train into local models/anomaly_detection/ (ANOMALY_DETECTION_MODELS_DIR)
+        train_all_models_from_parquet(
+            parquet_path,
+            output_dir=MODELS_DIR,
+            per_well_limit=PER_WELL_TRAINING_LIMIT,
+        )
+    else:
+        # ------------------------------------------------------------------
+        # 2) Legacy Snowflake path (kept for backward compatibility)
+        # ------------------------------------------------------------------
+        logger.info("ANOMALY_SENSOR_PARQUET_S3 not set and S3 paths not configured; falling back to Snowflake.")
+        create_models_dir()
 
-    try:
-        well_ids = get_well_ids_from_snowflake(conn=conn)
-    except Exception as e:
-        logger.error("Failed to get well list: %s", e)
-        conn.close()
-        return
-
-    if not well_ids:
-        logger.error("No wells found in well_sensor_readings")
-        conn.close()
-        return
-
-    logger.info(f"Training per well: {len(well_ids)} wells (last {PER_WELL_TRAINING_LIMIT} rows each)")
-
-    all_metrics = {}
-
-    for well_id in well_ids:
         try:
-            well_df = load_training_data_for_well_from_snowflake(well_id, limit=PER_WELL_TRAINING_LIMIT, conn=conn)
+            conn = connect_snowflake()
         except Exception as e:
-            logger.warning("Skip well %s: %s", well_id, e)
-            all_metrics[f"well {well_id}"] = {'error': str(e)}
-            continue
-        if well_df.empty or len(well_df) < 2:
-            continue
-        lift_type = well_df['lift_type'].dropna().iloc[0] if 'lift_type' in well_df.columns else None
-        if not lift_type or str(lift_type).strip() == '':
-            continue
-        safe_id = well_id_to_safe(well_id)  # lowercase for consistent folder/key with detector
-        label = f"well {well_id} ({lift_type})"
+            logger.error("Snowflake connection required for legacy training path: %s", e)
+            return
 
+        try:
+            well_ids = get_well_ids_from_snowflake(conn=conn)
+        except Exception as e:
+            logger.error("Failed to get well list from Snowflake: %s", e)
+            conn.close()
+            return
+
+        if not well_ids:
+            logger.error("No wells found in well_sensor_readings (Snowflake)")
+            conn.close()
+            return
+
+        logger.info(
+            f"Training per well from Snowflake: {len(well_ids)} wells (last {PER_WELL_TRAINING_LIMIT} rows each)"
+        )
+
+        all_metrics = {}
+
+        for well_id in well_ids:
+            try:
+                well_df = load_training_data_for_well_from_snowflake(
+                    well_id, limit=PER_WELL_TRAINING_LIMIT, conn=conn
+                )
+            except Exception as e:
+                logger.warning("Skip well %s: %s", well_id, e)
+                all_metrics[f"well {well_id}"] = {"error": str(e)}
+                continue
+            if well_df.empty or len(well_df) < 2:
+                continue
+            lift_type = (
+                well_df["lift_type"].dropna().iloc[0]
+                if "lift_type" in well_df.columns
+                else None
+            )
+            if not lift_type or str(lift_type).strip() == "":
+                continue
+            safe_id = well_id_to_safe(
+                well_id
+            )  # lowercase for consistent folder/key with detector
+            label = f"well {well_id} ({lift_type})"
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Training models for {label}")
+            logger.info(f"{'='*60}")
+
+            try:
+                prepared = prepare_data_for_training(well_df, lift_type)
+                if prepared is None:
+                    logger.warning(f"Skipping {label} - no training data")
+                    all_metrics[label] = {"error": "No training data available"}
+                    continue
+                X_train, X_test, y_train, y_test, scaler, features = prepared
+
+                iso_model, scaler_iso, iso_metrics = train_isolation_forest(
+                    X_train, X_test, y_test, label, scaler
+                )
+                stat_model, stat_metrics = train_statistical_model(
+                    X_train, X_test, y_test, label, features
+                )
+                lstm_model, lstm_metrics = train_lstm_autoencoder(
+                    X_train, X_test, label, features
+                )
+
+                # Save under models/wells/<safe_id>/ with fixed filenames
+                well_dir = get_well_model_dir(safe_id)
+                os.makedirs(well_dir, exist_ok=True)
+                save_model(
+                    {"model": iso_model, "scaler": scaler_iso, "features": features},
+                    os.path.join(well_dir, ISO_FILENAME),
+                )
+                save_model(
+                    stat_model,
+                    os.path.join(well_dir, STAT_FILENAME),
+                )
+                if lstm_model:
+                    torch.save(
+                        lstm_model["model"].state_dict(),
+                        os.path.join(well_dir, LSTM_PT_FILENAME),
+                    )
+                    joblib.dump(
+                        lstm_model["scaler"],
+                        os.path.join(well_dir, LSTM_SCALER_FILENAME),
+                    )
+                    meta = {
+                        "input_dim": lstm_model["model"].input_dim,
+                        "features": features,
+                        "seq_len": SEQ_LEN,
+                    }
+                    joblib.dump(
+                        meta, os.path.join(well_dir, LSTM_META_FILENAME)
+                    )
+                    logger.info(f"Saved LSTM model for {label}")
+
+                all_metrics[label] = {
+                    "isolation_forest": iso_metrics,
+                    "statistical": stat_metrics,
+                    "lstm": lstm_metrics
+                    if lstm_model
+                    else {"error": "Not trained"},
+                    "training_samples": len(X_train),
+                    "test_samples": len(X_test),
+                    "features": features,
+                    "well_id": str(well_id),
+                    "lift_type": str(lift_type),
+                    "timestamp": datetime.now().isoformat(),
+                }
+                save_metrics(all_metrics[label], safe_id, well_dir=well_dir)
+
+            except Exception as e:
+                logger.error(f"Error training {label}: {e}", exc_info=True)
+                all_metrics[label] = {"error": str(e)}
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        # Print summary
         logger.info(f"\n{'='*60}")
-        logger.info(f"Training models for {label}")
+        logger.info("TRAINING SUMMARY")
         logger.info(f"{'='*60}")
 
-        try:
-            prepared = prepare_data_for_training(well_df, lift_type)
-            if prepared is None:
-                logger.warning(f"Skipping {label} - no training data")
-                all_metrics[label] = {'error': 'No training data available'}
-                continue
-            X_train, X_test, y_train, y_test, scaler, features = prepared
-
-            iso_model, scaler_iso, iso_metrics = train_isolation_forest(
-                X_train, X_test, y_test, label, scaler
-            )
-            stat_model, stat_metrics = train_statistical_model(
-                X_train, X_test, y_test, label, features
-            )
-            lstm_model, lstm_metrics = train_lstm_autoencoder(
-                X_train, X_test, label, features
-            )
-
-            # Save under models/wells/<safe_id>/ with fixed filenames
-            well_dir = get_well_model_dir(safe_id)
-            os.makedirs(well_dir, exist_ok=True)
-            save_model(
-                {'model': iso_model, 'scaler': scaler_iso, 'features': features},
-                os.path.join(well_dir, ISO_FILENAME)
-            )
-            save_model(
-                stat_model,
-                os.path.join(well_dir, STAT_FILENAME)
-            )
-            if lstm_model:
-                torch.save(lstm_model['model'].state_dict(),
-                          os.path.join(well_dir, LSTM_PT_FILENAME))
-                joblib.dump(lstm_model['scaler'],
-                           os.path.join(well_dir, LSTM_SCALER_FILENAME))
-                meta = {'input_dim': lstm_model['model'].input_dim, 'features': features, 'seq_len': SEQ_LEN}
-                joblib.dump(meta, os.path.join(well_dir, LSTM_META_FILENAME))
-                logger.info(f"Saved LSTM model for {label}")
-
-            all_metrics[label] = {
-                'isolation_forest': iso_metrics,
-                'statistical': stat_metrics,
-                'lstm': lstm_metrics if lstm_model else {'error': 'Not trained'},
-                'training_samples': len(X_train),
-                'test_samples': len(X_test),
-                'features': features,
-                'well_id': str(well_id),
-                'lift_type': str(lift_type),
-                'timestamp': datetime.now().isoformat()
-            }
-            save_metrics(all_metrics[label], safe_id, well_dir=well_dir)
-
-        except Exception as e:
-            logger.error(f"Error training {label}: {e}", exc_info=True)
-            all_metrics[label] = {'error': str(e)}
-
-    try:
-        conn.close()
-    except Exception:
-        pass
-
-    # Print summary
-    logger.info(f"\n{'='*60}")
-    logger.info("TRAINING SUMMARY")
-    logger.info(f"{'='*60}")
-
-    for label, metrics in all_metrics.items():
-        logger.info(f"\n{label}:")
-        if 'error' in metrics:
-            logger.info(f"  ❌ Error: {metrics['error']}")
-        else:
-            logger.info(f"  ✓ Training samples: {metrics['training_samples']}")
-            logger.info(f"  ✓ Test samples: {metrics['test_samples']}")
-            logger.info(f"  ✓ Features: {', '.join(metrics['features'])}")
-            logger.info(f"  ✓ Isolation Forest - F1: {metrics['isolation_forest']['f1']:.3f}")
-            logger.info(f"  ✓ Statistical Model - F1: {metrics['statistical']['f1']:.3f}")
-            if 'lstm' in metrics and metrics['lstm'] and 'test_mse' in metrics['lstm']:
-                logger.info(f"  ✓ LSTM Autoencoder - Test MSE: {metrics['lstm']['test_mse']:.4f}")
+        for label, metrics in all_metrics.items():
+            logger.info(f"\n{label}:")
+            if "error" in metrics:
+                logger.info(f"  ❌ Error: {metrics['error']}")
             else:
-                logger.info(f"  ✓ LSTM Autoencoder - Not trained")
+                logger.info(f"  ✓ Training samples: {metrics['training_samples']}")
+                logger.info(f"  ✓ Test samples: {metrics['test_samples']}")
+                logger.info(f"  ✓ Features: {', '.join(metrics['features'])}")
+                logger.info(
+                    f"  ✓ Isolation Forest - F1: {metrics['isolation_forest']['f1']:.3f}"
+                )
+                logger.info(
+                    f"  ✓ Statistical Model - F1: {metrics['statistical']['f1']:.3f}"
+                )
+                if "lstm" in metrics and metrics["lstm"] and "test_mse" in metrics["lstm"]:
+                    logger.info(
+                        f"  ✓ LSTM Autoencoder - Test MSE: {metrics['lstm']['test_mse']:.4f}"
+                    )
+                else:
+                    logger.info("  ✓ LSTM Autoencoder - Not trained")
 
-    summary_file = os.path.join(ANOMALY_DETECTION_MODELS_DIR, 'training_summary.json')
+        summary_file = os.path.join(
+            ANOMALY_DETECTION_MODELS_DIR, "training_summary.json"
+        )
 
-    def convert_types(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, dict):
-            return {k: convert_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_types(item) for item in obj]
-        return obj
+        def convert_types(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_types(item) for item in obj]
+            return obj
 
-    with open(summary_file, 'w') as f:
-        json.dump(convert_types(all_metrics), f, indent=2)
-    logger.info(f"\nSaved training summary to {summary_file}")
+        with open(summary_file, "w") as f:
+            json.dump(convert_types(all_metrics), f, indent=2)
+        logger.info(f"\nSaved training summary to {summary_file}")
 
-    # Required: upload models to S3 (for SageMaker / remote use). Set S3_BUCKET in .env.
+    # ------------------------------------------------------------------
+    # Upload trained models to S3 for inference (same as before)
+    # ------------------------------------------------------------------
     s3_bucket = os.environ.get("S3_BUCKET")
     if not s3_bucket:
-        logger.error("S3_BUCKET is required. Set S3_BUCKET in .env (e.g. S3_BUCKET=your-models-bucket)")
+        logger.error(
+            "S3_BUCKET is required. Set S3_BUCKET in .env (e.g. S3_BUCKET=your-models-bucket)"
+        )
         sys.exit(1)
     if not _upload_anomaly_models_to_s3(s3_bucket):
-        logger.error("S3 upload failed. Training saved locally but deploy will not have the latest models.")
+        logger.error(
+            "S3 upload failed. Training saved locally but deploy will not have the latest models."
+        )
         sys.exit(1)
 
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("TRAINING COMPLETE - Per-well models saved and uploaded to S3")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
 
 def train_all_models_from_parquet(parquet_path, output_dir, per_well_limit=None):

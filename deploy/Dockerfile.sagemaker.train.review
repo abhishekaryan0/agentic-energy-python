@@ -1,0 +1,16 @@
+# SageMaker training container for anomaly review (per-well RF + autoencoder from daily_production.parquet)
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libgomp1 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir pandas pyarrow boto3 scikit-learn joblib numpy torch
+
+COPY anomaly_review ./anomaly_review
+COPY deploy/__init__.py ./deploy/__init__.py
+COPY deploy/sagemaker/__init__.py ./deploy/sagemaker/__init__.py
+COPY deploy/sagemaker/train_review.py ./deploy/sagemaker/train_review.py
+
+ENV PYTHONPATH=/app
+ENTRYPOINT ["python", "-m", "deploy.sagemaker.train_review"]

@@ -1,0 +1,33 @@
+{
+  "family": "operations-detection-batch",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "operations-detection",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "environment": [
+        { "name": "S3_BUCKET", "value": "S3_BUCKET_VALUE" },
+        { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
+        { "name": "OPERATIONS_MODEL_TARBALL_S3_URI", "value": "OPERATIONS_MODEL_TARBALL_S3_URI_VALUE" },
+        { "name": "OPERATIONS_CONFIDENCE_THRESHOLD", "value": "0.6" },
+        { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+        { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
+        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "LOG_GROUP_NAME",
+          "awslogs-region": "AWS_REGION_VALUE",
+          "awslogs-stream-prefix": "operations-detection"
+        }
+      }
+    }
+  ]
+}

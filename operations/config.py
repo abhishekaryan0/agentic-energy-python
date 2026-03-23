@@ -3,10 +3,49 @@ Configuration for the operations module.
 
 This module contains configuration dataclasses and constants used throughout
 the operations package for recommendations, predictions, and training.
+Uses S3 only (no Snowflake). ORGANIZATION_ID from env for model path.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+
+def get_organization_id() -> Optional[str]:
+    """Organization UUID from env. Used for S3 model path: s3://BUCKET/{ORG_ID}/model/."""
+    return os.getenv("ORGANIZATION_ID")
+
+
+def get_operations_model_s3_base() -> Optional[str]:
+    """
+    S3 base prefix for operations trained model (SageMaker job output).
+    Uses ORGANIZATION_ID from env: s3://BUCKET/{ORGANIZATION_ID}/model/.
+    Override with OPERATIONS_MODEL_S3_URI to pin a specific model.tar.gz URI.
+    """
+    override = os.getenv("OPERATIONS_MODEL_S3_URI", "").strip()
+    if override:
+        return override if override.startswith("s3://") else f"s3://{override}"
+    bucket = os.getenv("S3_BUCKET", "")
+    org = get_organization_id()
+    if not bucket or not org:
+        return None
+    return f"s3://{bucket}/{org}/model"
+
+
+def get_operations_s3_bucket() -> str:
+    """S3 bucket for operations input/output. From S3_BUCKET env."""
+    return os.getenv("S3_BUCKET", "")
+
+
+def get_operations_output_prefix() -> str:
+    """S3 prefix for operations detection output: {ORG}/detections/operations or override."""
+    override = os.getenv("OPERATIONS_OUTPUT_S3_PREFIX", "").strip()
+    if override:
+        return override.rstrip("/")
+    org = get_organization_id()
+    if org:
+        return f"{org}/detections/operations"
+    return "detections/operations"
 
 
 @dataclass

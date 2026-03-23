@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+# Lightweight image for daily well status update on ECS Fargate (S3 only).
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY deploy/requirements.well_status.txt ./requirements.well_status.txt
+RUN pip install --no-cache-dir -r requirements.well_status.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+# Run well status update once (read sensor parquet from S3, write well_status.parquet to S3)
+CMD ["python", "-m", "well_status.service"]

@@ -41,7 +41,7 @@ except ImportError:
     get_features_for_lift_type = None
     get_lift_types = None
     get_sensor_ranges = None
-    logging.warning("sensor_config module not available; using fallback rules")
+    logging.warning("sensor_config module not available; using fallback rules (S3-only / ML-only mode)")
 
 try:
     from sklearn.ensemble import IsolationForest
@@ -296,9 +296,13 @@ def get_well_type_rules(lift_type: str) -> Dict:
     """
     if os.environ.get("SAGEMAKER_REGION"):
         return {}
+    # When sensor_config / Snowflake is not available, allow pure ML/S3-based detection.
     if not SENSOR_CONFIG_AVAILABLE:
-        raise ValueError("Dynamic config not available. Ensure Snowflake is configured and tables are created.")
-    
+        logging.warning(
+            "Dynamic sensor_config not available; get_well_type_rules returning empty rules "
+            "(rules component disabled, ML models + fallback bands only)."
+        )
+        return {}
     try:
         ranges = get_sensor_ranges(lift_type)
         rules = {}
@@ -349,11 +353,11 @@ class AnomalyDetector:
         self.config = config or DEFAULT_CONFIG
         self.config.validate()
         
+        # In S3-only mode, allow running without sensor_config/Snowflake by using fallback rules.
         if not SENSOR_CONFIG_AVAILABLE and not os.environ.get("SAGEMAKER_REGION"):
-            raise RuntimeError(
-                "Dynamic config (Snowflake) is required. "
-                "Run: python setup_production_db.py\n"
-                "Or ensure config.sensor_config module is available."
+            logger.warning(
+                "sensor_config (Snowflake) not available. "
+                "Proceeding with fallback anomaly rules and ML models only."
             )
         
         self.trained_models: Dict[str, Any] = self._load_trained_models()

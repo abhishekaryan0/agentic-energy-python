@@ -25,6 +25,72 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_MODELS_DIR = _PROJECT_ROOT / 'models'
 MODELS_DIR = _DEFAULT_MODELS_DIR  # backward compat; use get_models_dir() for env override
 
+# One-time sync of operations models from S3 (bucket + ORGANIZATION_ID from env)
+_OPERATIONS_MODELS_S3_SYNCED = False
+
+
+def _ensure_operations_models_from_s3() -> None:
+    """
+    If S3_BUCKET and ORGANIZATION_ID are set, download the latest operations-train-* model
+    from s3://BUCKET/{ORGANIZATION_ID}/model/operations-train-*/output/model.tar.gz,
+    extract to a local cache, and set OPERATIONS_MODELS_DIR. Uses ORGANIZATION_ID from env.
+    Only runs once per process.
+    """
+    global _OPERATIONS_MODELS_S3_SYNCED
+    if _OPERATIONS_MODELS_S3_SYNCED:
+        return
+    try:
+        from operations.config import get_operations_model_s3_base
+        base = get_operations_model_s3_base()
+    except Exception:
+        base = None
+    if not base:
+        return
+    try:
+        import tarfile
+        import tempfile
+        from urllib.parse import urlparse
+        import boto3
+        s3 = boto3.client("s3")
+        parsed = urlparse(base)
+        bucket = parsed.netloc
+        prefix = (parsed.path or "").lstrip("/")
+        if not prefix:
+            prefix = ""
+        elif not prefix.endswith("/"):
+            prefix = prefix + "/"
+        if base.rstrip("/").endswith("model.tar.gz"):
+            key = parsed.path.lstrip("/")
+        else:
+            paginator = s3.get_paginator("list_objects_v2")
+            candidates = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    k = obj["Key"]
+                    if "operations-train-" in k and k.endswith("output/model.tar.gz"):
+                        candidates.append(k)
+            if not candidates:
+                logger.warning("No operations-train-*/output/model.tar.gz under s3://%s/%s", bucket, prefix)
+                return
+            candidates.sort(reverse=True)
+            key = candidates[0]
+        logger.info("Downloading operations model from s3://%s/%s", bucket, key)
+        cache_dir = os.environ.get("OPERATIONS_MODEL_CACHE_DIR") or tempfile.mkdtemp(prefix="operations_models_")
+        os.makedirs(cache_dir, exist_ok=True)
+        local_tar = os.path.join(cache_dir, "model.tar.gz")
+        s3.download_file(bucket, key, local_tar)
+        with tarfile.open(local_tar, "r:gz") as tf:
+            tf.extractall(cache_dir)
+        try:
+            os.remove(local_tar)
+        except OSError:
+            pass
+        os.environ["OPERATIONS_MODELS_DIR"] = cache_dir
+        _OPERATIONS_MODELS_S3_SYNCED = True
+        logger.info("Operations models loaded from S3 -> %s (ORGANIZATION_ID from env)", cache_dir)
+    except Exception as e:
+        logger.warning("Failed to sync operations models from S3: %s", e)
+
 
 def get_project_root() -> Path:
     """Get the project root directory."""
@@ -32,7 +98,8 @@ def get_project_root() -> Path:
 
 
 def get_models_dir() -> Path:
-    """Get the models directory path. Uses OPERATIONS_MODELS_DIR env if set (e.g. SageMaker /opt/ml/model)."""
+    """Get the models directory. Syncs from S3 if S3_BUCKET and ORGANIZATION_ID set."""
+    _ensure_operations_models_from_s3()
     return Path(os.environ.get("OPERATIONS_MODELS_DIR", str(_DEFAULT_MODELS_DIR)))
 
 

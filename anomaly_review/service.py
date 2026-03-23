@@ -20,13 +20,13 @@ Orchestrates:
 import sys
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Dict, List, Optional
 
 import pandas as pd
 import numpy as np
-import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,8 +50,7 @@ from anomaly_review.data import (
     has_recent_anomaly,
     get_existing_anomaly_event_date,
     fetch_sensor_metadata,
-    get_snowflake_conn,
-    get_db_url,
+    write_anomaly_reviews_to_s3,
 )
 
 from anomaly_review.checkers import (
@@ -520,6 +519,7 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         safe_impact_metrics = _clean_for_json(finding.get('impact_payload') or {})
 
         enriched_results.append({
+            "id": str(uuid.uuid4()),
             "well_id": well_id,
             "event_date": str(finding['event_date']),
             "detected_at": finding['detected_at'],
@@ -571,154 +571,11 @@ def save_reviews(reviews):
     org_id = get_organization_id()
 
     # ------------------------------------------------------------------
-    # --- POSTGRES SAVE (ACTIVE) ---
+    # --- S3 SAVE (output parquet; same layout as operations) ---
     # ------------------------------------------------------------------
-    url = get_db_url()
-    if url:
-        try:
-            with psycopg2.connect(url) as conn:
-                with conn.cursor() as cur:
-                    if org_id:
-                        q = '''
-                            INSERT INTO anomaly_review
-                            (organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
-                             title, ui_text, impact_value, impact_metrics, chart_data, status)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
-                            detected_at = EXCLUDED.detected_at,
-                            severity = EXCLUDED.severity,
-                            title = EXCLUDED.title,
-                            ui_text = EXCLUDED.ui_text,
-                            impact_value = EXCLUDED.impact_value,
-                            impact_metrics = EXCLUDED.impact_metrics,
-                            chart_data = EXCLUDED.chart_data,
-                            status = EXCLUDED.status
-                        '''
-                        for r in cleaned_reviews:
-                            cur.execute(q, (
-                                org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                                r['category'], r['severity'], r['title'],
-                                json.dumps(r['ui_text']),
-                                r['impact_value'],
-                                json.dumps(r['impact_metrics']),
-                                json.dumps(r['chart_data']),
-                                r['status']
-                            ))
-                    else:
-                        q = '''
-                            INSERT INTO anomaly_review
-                            (well_id, event_date, detected_at, anomaly_code, category, severity,
-                             title, ui_text, impact_value, impact_metrics, chart_data, status)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (well_id, anomaly_code, event_date) DO UPDATE SET
-                            detected_at = EXCLUDED.detected_at,
-                            severity = EXCLUDED.severity,
-                            title = EXCLUDED.title,
-                            ui_text = EXCLUDED.ui_text,
-                            impact_value = EXCLUDED.impact_value,
-                            impact_metrics = EXCLUDED.impact_metrics,
-                            chart_data = EXCLUDED.chart_data,
-                            status = EXCLUDED.status
-                        '''
-                        for r in cleaned_reviews:
-                            cur.execute(q, (
-                                r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                                r['category'], r['severity'], r['title'],
-                                json.dumps(r['ui_text']),
-                                r['impact_value'],
-                                json.dumps(r['impact_metrics']),
-                                json.dumps(r['chart_data']),
-                                r['status']
-                            ))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"PostgreSQL Save failed: {e}")
-
-    # ------------------------------------------------------------------
-    # --- SNOWFLAKE SAVE (ACTIVE) ---
-    # ------------------------------------------------------------------
-    try:
-        with get_snowflake_conn() as conn:
-            cur = conn.cursor()
-            if org_id:
-                update_q = """
-                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
-                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s, organization_id = %s
-                    WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
-                """
-                insert_q = """
-                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                    (id, organization_id, well_id, event_date, detected_at, anomaly_code, category, severity,
-                     title, ui_text, impact_value, impact_metrics, chart_data, status)
-                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
-                           PARSE_JSON(%s), PARSE_JSON(%s), %s
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s AND (organization_id = %s OR organization_id IS NULL)
-                    )
-                """
-                for r in cleaned_reviews:
-                    cur.execute(update_q, (
-                        r['detected_at'], r['severity'], r['title'],
-                        json.dumps(r['ui_text']),
-                        r['impact_value'],
-                        json.dumps(r['impact_metrics']),
-                        json.dumps(r['chart_data']),
-                        r['status'], org_id,
-                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
-                    ))
-                    cur.execute(insert_q, (
-                        org_id, r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                        r['category'], r['severity'], r['title'],
-                        json.dumps(r['ui_text']),
-                        r['impact_value'],
-                        json.dumps(r['impact_metrics']),
-                        json.dumps(r['chart_data']),
-                        r['status'],
-                        r['well_id'], r['anomaly_code'], r['event_date'], org_id
-                    ))
-            else:
-                update_q = """
-                    UPDATE AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                    SET detected_at = %s, severity = %s, title = %s, ui_text = PARSE_JSON(%s),
-                        impact_value = %s, impact_metrics = PARSE_JSON(%s), chart_data = PARSE_JSON(%s), status = %s
-                    WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
-                """
-                insert_q = """
-                    INSERT INTO AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                    (id, well_id, event_date, detected_at, anomaly_code, category, severity,
-                     title, ui_text, impact_value, impact_metrics, chart_data, status)
-                    SELECT UUID_STRING(), %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s,
-                           PARSE_JSON(%s), PARSE_JSON(%s), %s
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW
-                        WHERE well_id = %s AND anomaly_code = %s AND event_date = %s
-                    )
-                """
-                for r in cleaned_reviews:
-                    cur.execute(update_q, (
-                        r['detected_at'], r['severity'], r['title'],
-                        json.dumps(r['ui_text']),
-                        r['impact_value'],
-                        json.dumps(r['impact_metrics']),
-                        json.dumps(r['chart_data']),
-                        r['status'],
-                        r['well_id'], r['anomaly_code'], r['event_date']
-                    ))
-                    cur.execute(insert_q, (
-                        r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
-                        r['category'], r['severity'], r['title'],
-                        json.dumps(r['ui_text']),
-                        r['impact_value'],
-                        json.dumps(r['impact_metrics']),
-                        json.dumps(r['chart_data']),
-                        r['status'],
-                        r['well_id'], r['anomaly_code'], r['event_date']
-                    ))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"Snowflake Save failed: {e}")
+    s3_key = write_anomaly_reviews_to_s3(cleaned_reviews)
+    if s3_key:
+        logger.info("Anomaly reviews written to S3: %s", s3_key)
 
 if __name__ == "__main__":
     wid = sys.argv[1] if len(sys.argv) > 1 else "Well_001_RodPump"

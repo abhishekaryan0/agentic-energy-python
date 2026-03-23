@@ -5,77 +5,124 @@ Sensor configuration loader - fetches lift types, sensor definitions and rules f
 
 import os
 import logging
+from functools import lru_cache
+from typing import Dict, List
+
+import pandas as pd
+
 from dotenv import load_dotenv
-from snowflake.connector import connect as snowflake_connect
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SNOWFLAKE_CONFIG = {
-    'user': os.getenv('SNOWFLAKE_USER'),
-    'password': os.getenv('SNOWFLAKE_PASSWORD'),
-    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-    'database': os.getenv('SNOWFLAKE_DATABASE'),
-    'schema': os.getenv('SNOWFLAKE_SCHEMA'),
-    'role': os.getenv('SNOWFLAKE_ROLE')
-}
-
 # Cache for config
 _config_cache = {}
 
+
 def get_db_connection():
-    """Get Snowflake connection."""
-    return snowflake_connect(**SNOWFLAKE_CONFIG)
+    """
+    Legacy stub kept for backward compatibility.
+    In S3-only mode we no longer connect to Snowflake; callers should avoid using this.
+    """
+    raise RuntimeError("Snowflake is disabled in this deployment (S3-only mode).")
+
+
+@lru_cache(maxsize=1)
+def _load_sensor_ranges_from_parquet() -> pd.DataFrame:
+    """
+    Load sensor_ranges from S3 parquet, using either:
+    - SENSOR_RANGES_S3_URI env, or
+    - s3://S3_BUCKET/ORGANIZATION_ID/sensor_data/sensor_ranges.parquet
+    """
+    uri = os.getenv("SENSOR_RANGES_S3_URI", "").strip()
+    if not uri:
+        bucket = os.getenv("S3_BUCKET", "").strip()
+        org = os.getenv("ORGANIZATION_ID", "").strip()
+        if bucket and org:
+            uri = f"s3://{bucket}/{org}/sensor_data/sensor_ranges.parquet"
+    if not uri:
+        raise RuntimeError("Sensor ranges parquet URI not configured (SENSOR_RANGES_S3_URI or S3_BUCKET/ORGANIZATION_ID).")
+
+    try:
+        if uri.startswith("s3://"):
+            import boto3
+            import io
+            from urllib.parse import urlparse
+
+            parsed = urlparse(uri)
+            bucket, key = parsed.netloc, parsed.path.lstrip("/")
+            s3 = boto3.client("s3")
+            buf = io.BytesIO()
+            s3.download_fileobj(bucket, key, buf)
+            buf.seek(0)
+            df = pd.read_parquet(buf)
+        else:
+            df = pd.read_parquet(uri)
+    except Exception as e:
+        logger.error(f"Failed to load sensor_ranges parquet from {uri}: {e}")
+        raise
+
+    # Normalize columns
+    df.columns = [c.lower() for c in df.columns]
+    # Backward compat: some parquet use 'lift_type_name' instead of 'lift_type'
+    if "lift_type" not in df.columns and "lift_type_name" in df.columns:
+        df = df.rename(columns={"lift_type_name": "lift_type"})
+    # Expected columns (case-insensitive): lift_type, field_name, min_value, max_value, unit, is_form_field, display_order, sensor_name?
+    if "lift_type" not in df.columns or "field_name" not in df.columns:
+        raise RuntimeError(
+            f"sensor_ranges parquet at {uri} is missing required columns (lift_type, field_name). "
+            f"Columns: {list(df.columns)}"
+        )
+
+    return df
 
 def get_lift_types():
-    """Fetch all lift types from DB."""
-    if 'lift_types' in _config_cache:
-        return _config_cache['lift_types']
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id, lift_type_name FROM lift_types ORDER BY lift_type_name")
-    lift_types = {row[1]: row[0] for row in cursor.fetchall()}
-    
-    conn.close()
-    _config_cache['lift_types'] = lift_types
+    """
+    Fetch all lift types from sensor_ranges parquet.
+    Returns dict {lift_type_name: index_id}.
+    """
+    if "lift_types" in _config_cache:
+        return _config_cache["lift_types"]
+
+    df = _load_sensor_ranges_from_parquet()
+    lift_types_list = sorted(df["lift_type"].dropna().astype(str).unique().tolist())
+    lift_types = {name: i + 1 for i, name in enumerate(lift_types_list)}
+    _config_cache["lift_types"] = lift_types
     return lift_types
 
 def get_sensors_for_lift_type(lift_type_name):
-    """Fetch sensor definitions for a specific lift type."""
-    cache_key = f'sensors_{lift_type_name}'
+    """
+    Fetch sensor definitions for a specific lift type.
+
+    Backed by sensor_ranges.parquet in S3. Expects columns:
+      - lift_type, field_name, min_value, max_value, unit
+      - Optional: sensor_name, is_form_field, display_order
+    """
+    cache_key = f"sensors_{lift_type_name}"
     if cache_key in _config_cache:
         return _config_cache[cache_key]
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT sd.id, sd.sensor_name, sd.field_name, sd.unit, 
-               sd.min_value, sd.max_value, sd.is_form_field, sd.display_order
-        FROM sensor_definitions sd
-        JOIN lift_types lt ON sd.lift_type_id = lt.id
-        WHERE lt.lift_type_name = %s
-        ORDER BY sd.display_order
-    """, (lift_type_name,))
-    
-    sensors = []
-    for row in cursor.fetchall():
-        sensors.append({
-            'id': row[0],
-            'name': row[1],
-            'field_name': row[2],
-            'unit': row[3],
-            'min': row[4],
-            'max': row[5],
-            'is_form_field': row[6],
-            'display_order': row[7]
-        })
-    
-    conn.close()
+
+    df = _load_sensor_ranges_from_parquet()
+    sub = df[df["lift_type"].astype(str) == str(lift_type_name)]
+    if sub.empty:
+        sensors: List[Dict] = []
+    else:
+        sensors = []
+        for idx, row in sub.iterrows():
+            sensors.append(
+                {
+                    "id": idx,
+                    "name": row.get("sensor_name") or row.get("field_name"),
+                    "field_name": row.get("field_name"),
+                    "unit": row.get("unit"),
+                    "min": row.get("min_value"),
+                    "max": row.get("max_value"),
+                    "is_form_field": bool(row.get("is_form_field", True)),
+                    "display_order": int(row.get("display_order", idx)),
+                }
+            )
+
     _config_cache[cache_key] = sensors
     return sensors
 

@@ -22,9 +22,19 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
-from anomaly_review.config import MODEL_DIR, MODEL_CACHE_DAYS, LIFT_TYPE_FEATURES, AUTOENCODER_THRESHOLD_SIGMA
+from anomaly_review.config import (
+    MODEL_DIR,
+    MODEL_CACHE_DAYS,
+    LIFT_TYPE_FEATURES,
+    AUTOENCODER_THRESHOLD_SIGMA,
+    get_anomaly_review_model_s3_base,
+    get_organization_id,
+)
 
 logger = logging.getLogger('AnomalyReviewModels')
+
+# One-time sync of review models from S3 (bucket + ORGANIZATION_ID from env)
+_REVIEW_MODELS_S3_SYNCED = False
 
 # =============================================================================
 # TORCH AVAILABILITY CHECK
@@ -475,12 +485,81 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
 
 
 # =============================================================================
+# S3 MODEL SYNC (trained model from SageMaker output; ORGANIZATION_ID from env)
+# =============================================================================
+
+def _ensure_review_models_from_s3() -> None:
+    """
+    If S3_BUCKET and ORGANIZATION_ID are set, download the latest review-train-* model
+    from s3://BUCKET/{ORGANIZATION_ID}/model/review-train-*/output/model.tar.gz,
+    extract to a local cache, and set MODEL_DIR. Uses ORGANIZATION_ID from env always.
+    Only runs once per process.
+    """
+    global _REVIEW_MODELS_S3_SYNCED
+    if _REVIEW_MODELS_S3_SYNCED:
+        return
+    base = get_anomaly_review_model_s3_base()
+    if not base:
+        return
+    try:
+        import tarfile
+        import tempfile
+        from urllib.parse import urlparse
+        import boto3
+        s3 = boto3.client("s3")
+        parsed = urlparse(base)
+        bucket = parsed.netloc
+        prefix = (parsed.path or "").lstrip("/")
+        if not prefix:
+            prefix = ""
+        elif not prefix.endswith("/"):
+            prefix = prefix + "/"
+        # ANOMALY_REVIEW_MODEL_S3_URI can be full URI to model.tar.gz
+        if base.rstrip("/").endswith("model.tar.gz"):
+            key = parsed.path.lstrip("/")
+            tarball_uri = base
+        else:
+            # List under prefix to find latest review-train-*/output/model.tar.gz
+            paginator = s3.get_paginator("list_objects_v2")
+            candidates = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    k = obj["Key"]
+                    if "review-train-" in k and k.endswith("output/model.tar.gz"):
+                        candidates.append(k)
+            if not candidates:
+                logger.warning("No review-train-*/output/model.tar.gz found under s3://%s/%s", bucket, prefix)
+                return
+            candidates.sort(reverse=True)  # e.g. review-train-20260309-1613/output/model.tar.gz
+            key = candidates[0]
+            tarball_uri = f"s3://{bucket}/{key}"
+        logger.info("Downloading anomaly review model from %s", tarball_uri)
+        cache_dir = os.environ.get("ANOMALY_REVIEW_MODEL_CACHE_DIR") or tempfile.mkdtemp(prefix="anomaly_review_models_")
+        os.makedirs(cache_dir, exist_ok=True)
+        local_tar = os.path.join(cache_dir, "model.tar.gz")
+        s3.download_file(bucket, key, local_tar)
+        with tarfile.open(local_tar, "r:gz") as tf:
+            tf.extractall(cache_dir)
+        try:
+            os.remove(local_tar)
+        except OSError:
+            pass
+        os.environ["MODEL_DIR"] = cache_dir
+        _REVIEW_MODELS_S3_SYNCED = True
+        logger.info("Anomaly review models loaded from S3 -> %s (ORGANIZATION_ID from env)", cache_dir)
+    except Exception as e:
+        logger.warning("Failed to sync anomaly review models from S3: %s", e)
+
+
+# =============================================================================
 # MODEL PERSISTENCE
 # =============================================================================
 
 def get_model_dir(well_id: str) -> str:
-    """Get or create model directory for a well."""
-    path = os.path.join(MODEL_DIR, well_id)
+    """Get or create model directory for a well. Uses MODEL_DIR env; syncs from S3 if bucket+ORGANIZATION_ID set."""
+    _ensure_review_models_from_s3()
+    base = os.environ.get("MODEL_DIR", MODEL_DIR)
+    path = os.path.join(base, well_id)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -594,6 +673,82 @@ def load_models_from_disk(well_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.warning(f"Failed to load cached models for {well_id}: {e}")
         return None
+
+
+# =============================================================================
+# PARQUET-BASED TRAINING (SageMaker / S3)
+# =============================================================================
+
+# Map digital twin daily_production.parquet columns -> anomaly_review expected names
+_DAILY_PROD_TO_REVIEW = {
+    "true_oil": "oil_volume",
+    "true_water": "water_volume",
+    "true_gas": "gas_volume",
+    "avg_tubing_pressure": "tubing_pressure",
+    "avg_casing_pressure": "casing_pressure",
+    "spm": "strokes_per_minute",
+    "pump_fillage_pct": "pump_fillage",
+    "avg_motor_amps": "motor_current",
+    "motor_temp_f": "motor_temp",
+    "injection_rate_mcf": "injection_rate",
+    "gross_stroke_len": "surface_stroke_length",
+}
+
+
+def load_daily_production_for_review(path: str) -> pd.DataFrame:
+    """
+    Load daily production parquet (local or s3://) and rename columns for anomaly_review training.
+    """
+    if path.startswith("s3://"):
+        try:
+            import boto3
+            from urllib.parse import urlparse
+            parsed = urlparse(path)
+            bucket, key = parsed.netloc, parsed.path.lstrip("/")
+            s3 = boto3.client("s3")
+            buf = __import__("io").BytesIO()
+            s3.download_fileobj(bucket, key, buf)
+            buf.seek(0)
+            df = pd.read_parquet(buf)
+        except Exception as e:
+            logger.error("Failed to load parquet from S3 %s: %s", path, e)
+            raise
+    else:
+        df = pd.read_parquet(path)
+    df = df.copy()
+    for old_name, new_name in _DAILY_PROD_TO_REVIEW.items():
+        if old_name in df.columns:
+            df[new_name] = df[old_name]
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def train_all_review_models_from_parquet(parquet_path: str, output_dir: str) -> None:
+    """
+    Train per-well review models (RF + autoencoder) from daily_production.parquet; write to output_dir.
+    Sets MODEL_DIR env so get_model_dir uses output_dir. Used by SageMaker training job.
+    """
+    os.environ["MODEL_DIR"] = output_dir
+    logger.info("Training anomaly_review models from %s -> %s", parquet_path, output_dir)
+    df = load_daily_production_for_review(parquet_path)
+    well_col = "asset_id" if "asset_id" in df.columns else "well_id"
+    if well_col not in df.columns:
+        raise ValueError(f"Parquet must have asset_id or well_id; columns: {list(df.columns)[:20]}")
+    well_ids = df[well_col].dropna().astype(str).unique().tolist()
+    logger.info("Wells to train: %s", len(well_ids))
+    for well_id in well_ids:
+        well_df = df[df[well_col].astype(str) == well_id].copy()
+        if "date" in well_df.columns:
+            well_df = well_df.sort_values("date")
+        if len(well_df) < 60:
+            logger.info("Skip %s: insufficient rows (%s)", well_id, len(well_df))
+            continue
+        try:
+            get_or_train_model(well_id, well_df, force_retrain=True)
+        except Exception as e:
+            logger.warning("Failed to train review model for %s: %s", well_id, e)
+    logger.info("Anomaly review training from parquet complete. Output: %s", output_dir)
 
 
 # =============================================================================

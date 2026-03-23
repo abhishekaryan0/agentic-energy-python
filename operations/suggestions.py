@@ -1,6 +1,6 @@
 """
 Database operations for operational recommendations and suggestions.
-Handles both Snowflake (anomalies) and PostgreSQL (operation suggestions) storage.
+PostgreSQL (operation_suggestion) storage only; S3 for data and models.
 """
 
 import json

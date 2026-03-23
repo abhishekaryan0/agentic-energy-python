@@ -19,9 +19,9 @@ Quick Start:
     >>> analyzer = TrendAnalyzer(sensor_df, lift_type='ESP')
     >>> metrics = analyzer.compute_metrics()
     >>> 
-    >>> # Get recommendations
-    >>> engine = RuleEngine(snowflake_conn)
-    >>> recommendations = engine.apply(well_id, metrics)
+    >>> # Get recommendations (metrics from S3 parquet; RuleEngine(conn=None) for rules only)
+    >>> from operations.recommendations.persistence import recommend_from_metrics
+    >>> recs = recommend_from_metrics(well_id, lift_type, metrics, confidence_threshold=0.6)
 
 Configuration:
     >>> from operations import RecommendationConfig, TrainingConfig
@@ -104,55 +104,22 @@ from operations.recommendations.rules import (
 
 from operations.recommendations.persistence import (
     predict_category,
-    predict_all_wells,
     load_model,
     get_model_for_lift_type,
     predict_with_model,
-    generate_recommendations_for_well,
-    detect_and_persist,
-    save_recommendation_to_snowflake,
+    recommend_from_metrics,
+    write_operations_recommendations_to_s3,
     _features_from_metrics,
 )
 
-# ============================================================================
-# TRAINING FUNCTIONS
-# ============================================================================
-
-from operations.recommendations.persistence import (
-    train_with_synthetic_labels,
-    train_from_snowflake,
-    train_on_two_wells,
-)
-
 from operations.train_models import (
-    train_category_model,
+    train_operations_from_parquet,
+    train_with_synthetic_labels,
+    build_metrics_from_parquet,
 )
 
 # ============================================================================
-# SUGGESTIONS (OpenAI Integration)
-# ============================================================================
-
-from operations.suggestions import (
-    # Table management
-    create_operation_suggestion_table,
-    
-    # OpenAI generation
-    generate_operation_suggestion_with_openai,
-    infer_action_category_priority,
-    refine_suggestion_with_openai,
-    
-    # CRUD operations
-    save_operation_suggestion,
-    get_operation_suggestions,
-    update_operation_suggestion_status,
-    get_operation_suggestion_detail,
-    
-    # Pipeline streaming
-    stream_run_operational_pipeline,
-)
-
-# ============================================================================
-# PUBLIC API
+# PUBLIC API (no PostgreSQL; model + output use S3 only)
 # ============================================================================
 
 __all__ = [
@@ -200,28 +167,14 @@ __all__ = [
     
     # Prediction functions
     'predict_category',
-    'predict_all_wells',
     'load_model',
     'get_model_for_lift_type',
     'predict_with_model',
-    'generate_recommendations_for_well',
-    'detect_and_persist',
-    'save_recommendation_to_snowflake',
+    'recommend_from_metrics',
+    'write_operations_recommendations_to_s3',
     
-    # Training functions
+    # Training (S3/parquet only)
+    'train_operations_from_parquet',
     'train_with_synthetic_labels',
-    'train_from_snowflake',
-    'train_on_two_wells',
-    'train_category_model',
-    
-    # Suggestions functions
-    'create_operation_suggestion_table',
-    'generate_operation_suggestion_with_openai',
-    'infer_action_category_priority',
-    'refine_suggestion_with_openai',
-    'save_operation_suggestion',
-    'get_operation_suggestions',
-    'update_operation_suggestion_status',
-    'get_operation_suggestion_detail',
-    'stream_run_operational_pipeline',
+    'build_metrics_from_parquet',
 ]

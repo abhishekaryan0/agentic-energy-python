@@ -69,18 +69,16 @@ from anomaly_review.config import (
 # =============================================================================
 
 from anomaly_review.data import (
-    # Database connections
-    get_snowflake_conn,
-    get_db_url,
     get_openai_client,
-    
-    # Data fetching
     fetch_well_data,
     fetch_all_active_wells,
     get_recent_anomaly_history,
     
     # Data processing
     calculate_rolling_baseline,
+    
+    # S3 output
+    write_anomaly_reviews_to_s3,
 )
 
 # =============================================================================
@@ -162,14 +160,19 @@ from anomaly_review.llm import (
 )
 
 # =============================================================================
-# CORE SERVICE
+# CORE SERVICE (optional; needs psycopg2 - not in SageMaker training image)
 # =============================================================================
 
-from anomaly_review.service import (
-    detect_anomalies,
-    select_top_anomalies_per_well,
-    save_reviews,
-)
+try:
+    from anomaly_review.service import (
+        detect_anomalies,
+        select_top_anomalies_per_well,
+        save_reviews,
+    )
+except ImportError:
+    detect_anomalies = None
+    select_top_anomalies_per_well = None
+    save_reviews = None
 
 # =============================================================================
 # BATCH RUNNER
@@ -209,13 +212,12 @@ __all__ = [
     'format_number',
     
     # Data functions
-    'get_snowflake_conn',
-    'get_db_url',
     'get_openai_client',
     'fetch_well_data',
     'fetch_all_active_wells',
     'get_recent_anomaly_history',
     'calculate_rolling_baseline',
+    'write_anomaly_reviews_to_s3',
     
     # Checkers
     'determine_severity',

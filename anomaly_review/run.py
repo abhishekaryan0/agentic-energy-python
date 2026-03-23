@@ -20,8 +20,8 @@ from typing import Dict, List
 from dotenv import load_dotenv
 
 from anomaly_review.config import BatchConfig, DEFAULT_BATCH_CONFIG
-from anomaly_review.data import get_snowflake_conn
-from anomaly_review.service import detect_anomalies
+from anomaly_review.data import fetch_all_active_wells
+from anomaly_review.service import detect_anomalies, save_reviews
 
 load_dotenv()
 
@@ -53,43 +53,31 @@ BATCH_CONFIG = DEFAULT_BATCH_CONFIG
 # =============================================================================
 
 def get_all_active_wells() -> List[str]:
-    """Fetch list of wells that have any sensor data. Data per well uses that well's real last N days."""
-    try:
-        conn = get_snowflake_conn()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT DISTINCT well_id FROM well_sensor_readings ORDER BY well_id
-        """)
-        wells = [row[0] for row in cursor.fetchall()]
-        cursor.close()
-        conn.close()
-        return wells
-    except Exception as e:
-        logger.error(f"Failed to fetch well list: {e}")
-        return []
+    """Fetch list of wells from S3 sensor parquet (well_sensor_readings.parquet)."""
+    return fetch_all_active_wells()
 
 
 # =============================================================================
 # PROCESS SINGLE WELL
 # =============================================================================
 
-def process_single_well(well_id: str) -> Dict:
-    """Wrapper function for parallel execution."""
+def process_single_well(well_id: str, save_to_db: bool = False) -> Dict:
+    """Wrapper function for parallel execution. When save_to_db=False, caller will batch-write to S3."""
     try:
-        results = detect_anomalies(well_id)
-
+        results = detect_anomalies(well_id, save_to_db=save_to_db)
         return {
             "well_id": well_id,
             "count": len(results),
+            "results": results,
             "titles": [r.get("title") for r in results],
             "status": "success",
         }
-
     except Exception as e:
         logger.error(f"Error processing {well_id}: {e}")
         return {
             "well_id": well_id,
             "count": 0,
+            "results": [],
             "status": "failed",
             "error": str(e),
         }
@@ -118,10 +106,10 @@ def run_batch(config=None):
     # Fetch wells: any well with sensor data; each well's data uses that well's real last N days
     wells = get_all_active_wells()
     if not wells:
-        logger.error("No wells found in well_sensor_readings. Exiting.")
+        logger.error("No wells found (S3_BUCKET and sensor_data parquet required). Exiting.")
         return
 
-    # Test mode logic
+    # Test mode is disabled by default (BatchConfig.test_mode=False). Set test_mode=True for single-well or limited runs.
     if config.test_mode:
         logger.warning("⚠️  TEST MODE ENABLED")
 
@@ -145,24 +133,26 @@ def run_batch(config=None):
         "failed": 0,
         "anomalies_found": 0,
     }
+    all_reviews = []
 
-    # Parallel processing
+    # Parallel processing (save_to_db=False so we write one S3 parquet per run)
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_to_well = {
-            executor.submit(process_single_well, well): well
+            executor.submit(process_single_well, well, False): well
             for well in wells
         }
- 
+
         for i, future in enumerate(as_completed(future_to_well)):
             result = future.result()
- 
+
             sys.stdout.write(f"\rProgress: {i + 1}/{len(wells)}")
             sys.stdout.flush()
- 
+
             if result["status"] == "success":
                 stats["processed"] += 1
                 stats["anomalies_found"] += result["count"]
- 
+                all_reviews.extend(result.get("results", []))
+
                 if result["count"] > 0:
                     sys.stdout.write("\n")
                     logger.info(
@@ -175,7 +165,11 @@ def run_batch(config=None):
                 logger.error(
                     f"[-] {result['well_id']} failed: {result.get('error')}"
                 )
- 
+
+    # Single batch write to S3 (and Postgres if DATABASE_URL set)
+    if all_reviews:
+        save_reviews(all_reviews)
+
     total_time = time.time() - start_time
  
     logger.info("\n" + "=" * 60)

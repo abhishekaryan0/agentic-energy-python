@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Integrated Operational Recommendations Pipeline
-================================================
+Integrated Operational Recommendations Pipeline (S3 only: model load, input, output).
+====================================================================================
 
-This script runs the complete operational recommendations pipeline:
+1. Optionally trains models from S3 parquet (train_operations_from_parquet).
+2. Builds metrics from S3 parquet (s3://BUCKET/{ORGANIZATION_ID}/sensor_data/).
+3. Runs recommend_from_metrics (model loaded from S3 via get_models_dir()).
+4. Writes recommendations to S3 only (write_operations_recommendations_to_s3).
 
-1. Trains models (via train_operational_models) on all well data
-2. Runs predictions on all wells (via operational_recommendations)
-3. For each detected recommendation:
-   - Stores in Snowflake (operation_recommendation table)
-   - Stores in PostgreSQL (operation_suggestion table with OpenAI details)
-4. Generates a comprehensive report
-
-Usage:
-    python -m operations.run_pipeline
-    python -m operations.run_pipeline --skip-training
-    python -m operations.run_pipeline --confidence 0.8
+No PostgreSQL. Env: S3_BUCKET, ORGANIZATION_ID.
 """
 
 import sys
@@ -23,44 +16,20 @@ import os
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-# Ensure project root is on path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Import shared utilities
-from operations.utils import get_project_root, get_models_dir, get_model_path
-
-MODELS_DIR = get_models_dir()
-
+from operations.utils import get_models_dir, get_model_path
+from operations.train_models import build_metrics_from_parquet, train_operations_from_parquet
 from operations.recommendations.persistence import (
-    train_with_synthetic_labels,
-    predict_all_wells,
-    load_model,
-    generate_recommendations_for_well,
-)
-from operations.recommendations.rules import ACTION_CATEGORY_MAP
-
-# Use shared get_model_path
-_get_model_path = get_model_path
-
-from operations.suggestions import (
-    save_operation_suggestion,
-    get_operation_suggestions,
-    create_operation_suggestion_table,
-    infer_action_category_priority
+    recommend_from_metrics,
+    write_operations_recommendations_to_s3,
 )
 
 from dotenv import load_dotenv
-try:
-    from snowflake.connector import connect as snowflake_connect
-except Exception:
-    # Keep import failure explicit so downstream connection code can surface a clear error
-    snowflake_connect = None
-
 load_dotenv()
 
 logging.basicConfig(
@@ -69,367 +38,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_get_model_path = get_model_path
 
-def get_snowflake_connection():
+
+def _get_s3_parquet_paths() -> tuple:
+    """Return (sensor_uri, production_uri) from S3_BUCKET and ORGANIZATION_ID."""
+    bucket = os.getenv("S3_BUCKET", "").strip()
+    org = os.getenv("ORGANIZATION_ID", "").strip()
+    if not bucket or not org:
+        raise ValueError("S3_BUCKET and ORGANIZATION_ID are required for run_pipeline (S3-only).")
+    base = f"{org}/sensor_data"
+    return (
+        f"s3://{bucket}/{base}/well_sensor_readings.parquet",
+        f"s3://{bucket}/{base}/daily_production.parquet",
+    )
+
+
+def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75) -> Dict[str, Any]:
     """
-    Create Snowflake connection.
+    Execute the operational recommendations pipeline (S3 only).
 
-    Raises:
-        RuntimeError: if the Snowflake connector is unavailable.
-        ValueError: if required configuration values are missing.
-    """
-    if snowflake_connect is None:
-        raise RuntimeError("Snowflake connector is not installed or failed to import.")
-    SNOWFLAKE_CONFIG = {
-        'user': os.getenv('SNOWFLAKE_USER'),
-        'password': os.getenv('SNOWFLAKE_PASSWORD'),
-        'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-        'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-        'database': os.getenv('SNOWFLAKE_DATABASE'),
-        'schema': os.getenv('SNOWFLAKE_SCHEMA'),
-        'role': os.getenv('SNOWFLAKE_ROLE')
-    }
-    REQUIRED_KEYS = ['user', 'password', 'account', 'warehouse', 'database', 'schema', 'role']
-    missing = [k for k in REQUIRED_KEYS if not SNOWFLAKE_CONFIG.get(k)]
-    if missing:
-        raise ValueError(f"Missing Snowflake configuration: {missing}")
-    try:
-        conn = snowflake_connect(**SNOWFLAKE_CONFIG)
-        return conn
-    except Exception as e:
-        logger.error(f"Failed to connect to Snowflake: {e}")
-        raise
-
-
-def get_well_metrics(snowflake_conn, well_id):
-    """Retrieve production and sensor metrics for a well."""
-    try:
-        cur = snowflake_conn.cursor()
-        
-        # Get latest sensor metrics
-        cur.execute("""
-            SELECT 
-                motor_current, motor_temp, surface_pressure,
-                tubing_pressure, casing_pressure, wellhead_temp
-            FROM well_sensor_readings 
-            WHERE well_id = %s
-            ORDER BY timestamp DESC 
-            LIMIT 1
-        """, (well_id,))
-        
-        sensor_row = cur.fetchone()
-        sensor_metrics = {}
-        if sensor_row:
-            cols = [d[0].lower() for d in cur.description]
-            sensor_metrics = {cols[i]: sensor_row[i] for i in range(len(cols))}
-        
-        # Get latest production metrics
-        cur.execute("""
-            SELECT 
-                oil_volume, gas_volume, water_volume
-            FROM well_daily_production
-            WHERE well_id = %s
-            ORDER BY date DESC
-            LIMIT 1
-        """, (well_id,))
-        
-        prod_row = cur.fetchone()
-        production_metrics = {}
-        if prod_row:
-            cols = [d[0].lower() for d in cur.description]
-            production_metrics = {cols[i]: prod_row[i] for i in range(len(cols))}
-        
-        cur.close()
-        return production_metrics, sensor_metrics
-    
-    except Exception as e:
-        logger.error(f"Error retrieving metrics for {well_id}: {e}")
-        return {}, {}
-
-
-def process_recommendations(predictions, snowflake_conn):
-    """
-    Process predicted recommendations and store in both databases.
-    
-    Args:
-        predictions: List of dicts from predict_all_wells()
-        snowflake_conn: Snowflake connection
-    
-    Returns:
-        Dict with summary statistics
-    """
-    logger.info("=" * 80)
-    logger.info("Processing Recommendations for Database Storage")
-    logger.info("=" * 80)
-    
-    stats = {
-        'total_processed': 0,
-        'saved_snowflake': 0,
-        'saved_postgres': 0,
-        'failed': 0,
-        'details': []
-    }
-    
-    for pred in predictions:
-        try:
-            well_id = pred.get('well_id')
-            action = pred.get('action')
-            probability = pred.get('probability', 0.0)
-            
-            logger.info(f"\nProcessing: {well_id} - {action} (confidence: {probability:.0%})")
-            stats['total_processed'] += 1
-            
-            # Get well metrics for context
-            production_data, sensor_metrics = get_well_metrics(snowflake_conn, well_id)
-            
-            # Note: Snowflake storage already handled by predict_all_wells()
-            # So we just need to save to PostgreSQL with OpenAI details
-            
-            logger.info(f"  ↓ Inferring action/category/priority via OpenAI...")
-            inferred = infer_action_category_priority(well_id, production_data, sensor_metrics, hint=action)
-            inferred_action = inferred.get('action')
-            inferred_category = inferred.get('category')
-            inferred_priority = inferred.get('priority')
-
-            # Data-driven priority based on confidence
-            # Thresholds calibrated to actual model performance
-            if probability > 0.55:
-                data_priority = 'HIGH'
-            elif probability > 0.40:
-                data_priority = 'MEDIUM'
-            else:
-                data_priority = 'LOW'
-            
-            # Get detection metrics from the prediction if available
-            detection_metrics = pred.get('detection_metrics', {})
-            
-            # Build data-driven sensor metrics with current vs optimal
-            data_driven_metrics = {
-                **sensor_metrics,
-                'detection': detection_metrics,
-                'confidence': probability,
-                'model_action': action,
-                'inferred_action': inferred_action
-            }
-            
-            logger.info(f"  ↓ Generating OpenAI analysis for PostgreSQL with inferred action/category...")
-            success = save_operation_suggestion(
-                well_id=well_id,
-                action=inferred_action,
-                category=inferred_category,
-                status="New",
-                priority=inferred_priority or pred.get('priority') or data_priority,
-                confidence=probability * 100,  # Convert to percentage
-                production_data=production_data,
-                sensor_metrics=data_driven_metrics,
-                reason=pred.get('reason') or f"ML model prediction with {probability:.0%} confidence",
-                expected_impact=pred.get('expected_impact') or f"Recommendation based on trend analysis and historical patterns"
-            )
-            
-            if success:
-                logger.info(f"  ✓ Saved to PostgreSQL operation_suggestion table")
-                stats['saved_postgres'] += 1
-                stats['details'].append({
-                    'well_id': well_id,
-                    'action': action,
-                    'confidence': probability,
-                    'snowflake': True,
-                    'postgres': True
-                })
-            else:
-                logger.warning(f"  ✗ Failed to save to PostgreSQL")
-                stats['details'].append({
-                    'well_id': well_id,
-                    'action': action,
-                    'confidence': probability,
-                    'snowflake': True,
-                    'postgres': False
-                })
-
-            # Also generate and save rule-based recommendations for the same well
-            try:
-                rule_recs = generate_recommendations_for_well(snowflake_conn, well_id)
-                for rr in rule_recs:
-                    ra = rr.get('action') or rr.get('recommendation') or ''
-                    rcat = rr.get('category') or ACTION_CATEGORY_MAP.get(ra, 'Production')
-                    rprio = rr.get('priority') or 'MEDIUM'
-                    rconf = rr.get('confidence') or rr.get('probability') or 0.0
-                    
-                    # Include detection metrics from rule-based detection
-                    rule_detection_metrics = rr.get('detection_metrics', {})
-                    rule_sensor_metrics = {
-                        **sensor_metrics,
-                        'detection': rule_detection_metrics,
-                        'source': 'rule_based'
-                    }
-                    
-                    saved = save_operation_suggestion(
-                        well_id=well_id,
-                        action=ra,
-                        category=rcat,
-                        status='New',
-                        priority=rprio,
-                        confidence=(rconf * 100) if rconf and rconf <= 1 else rconf,
-                        production_data=production_data,
-                        sensor_metrics=rule_sensor_metrics,
-                        reason=rr.get('reason') or 'Rule-based recommendation',
-                        expected_impact=rr.get('expected_impact', '')
-                    )
-                    if saved:
-                        stats['saved_postgres'] += 1
-            except Exception as e:
-                logger.warning(f"Rule-based recommendations failed for {well_id}: {e}")
-        
-        except Exception as e:
-            logger.error(f"Error processing recommendation for {well_id}: {e}", exc_info=True)
-            stats['failed'] += 1
-    
-    # Snowflake count (already saved by predict_all_wells)
-    stats['saved_snowflake'] = len(predictions)
-    
-    return stats
-
-
-def run_pipeline(skip_training=False, confidence_threshold=0.75):
-    """
-    Execute the complete operational recommendations pipeline.
-    
-    Args:
-        skip_training: Skip model training if True
-        confidence_threshold: Minimum confidence for recommendations (0-1)
-    
-    Returns:
-        Dict with pipeline results
+    - Model: loaded from S3 via get_models_dir() (OPERATIONS_MODEL_S3_URI or s3://BUCKET/{ORG}/model/).
+    - Input: S3 parquet (sensor + production).
+    - Output: S3 parquet (write_operations_recommendations_to_s3).
     """
     try:
         logger.info("=" * 80)
-        logger.info("OPERATIONAL RECOMMENDATIONS PIPELINE")
+        logger.info("OPERATIONAL RECOMMENDATIONS PIPELINE (S3 only)")
         logger.info("=" * 80)
-        logger.info(f"Start Time: {datetime.now(timezone.utc).isoformat()}")
-        logger.info(f"Confidence Threshold: {confidence_threshold:.0%}")
-        
-        # Initialize PostgreSQL table
-        logger.info("\n1. Initializing PostgreSQL...")
-        create_operation_suggestion_table()
-        logger.info("✓ PostgreSQL operation_suggestion table ready")
-        
-        # Connect to Snowflake
-        logger.info("\n2. Connecting to Snowflake...")
-        snowflake_conn = get_snowflake_connection()
-        logger.info("✓ Connected to Snowflake")
-        
-        # Train model
+        logger.info("Start Time: %s", datetime.now(timezone.utc).isoformat())
+        logger.info("Confidence Threshold: %.0f%%", confidence_threshold * 100)
+
+        sensor_uri, prod_uri = _get_s3_parquet_paths()
+        logger.info("S3 input: sensor=%s production=%s", sensor_uri, prod_uri)
+
+        # Trigger model load from S3 (get_models_dir() calls _ensure_operations_models_from_s3)
+        _ = get_models_dir()
+
         train_result = None
         if not skip_training:
-            logger.info("\n3. Training Operational Recommendation Models (per lift-type + fallback)...")
-            model_path = _get_model_path('models/decision_tree_alldata.joblib')
-            train_result = train_with_synthetic_labels(snowflake_conn, model_path=model_path)
-            logger.info(f"✓ Models trained")
-            logger.info(f"  - Samples: {train_result.get('trained_on', 0)}")
-            logger.info(f"  - Label Distribution: {train_result.get('label_distribution', {})}")
-            per_lt = train_result.get('per_lift_type', {})
-            for k, v in per_lt.items():
-                if k == '_fallback':
-                    logger.info(f"  - Fallback: acc={v.get('test_accuracy', 0):.1%}")
-                else:
-                    logger.info(f"  - {k}: acc={v.get('test_accuracy', 0):.1%}, n={v.get('trained_on', 0)}")
+            logger.info("\n1. Training models from S3 parquet...")
+            cache_dir = os.environ.get("OPERATIONS_MODEL_CACHE_DIR") or os.path.join(_PROJECT_ROOT, "models", "operations_run")
+            os.makedirs(cache_dir, exist_ok=True)
+            train_result = train_operations_from_parquet(
+                sensor_uri,
+                prod_uri,
+                cache_dir,
+                model_path=os.path.join(cache_dir, "decision_tree_alldata.joblib"),
+            )
+            logger.info("Models trained (samples etc. in train_result)")
         else:
-            logger.info("\n3. Skipping training (--skip-training)")
-            model_path = _get_model_path('models/decision_tree_alldata.joblib')
-        
-        # Run predictions
-        logger.info("\n4. Running Predictions on All Wells...")
-        logger.info(f"  (Confidence threshold: {confidence_threshold:.0%})")
-        
-        predictions = predict_all_wells(
-            snowflake_conn,
-            model_path=model_path,
-            confidence_threshold=confidence_threshold,
-            dedup_days=7
-        )
-        logger.info(f"✓ Predictions completed: {len(predictions)} recommendations detected")
-        
-        # Process recommendations for both databases
-        logger.info("\n5. Storing Recommendations...")
-        if predictions:
-            stats = process_recommendations(predictions, snowflake_conn)
-        else:
-            logger.info("No high-confidence recommendations detected")
-            stats = {
-                'total_processed': 0,
-                'saved_snowflake': 0,
-                'saved_postgres': 0,
-                'failed': 0,
-                'details': []
+            logger.info("\n1. Skipping training (--skip-training); using existing model from S3/env.")
+
+        logger.info("\n2. Building metrics from S3 parquet...")
+        all_metrics = build_metrics_from_parquet(sensor_uri, prod_uri)
+        if not all_metrics:
+            logger.warning("No metrics built; check S3 parquet paths and data.")
+            return {
+                "status": "success",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "train_result": train_result,
+                "predictions_count": 0,
+                "stats": {"total_processed": 0, "saved_s3": 0, "failed": 0, "details": []},
             }
-        
-        # Verify storage
-        logger.info("\n6. Verifying Storage...")
-        logger.info("  Snowflake: operation_recommendation table")
-        logger.info(f"    - Saved in this run: {stats['saved_snowflake']}")
-        
-        logger.info("  PostgreSQL: operation_suggestion table")
-        postgres_suggestions = get_operation_suggestions(limit=5)
-        logger.info(f"    - Total in table: {len(postgres_suggestions)}")
-        if postgres_suggestions:
-            logger.info(f"    - Latest: {postgres_suggestions[0].get('well_id')} - {postgres_suggestions[0].get('action')}")
-        
-        snowflake_conn.close()
-        
-        # Summary report
-        logger.info("\n" + "=" * 80)
-        logger.info("PIPELINE SUMMARY")
-        logger.info("=" * 80)
-        logger.info(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
-        logger.info(f"Status: SUCCESS")
-        logger.info(f"\nRecommendations Processed: {stats['total_processed']}")
-        logger.info(f"Saved to Snowflake: {stats['saved_snowflake']}")
-        logger.info(f"Saved to PostgreSQL: {stats['saved_postgres']}")
-        logger.info(f"Failed: {stats['failed']}")
-        
-        if stats['details']:
-            logger.info("\nDetailed Results:")
-            logger.info("-" * 80)
-            for detail in stats['details']:
-                well_id = detail.get('well_id', 'N/A')
-                action = detail.get('action', 'N/A')[:50]
-                conf = detail.get('confidence', 0)
-                sf = "✓" if detail.get('snowflake') else "✗"
-                pg = "✓" if detail.get('postgres') else "✗"
-                logger.info(f"  {well_id:15s} | {action:50s} | {conf:7.0%} | SF:{sf} PG:{pg}")
-        
-        logger.info("\n✓ Pipeline completed successfully")
-        return {
-            'status': 'success',
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'train_result': train_result,
-            'predictions_count': len(predictions),
-            'stats': stats
+
+        logger.info("Built metrics for %s wells", len(all_metrics))
+
+        logger.info("\n3. Running recommendations (recommend_from_metrics)...")
+        all_recs: List[Dict[str, Any]] = []
+        for well_id, lift_type, metrics in all_metrics:
+            try:
+                recs = recommend_from_metrics(
+                    str(well_id),
+                    str(lift_type or "Unknown"),
+                    metrics,
+                    confidence_threshold=confidence_threshold,
+                )
+                for r in recs:
+                    r["well_id"] = well_id
+                    all_recs.append(r)
+            except Exception as e:
+                logger.warning("Recommendations failed for well %s: %s", well_id, e)
+
+        logger.info("Detected %s recommendations", len(all_recs))
+
+        logger.info("\n4. Writing to S3...")
+        s3_key = write_operations_recommendations_to_s3(all_recs)
+        stats = {
+            "total_processed": len(all_recs),
+            "saved_s3": len(all_recs) if s3_key else 0,
+            "failed": 0,
+            "details": [],
+            "s3_key": s3_key or "",
         }
-    
+        if all_recs:
+            stats["details"] = [{"well_id": r.get("well_id"), "action": r.get("action"), "confidence": r.get("probability") or r.get("confidence")} for r in all_recs]
+
+        logger.info("\n5. Summary")
+        logger.info("  Recommendations processed: %s", stats["total_processed"])
+        logger.info("  Written to S3: %s", stats["saved_s3"])
+        if s3_key:
+            logger.info("  S3 key: %s", s3_key)
+        logger.info("Pipeline completed successfully.")
+        return {
+            "status": "success",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "train_result": train_result,
+            "predictions_count": len(all_recs),
+            "stats": stats,
+        }
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        logger.error("Pipeline failed: %s", e, exc_info=True)
         return {
-            'status': 'error',
-            'message': str(e),
-            'timestamp': datetime.now(timezone.utc).isoformat()
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
-if __name__ == '__main__':
+def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Run operational recommendations pipeline')
-    parser.add_argument('--skip-training', action='store_true',
-                       help='Skip model training')
-    parser.add_argument('--confidence', type=float, default=0.75,
-                       help='Confidence threshold for recommendations (0-1)')
-    args = parser.parse_args()
-    
-    result = run_pipeline(
-        skip_training=args.skip_training,
-        confidence_threshold=args.confidence
-    )
-    
-    # Exit with appropriate code
-    sys.exit(0 if result.get('status') == 'success' else 1)
+    p = argparse.ArgumentParser(description="Operational recommendations pipeline (S3 only)")
+    p.add_argument("--skip-training", action="store_true", help="Skip model training")
+    p.add_argument("--confidence", type=float, default=0.75, help="Confidence threshold (0-1)")
+    args = p.parse_args()
+    result = run_pipeline(skip_training=args.skip_training, confidence_threshold=args.confidence)
+    sys.exit(0 if result.get("status") == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,8 +10,7 @@ Modules:
     - persistence: Database persistence and ML prediction functions
 
 Usage:
-    >>> from operations.recommendations import TrendAnalyzer, RuleEngine
-    >>> from operations.recommendations import save_recommendation_to_snowflake
+    >>> from operations.recommendations import TrendAnalyzer, RuleEngine, recommend_from_metrics
 """
 
 # =============================================================================
@@ -39,28 +38,13 @@ from operations.recommendations.rules import (
 # =============================================================================
 
 from operations.recommendations.persistence import (
-    # Model loading
     load_model,
     get_model_for_lift_type,
-    
-    # Prediction
     predict_category,
     predict_with_model,
-    predict_all_wells,
-    
-    # Features
     _features_from_metrics,
-    
-    # Persistence
-    save_recommendation_to_snowflake,
-    generate_recommendations_for_well,
     recommend_from_metrics,
-    detect_and_persist,
-    
-    # Training (delegated)
-    train_with_synthetic_labels,
-    train_from_snowflake,
-    train_on_two_wells,
+    write_operations_recommendations_to_s3,
 )
 
 # =============================================================================
@@ -110,17 +94,7 @@ __all__ = [
     # Prediction
     'predict_category',
     'predict_with_model',
-    'predict_all_wells',
     '_features_from_metrics',
-    
-    # Persistence
-    'save_recommendation_to_snowflake',
-    'generate_recommendations_for_well',
     'recommend_from_metrics',
-    'detect_and_persist',
-    
-    # Training
-    'train_with_synthetic_labels',
-    'train_from_snowflake',
-    'train_on_two_wells',
+    'write_operations_recommendations_to_s3',
 ]

@@ -1,0 +1,31 @@
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+if __package__ in (None, ""):
+    # Allow: python3 anomaly_detection/run.py
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+
+from anomaly_detection.bulk_detect import run_bulk_anomaly_detection
+
+
+def main() -> None:
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    last_n = int(os.getenv("ANOMALY_BULK_LAST_N", "15"))
+    max_wells = os.getenv("ANOMALY_BULK_MAX_WELLS")
+    max_wells_int = int(max_wells) if max_wells else None
+
+    result = run_bulk_anomaly_detection(last_n=last_n, per_well=True, max_wells=max_wells_int)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+

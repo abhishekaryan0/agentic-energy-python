@@ -15,6 +15,11 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+import io
+
+import boto3
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,94 +63,87 @@ IDLE_METRICS = {
     ]
 }
 
-# Minimum weighted score to consider well as IDLE
 IDLE_SCORE_THRESHOLD = 4  # Need at least 4 weighted points to be IDLE
 
-SNOWFLAKE_CONFIG = {
-    'user': os.getenv('SNOWFLAKE_USER'),
-    'password': os.getenv('SNOWFLAKE_PASSWORD'),
-    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-    'database': os.getenv('SNOWFLAKE_DATABASE'),
-    'schema': os.getenv('SNOWFLAKE_SCHEMA'),
-    'role': os.getenv('SNOWFLAKE_ROLE')
-}
 
-
-def get_snowflake_connection():
-    """Get Snowflake database connection."""
-    try:
-        from snowflake.connector import connect as snowflake_connect
-        conn = snowflake_connect(**SNOWFLAKE_CONFIG)
-        return conn
-    except Exception as e:
-        logger.error(f"Failed to connect to Snowflake: {e}")
-        raise
-
-
-def get_all_wells() -> List[Dict]:
+def _default_sensor_parquet_s3() -> str:
     """
-    Get all distinct well_ids from well_sensor_readings table
-    along with their latest reading info including all relevant sensor values.
+    Build default S3 path for well_sensor_readings.parquet from env:
+      - S3_BUCKET (e.g. agentic-energy-ml-models-200937443240)
+      - ORGANIZATION_ID (tenant id)
     """
-    conn = get_snowflake_connection()
-    cursor = conn.cursor()
-    
-    try:
-        query = """
-        WITH latest_readings AS (
-            SELECT 
-                WELL_ID,
-                MAX(TIMESTAMP) AS LAST_TIMESTAMP
-            FROM WELL_SENSOR_READINGS
-            GROUP BY WELL_ID
-        )
-        SELECT 
-            r.WELL_ID,
-            r.TIMESTAMP AS LAST_READING_TIMESTAMP,
-            r.LIFT_TYPE,
-            -- Rod Pump fields
-            r.STROKES_PER_MINUTE,
-            r.TORQUE,
-            r.POLISH_ROD_LOAD,
-            r.PUMP_FILLAGE,
-            r.TUBING_PRESSURE,
-            -- ESP fields
-            r.MOTOR_TEMP,
-            r.MOTOR_CURRENT,
-            r.DISCHARGE_PRESSURE,
-            r.PUMP_INTAKE_PRESSURE,
-            r.MOTOR_VOLTAGE,
-            -- Gas Lift fields
-            r.INJECTION_RATE,
-            r.INJECTION_TEMPERATURE,
-            r.BOTTOMHOLE_PRESSURE,
-            r.INJECTION_PRESSURE,
-            r.CYCLE_TIME
-        FROM WELL_SENSOR_READINGS r
-        INNER JOIN latest_readings lr 
-            ON r.WELL_ID = lr.WELL_ID AND r.TIMESTAMP = lr.LAST_TIMESTAMP
-        ORDER BY r.WELL_ID
-        """
-        
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        cols = [c[0].lower() for c in cursor.description] if cursor.description else []
-        
-        wells = []
-        for row in rows:
-            well = dict(zip(cols, row))
-            wells.append(well)
-        
-        logger.info(f"Found {len(wells)} wells in database")
-        return wells
-        
-    except Exception as e:
-        logger.error(f"Error fetching wells: {e}")
+    bucket = os.getenv("S3_BUCKET", "agentic-energy-ml-models-200937443240")
+    org_id = os.getenv("ORGANIZATION_ID")
+    if not org_id:
+        raise ValueError("ORGANIZATION_ID env var is required to build default sensor parquet path")
+    return f"s3://{bucket}/{org_id}/sensor_data/well_sensor_readings.parquet"
+
+
+DEFAULT_SENSOR_PARQUET_S3 = _default_sensor_parquet_s3()
+
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Expected s3:// URI, got: {uri}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _load_sensor_parquet_from_s3(uri: str) -> pd.DataFrame:
+    bucket, key = _parse_s3_uri(uri)
+    logger.info("Loading sensor parquet from s3://%s/%s", bucket, key)
+    s3 = boto3.client("s3")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    data = obj["Body"].read()
+    buf = io.BytesIO(data)
+    return pd.read_parquet(buf)
+
+
+def _compute_latest_readings_from_df(df: pd.DataFrame) -> List[Dict]:
+    """
+    From full well_sensor_readings dataframe, compute one latest row per well_id.
+    Returns list of dicts with keys used by determine_well_status.
+    """
+    if df.empty:
         return []
-    finally:
-        cursor.close()
-        conn.close()
+
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    well_col = "well_id" if "well_id" in df.columns else "asset_id"
+    if well_col not in df.columns:
+        raise ValueError(f"Expected well_id or asset_id column in parquet; got columns: {df.columns.tolist()}")
+
+    ts_col = None
+    for cand in ("timestamp", "time", "datetime"):
+        if cand in df.columns:
+            ts_col = cand
+            break
+    if ts_col is None:
+        ts_col = df.columns[1]
+
+    df[ts_col] = pd.to_datetime(df[ts_col])
+    df = df.sort_values(by=[well_col, ts_col])
+    latest = df.groupby(well_col).tail(1).copy()
+
+    wells: List[Dict] = []
+    for _, row in latest.iterrows():
+        rec = row.to_dict()
+        rec["well_id"] = str(rec.get(well_col))
+        rec["last_reading_timestamp"] = rec.get(ts_col)
+        wells.append(rec)
+
+    logger.info("Computed latest readings for %s wells from sensor parquet", len(wells))
+    return wells
+
+
+def get_all_wells_from_s3(sensor_parquet_s3: Optional[str] = None) -> List[Dict]:
+    """
+    Get all distinct wells with their latest reading from S3 parquet.
+    """
+    sensor_uri = sensor_parquet_s3 or os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
+    df = _load_sensor_parquet_from_s3(sensor_uri)
+    return _compute_latest_readings_from_df(df)
 
 
 def get_anomaly_counts(well_id: str, hours: int = 24, conn=None) -> Tuple[int, int]:
@@ -280,215 +278,148 @@ def determine_well_status(well: Dict) -> Tuple[str, str]:
     return ('RUNNING', f'Normal operation, last reading {hours_since_reading:.1f} hours ago')
 
 
-def update_well_status(well_id: str, status: str, reason: str, well_data: Dict, conn=None):
+def _build_status_rows(wells: List[Dict]) -> pd.DataFrame:
     """
-    Update or insert well status in WELL_STATUS table.
-    If conn is provided, use it and do not close it (caller owns it).
+    For each well dict, compute status and build a status dataframe.
     """
-    own_conn = conn is None
-    if conn is None:
-        conn = get_snowflake_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Calculate reading age in hours
-        last_timestamp = well_data.get('last_reading_timestamp')
+    rows = []
+    now = datetime.now(timezone.utc)
+
+    for well in wells:
+        well_id = str(well.get("well_id"))
+        if not well_id or well_id == "None":
+            continue
+
+        status, reason = determine_well_status(well)
+
+        last_timestamp = well.get("last_reading_timestamp")
         reading_age_hours = None
         if last_timestamp:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
             if isinstance(last_timestamp, str):
                 try:
-                    last_timestamp = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
-                except:
-                    last_timestamp = datetime.strptime(last_timestamp[:19], '%Y-%m-%d %H:%M:%S')
-            if hasattr(last_timestamp, 'tzinfo') and last_timestamp.tzinfo is not None:
-                last_timestamp = last_timestamp.replace(tzinfo=None)
-            reading_age_hours = (now - last_timestamp).total_seconds() / 3600
-        
-        # Get anomaly counts (reuse conn if provided)
-        anomaly_count, critical_count = get_anomaly_counts(well_id, 24, conn=conn)
-        
-        org_id = os.getenv("ORGANIZATION_ID")
+                    last_ts = datetime.fromisoformat(last_timestamp.replace("Z", "+00:00"))
+                except Exception:
+                    last_ts = datetime.strptime(last_timestamp[:19], "%Y-%m-%d %H:%M:%S")
+            else:
+                last_ts = last_timestamp
+            if getattr(last_ts, "tzinfo", None) is not None:
+                last_ts = last_ts.replace(tzinfo=None)
+            reading_age_hours = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600.0
 
-        # Use MERGE to upsert (when not matched, set ORGANIZATION_ID from env if available)
-        if org_id:
-            merge_query = """
-            MERGE INTO WELL_STATUS AS target
-            USING (SELECT %s AS WELL_ID, %s AS ORGANIZATION_ID) AS source
-            ON target.WELL_ID = source.WELL_ID
-            WHEN MATCHED THEN UPDATE SET
-                LIFT_TYPE = %s,
-                STATUS = %s,
-                LAST_READING_TIMESTAMP = %s,
-                LAST_READING_AGE_HOURS = %s,
-                STROKES_PER_MINUTE = %s,
-                MOTOR_CURRENT = %s,
-                INJECTION_RATE = %s,
-                ANOMALY_COUNT_24H = %s,
-                CRITICAL_ANOMALY_COUNT_24H = %s,
-                STATUS_REASON = %s,
-                UPDATED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                WELL_ID, ORGANIZATION_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP, LAST_READING_AGE_HOURS,
-                STROKES_PER_MINUTE, MOTOR_CURRENT, INJECTION_RATE,
-                ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H, STATUS_REASON
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            params = (
-                well_id, org_id,
-                well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
-                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
-                well_data.get('injection_rate'), anomaly_count, critical_count, reason,
-                well_id, org_id, well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
-                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
-                well_data.get('injection_rate'), anomaly_count, critical_count, reason
-            )
-        else:
-            merge_query = """
-            MERGE INTO WELL_STATUS AS target
-            USING (SELECT %s AS WELL_ID) AS source
-            ON target.WELL_ID = source.WELL_ID
-            WHEN MATCHED THEN UPDATE SET
-                LIFT_TYPE = %s,
-                STATUS = %s,
-                LAST_READING_TIMESTAMP = %s,
-                LAST_READING_AGE_HOURS = %s,
-                STROKES_PER_MINUTE = %s,
-                MOTOR_CURRENT = %s,
-                INJECTION_RATE = %s,
-                ANOMALY_COUNT_24H = %s,
-                CRITICAL_ANOMALY_COUNT_24H = %s,
-                STATUS_REASON = %s,
-                UPDATED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                WELL_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP, LAST_READING_AGE_HOURS,
-                STROKES_PER_MINUTE, MOTOR_CURRENT, INJECTION_RATE,
-                ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H, STATUS_REASON
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            params = (
-                well_id,
-                well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
-                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
-                well_data.get('injection_rate'), anomaly_count, critical_count, reason,
-                well_id, well_data.get('lift_type'), status, well_data.get('last_reading_timestamp'),
-                reading_age_hours, well_data.get('strokes_per_minute'), well_data.get('motor_current'),
-                well_data.get('injection_rate'), anomaly_count, critical_count, reason
-            )
-        
-        cursor.execute(merge_query, params)
-        conn.commit()
-        
-        logger.info(f"[{well_id}] Status updated: {status} - {reason}")
-        
+        rows.append(
+            {
+                "well_id": well_id,
+                "lift_type": well.get("lift_type"),
+                "status": status,
+                "last_reading_timestamp": well.get("last_reading_timestamp"),
+                "last_reading_age_hours": reading_age_hours,
+                "strokes_per_minute": well.get("strokes_per_minute"),
+                "motor_current": well.get("motor_current"),
+                "injection_rate": well.get("injection_rate"),
+                "anomaly_count_24h": 0,
+                "critical_anomaly_count_24h": 0,
+                "status_reason": reason,
+                "updated_at": now,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _load_status_parquet_from_s3(output_s3: str) -> Optional[pd.DataFrame]:
+    """
+    Helper to load well_status.parquet from S3 if present.
+    """
+    try:
+        bucket, key = _parse_s3_uri(output_s3)
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return pd.read_parquet(obj["Body"])
     except Exception as e:
-        logger.error(f"Error updating status for {well_id}: {e}")
-        conn.rollback()
-    finally:
-        cursor.close()
-        if own_conn:
-            conn.close()
+        logger.warning("Could not load status parquet from %s: %s", output_s3, e)
+        return None
 
 
 def get_well_status(well_id: str) -> Optional[Dict]:
     """
-    Get current status for a specific well from WELL_STATUS table.
+    Get current status for a specific well from S3 well_status.parquet.
     """
-    conn = get_snowflake_connection()
-    cursor = conn.cursor()
-    
-    try:
-        query = """
-        SELECT 
-            WELL_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP,
-            LAST_READING_AGE_HOURS, STROKES_PER_MINUTE, MOTOR_CURRENT,
-            INJECTION_RATE, ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H,
-            STATUS_REASON, UPDATED_AT
-        FROM WELL_STATUS
-        WHERE WELL_ID = %s
-        """
-        
-        cursor.execute(query, (well_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            cols = [c[0].lower() for c in cursor.description]
-            return dict(zip(cols, row))
+    sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
+    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
+    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+
+    df = _load_status_parquet_from_s3(output_uri)
+    if df is None or df.empty:
         return None
-        
-    except Exception as e:
-        logger.error(f"Error fetching status for {well_id}: {e}")
+
+    df = df.copy()
+    if "well_id" not in df.columns:
         return None
-    finally:
-        cursor.close()
-        conn.close()
+    match = df[df["well_id"].astype(str) == str(well_id)]
+    if match.empty:
+        return None
+    row = match.iloc[0].to_dict()
+    return row
 
 
 def get_all_well_statuses() -> List[Dict]:
     """
-    Get all well statuses from WELL_STATUS table.
+    Get all well statuses from S3 well_status.parquet.
     """
-    conn = get_snowflake_connection()
-    cursor = conn.cursor()
-    
-    try:
-        query = """
-        SELECT 
-            WELL_ID, LIFT_TYPE, STATUS, LAST_READING_TIMESTAMP,
-            LAST_READING_AGE_HOURS, STROKES_PER_MINUTE, MOTOR_CURRENT,
-            INJECTION_RATE, ANOMALY_COUNT_24H, CRITICAL_ANOMALY_COUNT_24H,
-            STATUS_REASON, UPDATED_AT
-        FROM WELL_STATUS
-        ORDER BY 
-            CASE STATUS 
-                WHEN 'SHUTDOWN' THEN 1 
-                WHEN 'IDLE' THEN 2 
-                ELSE 3 
-            END,
-            WELL_ID
-        """
-        
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        cols = [c[0].lower() for c in cursor.description] if cursor.description else []
-        
-        return [dict(zip(cols, row)) for row in rows]
-        
-    except Exception as e:
-        logger.error(f"Error fetching all statuses: {e}")
+    sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
+    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
+    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+
+    df = _load_status_parquet_from_s3(output_uri)
+    if df is None or df.empty:
         return []
-    finally:
-        cursor.close()
-        conn.close()
+
+    # Optional ordering similar to previous Snowflake query
+    if "status" in df.columns and "well_id" in df.columns:
+        status_order = {"SHUTDOWN": 1, "IDLE": 2}
+        df = df.copy()
+        df["_order"] = df["status"].map(status_order).fillna(3)
+        df = df.sort_values(by=["_order", "well_id"]).drop(columns=["_order"])
+
+    return [r._asdict() if hasattr(r, "_asdict") else dict(r) for _, r in df.iterrows()]
 
 
 def update_all_well_statuses():
     """
-    Main function to update status for all wells.
-    Should be run periodically (e.g., hourly via cron).
-    Reuses a single Snowflake connection for the whole batch to avoid slowness.
+    Main function to update status for all wells using S3 parquet only.
+    Reads SENSOR_PARQUET_S3 (or default), computes status, and writes well_status.parquet
+    alongside the sensor parquet.
     """
     logger.info("=" * 50)
-    logger.info("Starting well status update job")
+    logger.info("Starting well status update job (S3 parquet)")
     logger.info("=" * 50)
-    
-    wells = get_all_wells()
-    
+
+    sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
+    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
+    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+
+    df_sensor = _load_sensor_parquet_from_s3(sensor_uri)
+    wells = _compute_latest_readings_from_df(df_sensor)
+
     if not wells:
-        logger.warning("No wells found in database")
-        return
-    
-    status_counts = {'RUNNING': 0, 'IDLE': 0, 'SHUTDOWN': 0}
-    conn = get_snowflake_connection()
-    try:
-        for well in wells:
-            well_id = well.get('well_id')
-            status, reason = determine_well_status(well)
-            update_well_status(well_id, status, reason, well, conn=conn)
-            status_counts[status] = status_counts.get(status, 0) + 1
-    finally:
-        conn.close()
-    
+        logger.warning("No wells found in sensor parquet")
+        return {}
+
+    status_df = _build_status_rows(wells)
+
+    bucket, key = _parse_s3_uri(output_uri)
+    logger.info("Writing well status parquet to s3://%s/%s (%s rows)", bucket, key, len(status_df))
+    s3 = boto3.client("s3")
+    buf = io.BytesIO()
+    status_df.to_parquet(buf, index=False)
+    buf.seek(0)
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    status_counts = {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
+    if "status" in status_df.columns:
+        for s in status_counts.keys():
+            status_counts[s] = int((status_df["status"] == s).sum())
+
     logger.info("=" * 50)
     logger.info("Well status update complete")
     logger.info(f"Summary: RUNNING={status_counts['RUNNING']}, IDLE={status_counts['IDLE']}, SHUTDOWN={status_counts['SHUTDOWN']}")
@@ -500,7 +431,7 @@ def update_all_well_statuses():
 def get_status_for_reading(well_id: str, lift_type: str, readings: Dict) -> str:
     """
     Get status for a new reading being inserted.
-    This is called from app.py when inserting a reading.
+    This is called by real-time ingest paths when inserting a reading.
     
     Since we're inserting a reading, well is active (not SHUTDOWN).
     Determine RUNNING vs IDLE based on multiple production metrics.
