@@ -531,7 +531,9 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
             "ui_text": llm_content or {},
             "impact_metrics": safe_impact_metrics,
             "impact_value": impact_val,
-            "chart_data": safe_chart
+            "chart_data": safe_chart,
+            "mute_till": None,
+            "open_up": None,
         })
 
     if enriched_results:

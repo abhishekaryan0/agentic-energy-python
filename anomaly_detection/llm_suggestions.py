@@ -518,6 +518,8 @@ def persist_suggestion_to_s3(
         "alert_title": suggestion_result.get("alert_title"),
         "severity": suggestion_result.get("severity"),
         "status": suggestion_result.get("status"),
+        "open_up": None,
+        "mute_till": None,
         "confidence": suggestion_result.get("confidence"),
         "description": suggestion_result.get("description"),
         "suggested_actions": suggestion_result.get("suggested_actions"),

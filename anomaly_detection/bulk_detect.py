@@ -160,6 +160,8 @@ def run_bulk_anomaly_detection(
             "raw_values": current_readings,
             "model_name": "Rule_Based_Frontend",
             "status": "New",
+            "open_up": None,
+            "mute_till": None,
             "severity": calculated_severity,
             "category": lift_type,
         }

@@ -442,6 +442,8 @@ def _create_prediction_record(
     rec.setdefault('hybrid_model', None)
     rec.setdefault('recommended_model', None)
     rec.setdefault('status_reason', None)
+    rec.setdefault('mute_till', None)
+    rec.setdefault('open_up', None)
     
     # Try category model
     try:
@@ -559,7 +561,9 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         "data_quality",
         "status_reason",
         "prediction_source",
-        "expected_impact",  # kept for backward compatibility
+        "mute_till",
+        "open_up",
+        "metrics_json",
         "created_at",
         "updated_at",
         "organization_id",
@@ -586,6 +590,8 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         if metrics_val is not None:
             serialized = json.dumps(to_native_type(metrics_val), default=str)
             row["metrics_json"] = serialized
+        elif row.get("metrics_json") is None:
+            row["metrics_json"] = None
         rows.append(row)
     df = pd.DataFrame(rows)
     buf = io.BytesIO()

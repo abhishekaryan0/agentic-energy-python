@@ -1071,6 +1071,8 @@ def setup_postgres():
                 impact_value FLOAT,
                 impact_metrics JSONB,
                 chart_data JSONB,
+                mute_till TIMESTAMP,
+                open_up BOOLEAN,
                 status VARCHAR(50),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (well_id, anomaly_code, event_date)
@@ -1079,6 +1081,12 @@ def setup_postgres():
         )
         cur.execute(
             "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS organization_id UUID;"
+        )
+        cur.execute(
+            "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS mute_till TIMESTAMP;"
+        )
+        cur.execute(
+            "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS open_up BOOLEAN;"
         )
         logger.info("PostgreSQL: anomaly_review OK")
 

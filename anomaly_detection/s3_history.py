@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -7,6 +8,151 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+WELL_ANOMALIES_COLUMNS = [
+    "id",
+    "organization_id",
+    "well_id",
+    "timestamp",
+    "anomaly_type",
+    "anomaly_score",
+    "raw_values",
+    "model_name",
+    "status",
+    "open_up",
+    "mute_till",
+    "severity",
+    "category",
+]
+
+ANOMALY_VIOLATIONS_COLUMNS = [
+    "anomaly_id",
+    "well_id",
+    "timestamp",
+    "parameter_name",
+    "actual_value",
+    "expected_min",
+    "expected_max",
+    "unit",
+    "deviation_percent",
+]
+
+ANOMALY_SUGGESTIONS_COLUMNS = [
+    "id",
+    "well_id",
+    "timestamp",
+    "alert_title",
+    "severity",
+    "status",
+    "open_up",
+    "mute_till",
+    "confidence",
+    "description",
+    "suggested_actions",
+    "explanation",
+    "created_at",
+    "historical_context",
+    "risk_analysis",
+    "asset_id",
+    "reason",
+    "raw_anomaly_data",
+    "lift_type",
+    "category",
+    "well_status",
+    "organization_id",
+]
+
+
+def _json_dumps_safe(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_string_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+    return df
+
+
+def _normalize_well_anomalies_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        row = {k: r.get(k) for k in WELL_ANOMALIES_COLUMNS}
+        row["anomaly_score"] = _to_float_or_none(row.get("anomaly_score"))
+        row["raw_values"] = _json_dumps_safe(row.get("raw_values"))
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=WELL_ANOMALIES_COLUMNS)
+    df = _coerce_string_columns(
+        df,
+        [
+            "id",
+            "organization_id",
+            "well_id",
+            "timestamp",
+            "anomaly_type",
+            "raw_values",
+            "model_name",
+            "status",
+            "open_up",
+            "mute_till",
+            "severity",
+            "category",
+        ],
+    )
+    return df
+
+
+def _normalize_anomaly_violations_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        row = {k: r.get(k) for k in ANOMALY_VIOLATIONS_COLUMNS}
+        row["actual_value"] = _to_float_or_none(row.get("actual_value"))
+        row["expected_min"] = _to_float_or_none(row.get("expected_min"))
+        row["expected_max"] = _to_float_or_none(row.get("expected_max"))
+        row["deviation_percent"] = _to_float_or_none(row.get("deviation_percent"))
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=ANOMALY_VIOLATIONS_COLUMNS)
+    df = _coerce_string_columns(df, ["anomaly_id", "well_id", "timestamp", "parameter_name", "unit"])
+    return df
+
+
+def _normalize_anomaly_suggestions_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        row = {k: r.get(k) for k in ANOMALY_SUGGESTIONS_COLUMNS}
+        row["suggested_actions"] = _json_dumps_safe(row.get("suggested_actions"))
+        row["historical_context"] = _json_dumps_safe(row.get("historical_context"))
+        row["risk_analysis"] = _json_dumps_safe(row.get("risk_analysis"))
+        row["raw_anomaly_data"] = _json_dumps_safe(row.get("raw_anomaly_data"))
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=ANOMALY_SUGGESTIONS_COLUMNS)
+    df = _coerce_string_columns(df, ANOMALY_SUGGESTIONS_COLUMNS)
+    return df
 
 
 def _get_bucket_and_org() -> Optional[tuple]:
@@ -53,7 +199,7 @@ def write_well_anomalies_history_to_s3(records: List[Dict[str, Any]]) -> Optiona
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     key = f"{org}/detections/anomaly_detection/history/well_anomalies_run_ts={ts}.parquet"
 
-    df = pd.DataFrame(records)
+    df = _normalize_well_anomalies_records(records)
     _put_parquet_s3(df, bucket, key)
     return key
 
@@ -76,7 +222,7 @@ def write_anomaly_violations_history_to_s3(records: List[Dict[str, Any]]) -> Opt
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     key = f"{org}/detections/anomaly_detection/history/anomaly_violations_run_ts={ts}.parquet"
 
-    df = pd.DataFrame(records)
+    df = _normalize_anomaly_violations_records(records)
     _put_parquet_s3(df, bucket, key)
     return key
 
@@ -173,7 +319,7 @@ def write_anomaly_suggestions_history_to_s3(records: List[Dict[str, Any]]) -> Op
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     key = f"{org}/detections/anomaly_detection/anomaly_suggestions_run_ts={ts}.parquet"
 
-    df = pd.DataFrame(records)
+    df = _normalize_anomaly_suggestions_records(records)
     _put_parquet_s3(df, bucket, key)
     return key
 

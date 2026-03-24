@@ -124,6 +124,7 @@ def write_anomaly_reviews_to_s3(reviews: List[dict]) -> Optional[str]:
         row = {k: v for k, v in r.items() if k in (
             "id", "well_id", "event_date", "detected_at", "anomaly_code", "category",
             "severity", "title", "impact_value", "status", "organization_id", "reason",
+            "mute_till", "open_up",
         )}
         # Ensure organization_id is present to match Prisma model
         if not row.get("organization_id"):
