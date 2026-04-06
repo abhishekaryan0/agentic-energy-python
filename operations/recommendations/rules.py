@@ -7,7 +7,7 @@ recommendation generation from sensor metrics.
 
 Usage:
     >>> from operations.recommendations.rules import RuleEngine, ACTION_MAPPING
-    >>> engine = RuleEngine(snowflake_conn)
+    >>> engine = RuleEngine()
     >>> recommendations = engine.apply(well_id, metrics)
 """
 
@@ -314,40 +314,11 @@ ACTION_CATEGORY_MAP.update({
 })
 
 
-def load_sensor_config_from_db(conn) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def load_sensor_config_from_db(conn=None) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    Load sensor definitions from database to get actual min/max ranges.
-    
-    Args:
-        conn: Database connection with cursor API
-        
-    Returns:
-        Dict: {lift_type: {field_name: {'min': x, 'max': y, 'unit': z}}}
+    Reserved for compatibility. S3-only deployments use ACTION_MAPPING / config constants; no external DB.
     """
-    config: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT lt.lift_type_name, sd.field_name, sd.min_value, sd.max_value, sd.unit
-            FROM sensor_definitions sd
-            JOIN lift_types lt ON sd.lift_type_id = lt.id
-            WHERE sd.min_value IS NOT NULL AND sd.max_value IS NOT NULL
-        """)
-        for row in cur.fetchall():
-            lt_name, field, mn, mx, unit = row
-            if lt_name not in config:
-                config[lt_name] = {}
-            config[lt_name][field.lower()] = {
-                'min': float(mn) if mn is not None else None,
-                'max': float(mx) if mx is not None else None,
-                'unit': unit
-            }
-        return config
-    except Exception as e:
-        logger.warning(f"Could not load sensor config from DB: {e}")
-        return {}
-    finally:
-        cur.close()
+    return {}
 
 
 class RuleEngine:
@@ -368,113 +339,17 @@ class RuleEngine:
     """
 
     def __init__(self, conn=None):
-        """
-        Initialize with database connection for DB-based rules.
-        
-        Args:
-            conn: Optional database connection (Snowflake)
-        """
+        """``conn`` is ignored; rules use parquet/metrics only (no external database)."""
         self.conn = conn
         self.rules: Dict[str, Dict[str, Any]] = {}
 
     def load_rules_from_db(self, lift_type: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-        """
-        Load field ranges from sensor_definitions table in DB.
-        
-        Args:
-            lift_type: If specified, load rules for that type only
-            
-        Returns:
-            Dict of field -> {min, max} bounds
-        """
-        if not self.conn:
-            return {}
-        
-        cur = self.conn.cursor()
-        try:
-            if lift_type:
-                # Get lift_type_id
-                cur.execute("SELECT id FROM lift_types WHERE lift_type_name = %s", (lift_type,))
-                lift_id_row = cur.fetchone()
-                if not lift_id_row:
-                    return {}
-                lift_id = lift_id_row[0]
-                cur.execute(
-                    "SELECT field_name, min_value, max_value FROM sensor_definitions WHERE lift_type_id = %s", 
-                    (lift_id,)
-                )
-            else:
-                cur.execute("SELECT field_name, min_value, max_value FROM sensor_definitions")
-            
-            rows = cur.fetchall()
-            rules = {}
-            for field, mn, mx in rows:
-                rules[field] = {'min': mn, 'max': mx}
-            self.rules = rules
-            return rules
-        finally:
-            cur.close()
+        """No-op: threshold rules come from metrics and ACTION_MAPPING (S3-only)."""
+        return {}
 
     def load_adaptive_rules(self, well_id: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Load adaptive rules based on last 30 days data for the well.
-        
-        Args:
-            well_id: Well identifier
-            
-        Returns:
-            Dict of field -> {min, max} bounds computed from historical data
-        """
-        if not self.conn:
-            return {}
-        
-        cur = self.conn.cursor()
-        try:
-            # Get lift_type for the well
-            cur.execute(
-                "SELECT DISTINCT lift_type FROM well_sensor_readings WHERE well_id = %s LIMIT 1", 
-                (well_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return {}
-            lift_type = row[0]
-            
-            # Get lift_type_id
-            cur.execute("SELECT id FROM lift_types WHERE lift_type_name = %s", (lift_type,))
-            lift_id_row = cur.fetchone()
-            if not lift_id_row:
-                return {}
-            lift_id = lift_id_row[0]
-            
-            # Get fields for this lift_type that have numeric min/max defined
-            cur.execute(
-                "SELECT field_name FROM sensor_definitions "
-                "WHERE lift_type_id = %s AND min_value IS NOT NULL AND max_value IS NOT NULL", 
-                (lift_id,)
-            )
-            fields = [r[0] for r in cur.fetchall()]
-            
-            rules = {}
-            for field in fields:
-                # Compute min/max from last 30 days
-                try:
-                    cur.execute(
-                        f"SELECT MIN(TRY_CAST({field} AS FLOAT)), MAX(TRY_CAST({field} AS FLOAT)) "
-                        f"FROM well_sensor_readings "
-                        f"WHERE well_id = %s AND timestamp >= DATEADD(day, -30, CURRENT_DATE)", 
-                        (well_id,)
-                    )
-                    mn, mx = cur.fetchone()
-                    if mn is not None and mx is not None:
-                        rules[field] = {'min': float(mn), 'max': float(mx)}
-                except Exception as e:
-                    logger.warning(f"Skipping field {field} for well {well_id}: {e}")
-                    continue
-            self.rules = rules
-            return rules
-        finally:
-            cur.close()
+        """No-op: adaptive bounds are computed from TrendAnalyzer / parquet in memory."""
+        return {}
 
     def check_ranges(self, readings: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -539,9 +414,6 @@ class RuleEngine:
         Returns:
             List of recommendation dicts
         """
-        # Load rules from database based on well's lift type
-        self.load_adaptive_rules(well_id)
-        
         recs: List[Dict[str, Any]] = []
         seen_actions: set = set()  # Avoid duplicate recommendations
         
@@ -657,7 +529,12 @@ class RuleEngine:
         }
         
         templates = action_config.get('templates', [''])
-        expected_impact = templates[0].format(current=val, target=threshold) if templates else ''
+        try:
+            _cur = round(float(val), 2) if val is not None else val
+            _tgt = round(float(threshold), 2) if threshold is not None else threshold
+        except Exception:
+            _cur, _tgt = val, threshold
+        expected_impact = templates[0].format(current=_cur, target=_tgt) if templates else ''
         
         rec = {
             'well_id': well_id,

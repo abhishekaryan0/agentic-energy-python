@@ -423,6 +423,7 @@ Ensure your entire output is a single, valid JSON object.
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
+            response_format={"type": "json_object"},
         )
 
         content = response.choices[0].message.content or ""
@@ -534,6 +535,9 @@ def persist_suggestion_to_s3(
         "category": anomaly_details.get("category"),
         "well_status": well_status,
         "organization_id": organization_id,
+        "user_id": None,
+        "user_name": None,
+        "updated_at": None,
     }
     write_anomaly_suggestions_history_to_s3([record])
 

@@ -21,6 +21,7 @@ import sys
 import json
 import logging
 import uuid
+import os
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -521,6 +522,9 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
         enriched_results.append({
             "id": str(uuid.uuid4()),
             "well_id": well_id,
+            # If env var isn't provided, keep as NULL so DB/parquet can store null.
+            "user_id": os.getenv("ANOMALY_REVIEW_USER_ID"),
+            "user_name": os.getenv("ANOMALY_REVIEW_USER_NAME"),
             "event_date": str(finding['event_date']),
             "detected_at": finding['detected_at'],
             "anomaly_code": finding['anomaly_code'],

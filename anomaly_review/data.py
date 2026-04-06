@@ -124,11 +124,17 @@ def write_anomaly_reviews_to_s3(reviews: List[dict]) -> Optional[str]:
         row = {k: v for k, v in r.items() if k in (
             "id", "well_id", "event_date", "detected_at", "anomaly_code", "category",
             "severity", "title", "impact_value", "status", "organization_id", "reason",
-            "mute_till", "open_up",
+            "mute_till", "open_up", "user_id", "user_name",
         )}
         # Ensure organization_id is present to match Prisma model
         if not row.get("organization_id"):
             row["organization_id"] = org_id
+        # Preserve NULL when user_id isn't available.
+        # Only normalize empty string -> NULL.
+        if row.get("user_id") == "":
+            row["user_id"] = None
+        if row.get("user_name") == "":
+            row["user_name"] = None
         # Ensure reason column exists even if always null
         if "reason" not in row:
             row["reason"] = None

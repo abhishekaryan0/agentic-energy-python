@@ -195,15 +195,23 @@ def run_anomaly_review_training(well_ids, force_retrain: bool = True, workers: i
     return failed == 0
 
 
-def run_operations_training(conn):
-    """Run operations recommendation model training (full retrain with new data)."""
-    logger.info("[operations] Starting add-on training...")
+def run_operations_training(conn=None):
+    """Run operations training from S3/local parquet paths (S3-only; no DB)."""
+    logger.info("[operations] Starting training from parquet...")
     t0 = time.time()
     try:
-        from operations.train_models import train_with_synthetic_labels
-        from operations.utils import get_model_path
-        model_path = get_model_path("models/decision_tree_alldata.joblib")
-        train_with_synthetic_labels(conn, model_path=model_path)
+        import os
+        from operations.train_models import train_operations_from_parquet
+        sp = os.getenv("OPS_TRAIN_SENSOR_PARQUET", "").strip()
+        pp = os.getenv("OPS_TRAIN_PRODUCTION_PARQUET", "").strip()
+        out = os.getenv("OPERATIONS_MODELS_DIR", "models").strip() or "models"
+        if not sp or not pp:
+            logger.error(
+                "[operations] Set OPS_TRAIN_SENSOR_PARQUET and OPS_TRAIN_PRODUCTION_PARQUET "
+                "(e.g. s3://bucket/org/sensor_data/well_sensor_readings.parquet)"
+            )
+            return False
+        train_operations_from_parquet(sp, pp, out)
         logger.info("[operations] Training finished in %.1fs", time.time() - t0)
         return True
     except Exception as e:

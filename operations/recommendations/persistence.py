@@ -3,7 +3,7 @@ Persistence Module
 ==================
 
 Provides loading of ML models (from disk or S3) and recommend_from_metrics for
-operational recommendations. Uses S3 only (no Snowflake).
+operational recommendations. Uses S3 only.
 
 Usage:
     >>> from operations.recommendations.persistence import recommend_from_metrics, load_model
@@ -24,7 +24,6 @@ from operations.utils import (
     get_project_root,
     get_models_dir,
     get_model_path as _get_model_path,
-    retry_db_operation as _retry_db_operation,
     to_native_type,
 )
 
@@ -42,7 +41,262 @@ from operations.recommendations.rules import (
     ACTION_MAPPING,
 )
 
+from operations.eia_prices import get_brent_spot_usd_per_bbl
+
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded financial model (implementation cost regressor)
+_FINANCIAL_MODEL_OBJ: Optional[Dict[str, Any]] = None
+_FINANCIAL_MODEL_FAILED: bool = False
+
+
+def _get_financial_model_obj() -> Optional[Dict[str, Any]]:
+    """Load financial_implementation_cost.joblib once; None if missing or error."""
+    global _FINANCIAL_MODEL_OBJ, _FINANCIAL_MODEL_FAILED
+    if _FINANCIAL_MODEL_FAILED:
+        return None
+    if _FINANCIAL_MODEL_OBJ is not None:
+        return _FINANCIAL_MODEL_OBJ
+    override = (os.getenv("FINANCIAL_MODEL_PATH") or "").strip()
+    try:
+        from financial.persistence import load_financial_model
+        if override:
+            # Support either a directory or a direct joblib filepath.
+            p = Path(override)
+            parent = str(p.parent if p.suffix else p)
+            fname = p.name if p.suffix else "financial_implementation_cost.joblib"
+            _FINANCIAL_MODEL_OBJ = load_financial_model(parent, filename=fname)
+        else:
+            # Default behavior:
+            # 1) Sync + try loading the financial artifact from the synced models dir.
+            # 2) Prefer a locally trained "workover_like" implementation-cost model when present,
+            #    since implementation cost is a one-time intervention (workover/repair), not LOE.
+            md = get_models_dir()
+            default_candidate = md / "financial_implementation_cost.joblib"
+
+            # Find newest local candidate(s) first (so we can prefer correct training).
+            import glob
+            import os as _os
+
+            root = str(get_project_root() / "models")
+            pattern = _os.path.join(root, "**", "financial_implementation_cost.joblib")
+            candidates = glob.glob(pattern, recursive=True)
+
+            # Prefer workover_like models if present (expected one-time implementation basis).
+            local_workover_like = [fp for fp in candidates if "financial_local_workover_like" in fp]
+            local_pick_list = local_workover_like or candidates
+
+            def _pick_newest(joblib_paths: List[str]) -> Optional[str]:
+                if not joblib_paths:
+                    return None
+                joblib_paths = list(joblib_paths)
+                joblib_paths.sort(key=lambda fp: _os.path.getmtime(fp), reverse=True)
+                return joblib_paths[0]
+
+            local_newest = _pick_newest(local_pick_list)
+
+            if default_candidate.exists():
+                synced_obj = load_financial_model(str(md))
+                mode = (synced_obj or {}).get("implementation_invoice_mode")
+                # Older model artifacts usually don't have this key -> treat as wrong mode.
+                if mode == "workover_like":
+                    _FINANCIAL_MODEL_OBJ = synced_obj
+                else:
+                    # Use locally trained "workover_like" if present; otherwise keep synced.
+                    if local_newest:
+                        model_dir = str(Path(local_newest).parent)
+                        fname = Path(local_newest).name
+                        _FINANCIAL_MODEL_OBJ = load_financial_model(model_dir, filename=fname)
+                    else:
+                        _FINANCIAL_MODEL_OBJ = synced_obj
+            else:
+                if not local_newest:
+                    return None
+                model_dir = str(Path(local_newest).parent)
+                fname = Path(local_newest).name
+                _FINANCIAL_MODEL_OBJ = load_financial_model(model_dir, filename=fname)
+        return _FINANCIAL_MODEL_OBJ
+    except FileNotFoundError as e:
+        _FINANCIAL_MODEL_FAILED = True
+        logger.info("Financial implementation model not found: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("Financial implementation model load failed (retry on next call): %s", e)
+        return None
+
+
+def _metrics_to_financial_feature_values(metrics: Dict[str, Any], model_obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map TrendAnalyzer-style metrics to keys expected by the financial regressor.
+    Invoice/workover roll features are taken from `metrics` when present
+    (computed from invoice parquets upstream). Otherwise they default to 0.0.
+    """
+    window = int(model_obj.get("window_days") or 30)
+    oil_rm = metrics.get("oil_volume_roll_mean")
+    gas_rm = metrics.get("gas_volume_roll_mean")
+    wat_rm = metrics.get("water_volume_roll_mean")
+    try:
+        o = float(oil_rm) if oil_rm is not None and not (isinstance(oil_rm, float) and np.isnan(oil_rm)) else 0.0
+    except Exception:
+        o = 0.0
+    try:
+        g = float(gas_rm) if gas_rm is not None and not (isinstance(gas_rm, float) and np.isnan(gas_rm)) else 0.0
+    except Exception:
+        g = 0.0
+    try:
+        w = float(wat_rm) if wat_rm is not None and not (isinstance(wat_rm, float) and np.isnan(wat_rm)) else 0.0
+    except Exception:
+        w = 0.0
+    boe = o + (g / 6.0) if g else o
+
+    st = metrics.get("status") or metrics.get("well_status")
+    is_shut = 1.0 if (st and str(st).upper().replace(" ", "_") == "SHUT_IN") else 0.0
+
+    def _f(v: Any) -> float:
+        try:
+            if v is None:
+                return 0.0
+            fv = float(v)
+            # Guard against NaN.
+            return 0.0 if np.isnan(fv) else fv
+        except Exception:
+            return 0.0
+
+    base: Dict[str, Any] = {
+        "true_oil": o,
+        "true_gas": g,
+        "true_water": w,
+        "oil_volume": o,
+        "gas_volume": g,
+        "water_volume": w,
+        "boe": boe,
+        "is_shut_in": is_shut,
+        f"invoice_total_usd_roll{window}d": _f(metrics.get(f"invoice_total_usd_roll{window}d")),
+        f"invoice_count_roll{window}d": _f(metrics.get(f"invoice_count_roll{window}d")),
+        f"workover_total_usd_roll{window}d": _f(metrics.get(f"workover_total_usd_roll{window}d")),
+        f"workover_count_roll{window}d": _f(metrics.get(f"workover_count_roll{window}d")),
+    }
+    out: Dict[str, Any] = {}
+    for k in model_obj.get("features") or []:
+        if k in base:
+            out[k] = base[k]
+        else:
+            out[k] = 0.0
+    return out
+
+
+def merge_metrics_for_financial_impact(
+    production_data: Optional[Dict[str, Any]],
+    sensor_metrics: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge API-style production + sensor dicts into TrendAnalyzer-like keys for financial features."""
+    out: Dict[str, Any] = {}
+    if sensor_metrics:
+        out.update(sensor_metrics)
+    pd = production_data or {}
+    for k, v in pd.items():
+        out.setdefault(k, v)
+    if "oil_volume_roll_mean" not in out:
+        for alt in ("oil_roll_mean", "oil_bbl_day", "oil_rate", "avg_oil"):
+            if pd.get(alt) is not None:
+                try:
+                    out["oil_volume_roll_mean"] = float(pd[alt])
+                    break
+                except Exception:
+                    pass
+    if "gas_volume_roll_mean" not in out:
+        for alt in ("gas_roll_mean", "gas_mcf_day"):
+            if pd.get(alt) is not None:
+                try:
+                    out["gas_volume_roll_mean"] = float(pd[alt])
+                    break
+                except Exception:
+                    pass
+    if "water_volume_roll_mean" not in out:
+        for alt in ("water_roll_mean", "water_bbl_day"):
+            if pd.get(alt) is not None:
+                try:
+                    out["water_volume_roll_mean"] = float(pd[alt])
+                    break
+                except Exception:
+                    pass
+    return out
+
+
+def compute_financial_impact_fields(
+    metrics: Optional[Dict[str, Any]],
+    production_increase_bbl_day: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Revenue and cost fields aligned with EIA Brent spot and the financial ML model.
+
+    - daily_expense_benefit_usd: bbl/day × latest EIA Brent (or OPERATIONS_OIL_PRICE_USD fallback).
+    - implementation_cost_usd: **financial model only** — one-time USD =
+      ``predict_implementation_cost_usd_per_day × IMPLEMENTATION_LUMP_DAYS`` (no revenue heuristic,
+      no EIA scaling on implementation; model output is USD).
+    - net_daily_benefit_usd: daily benefit − (one-time cost / amortization days).
+    - asset_value_increase_usd: net_daily × 365 (simple annualization).
+
+    If the financial model is missing or prediction fails, implementation_cost_usd is 0.
+
+    Env:
+      IMPLEMENTATION_LUMP_DAYS: multiply modeled daily rate to one-time lump (default 30).
+      IMPLEMENTATION_AMORTIZATION_DAYS: amortize one-time cost for net daily (default 180).
+    """
+    metrics = metrics or {}
+    try:
+        bbl = float(production_increase_bbl_day or 0.0)
+    except Exception:
+        bbl = 0.0
+
+    price_per_bbl, price_src, price_period = get_brent_spot_usd_per_bbl()
+    daily_benefit = bbl * price_per_bbl
+
+    lump_days = float(os.getenv("IMPLEMENTATION_LUMP_DAYS", "30") or 30)
+    amort_days = float(os.getenv("IMPLEMENTATION_AMORTIZATION_DAYS", "180") or 180)
+
+    impl_one_time = 0.0
+    impl_basis = "none"
+    financial_model_mode: Optional[str] = None
+
+    mdl = _get_financial_model_obj()
+    if mdl is not None:
+        financial_model_mode = mdl.get("implementation_invoice_mode")
+        try:
+            from financial.persistence import predict_implementation_cost_usd_per_day
+
+            fv = _metrics_to_financial_feature_values(metrics, mdl)
+            daily_impl = float(predict_implementation_cost_usd_per_day(mdl, fv))
+            impl_one_time = max(0.0, daily_impl) * max(1.0, lump_days)
+            impl_basis = "financial_model"
+        except Exception as e:
+            logger.warning("Financial model prediction failed: %s", e)
+            impl_basis = "financial_model_error"
+
+    impl_one_time = round(max(0.0, impl_one_time), 2)
+    daily_benefit_r = round(daily_benefit, 2) if daily_benefit else 0.0
+
+    amort = max(1.0, amort_days)
+    net_daily = round(daily_benefit_r - (impl_one_time / amort), 2)
+    asset_val = round(net_daily * 365.0, 2) if net_daily else 0.0
+
+    return {
+        "daily_expense_benefit_usd": daily_benefit_r,
+        "implementation_cost_usd": impl_one_time,
+        "net_daily_benefit_usd": net_daily,
+        "asset_value_increase_usd": asset_val,
+        "_financial_meta": {
+            "oil_spot_usd_per_bbl": round(price_per_bbl, 4),
+            "oil_spot_source": price_src,
+            "oil_spot_period": price_period,
+            "implementation_cost_basis": impl_basis,
+            "financial_model_invoice_mode": financial_model_mode,
+            "implementation_cost_is_one_time": True,
+            "implementation_amortization_days": int(amort),
+            "implementation_lump_days": int(lump_days),
+        },
+    }
+
 
 # Map ML class (action) -> rule config for detailed_analysis, citations, etc.
 CLASS_TO_ACTION_CONFIG: Dict[str, Dict[str, Any]] = {}
@@ -325,6 +579,164 @@ def _has_detection_signal(metrics: Dict[str, Any]) -> bool:
     return has_prod_data or has_sensor_data or has_correlations
 
 
+def derive_production_impact_from_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Model-aligned production uplift fields from TrendAnalyzer-style metrics (same logic as ML recommendations).
+    Returns keys: production_increase_bbl_day, production_increase_percent (may be None).
+    """
+    out: Dict[str, Any] = {
+        "production_increase_bbl_day": None,
+        "production_increase_percent": None,
+    }
+    try:
+        # Prefer baseline-vs-current recoverable uplift if present (data-driven).
+        # Fallback to slope-based proxy otherwise.
+        oil_rec = metrics.get("oil_volume_recoverable_uplift")
+        gas_rec = metrics.get("gas_volume_recoverable_uplift")
+        oil_roll_mean = metrics.get("oil_volume_roll_mean")
+        gas_roll_mean = metrics.get("gas_volume_roll_mean")
+
+        boe_uplift = None
+        try:
+            o = float(oil_rec) if oil_rec is not None else None
+        except Exception:
+            o = None
+        try:
+            g = float(gas_rec) if gas_rec is not None else None
+        except Exception:
+            g = None
+
+        if o is not None or g is not None:
+            boe_uplift = float(o or 0.0) + (float(g or 0.0) / 6.0)
+        else:
+            # Convert slopes into a single "bbl/day" uplift proxy using BOE convention.
+            oil_slope = metrics.get("oil_volume_slope")
+            gas_slope = metrics.get("gas_volume_slope")
+
+            oil_boeday = None
+            gas_boeday = None
+            if oil_slope is not None:
+                oil_boeday = float(abs(oil_slope))
+            if gas_slope is not None:
+                gas_boeday = float(abs(gas_slope)) / 6.0
+
+            if oil_boeday is None and gas_boeday is None:
+                return out
+
+            boe_uplift = 0.0
+            if oil_boeday is not None:
+                boe_uplift += oil_boeday
+            if gas_boeday is not None:
+                boe_uplift += gas_boeday
+
+        out["production_increase_bbl_day"] = round(float(boe_uplift), 2)
+
+        base_oil = float(oil_roll_mean) if oil_roll_mean is not None else 0.0
+        base_gas = float(gas_roll_mean) / 6.0 if gas_roll_mean is not None else 0.0
+        base = base_oil + base_gas
+        if base > 0:
+            uplift = float(out.get("production_increase_bbl_day") or 0.0)
+            out["production_increase_percent"] = round((uplift / base) * 100.0, 2)
+    except Exception:
+        pass
+    return out
+
+
+def _fmt_metric(val: Any, digits: int = 2) -> str:
+    """Format numeric metric for user-visible text."""
+    if val is None:
+        return "—"
+    try:
+        fv = float(val)
+        if np.isnan(fv):
+            return "—"
+        # Avoid "-0.00"
+        if abs(fv) < 10 ** (-digits):
+            fv = 0.0
+        return f"{fv:.{digits}f}"
+    except Exception:
+        return "—"
+
+
+def _build_current_vs_optimal_performance(metrics: Dict[str, Any], uplift_bbl_day: Optional[float]) -> str:
+    """
+    Build a "Current vs Optimal Performance" text block.
+
+    - Current production uses `*_roll_mean` values.
+    - Optimal production uses uplift applied to BOE, split into oil/gas by current proportions.
+    - Sensor snapshot uses `*_latest` values from TrendAnalyzer.
+    """
+    try:
+        uplift = float(uplift_bbl_day or 0.0)
+    except Exception:
+        uplift = 0.0
+
+    oil_cur = metrics.get("oil_volume_roll_mean")
+    gas_cur = metrics.get("gas_volume_roll_mean")
+    water_cur = metrics.get("water_volume_roll_mean")
+
+    # BOE components (gas converted to oil-equivalent using /6).
+    oil_boed = float(oil_cur or 0.0)
+    gas_boed = float(gas_cur or 0.0) / 6.0
+    cur_boe = oil_boed + gas_boed
+    opt_boe = cur_boe + uplift
+
+    if cur_boe > 0:
+        oil_share = oil_boed / cur_boe
+        gas_share = gas_boed / cur_boe
+    else:
+        oil_share = 1.0
+        gas_share = 0.0
+
+    oil_opt = opt_boe * oil_share
+    gas_opt_boed = opt_boe * gas_share
+    gas_opt = gas_opt_boed * 6.0
+    water_opt = float(water_cur or 0.0)
+
+    motor_current = metrics.get("motor_current_latest")
+    motor_temp = metrics.get("motor_temp_latest")
+    surface_pressure = metrics.get("surface_pressure_latest")
+
+    oil_slope = metrics.get("oil_volume_slope")
+    gas_slope = metrics.get("gas_volume_slope")
+    water_slope = metrics.get("water_volume_slope")
+
+    # Optional rule-template target hint will be appended by caller if available.
+    return "\n".join(
+        [
+            "Current vs. Optimal Performance",
+            "Performance Snapshot",
+            f"Oil: {_fmt_metric(oil_cur)} bbl/d  | Optimal: {_fmt_metric(oil_opt)} bbl/d",
+            f"Gas: {_fmt_metric(gas_cur)} mcf/d  | Optimal: {_fmt_metric(gas_opt)} mcf/d",
+            f"Water: {_fmt_metric(water_cur)} bbl/d  | Optimal: {_fmt_metric(water_opt)} bbl/d",
+            f"Motor Current: {_fmt_metric(motor_current)} A · Temp: {_fmt_metric(motor_temp)} °F",
+            f"Surface Pressure: {_fmt_metric(surface_pressure)} psi",
+            "Historical Trend",
+            f"Oil slope: {_fmt_metric(oil_slope)}  | Gas slope: {_fmt_metric(gas_slope)}",
+            f"Water slope: {_fmt_metric(water_slope)}",
+        ]
+    )
+
+
+def _build_recent_production_30d_block(metrics: Dict[str, Any]) -> str:
+    """Build "Recent Production (Last 30 Days)" block from 30d mean/latest metrics."""
+    oil_mean = metrics.get("oil_volume_recent_30d_mean")
+    oil_latest = metrics.get("oil_volume_recent_30d_latest")
+    gas_mean = metrics.get("gas_volume_recent_30d_mean")
+    gas_latest = metrics.get("gas_volume_recent_30d_latest")
+    water_mean = metrics.get("water_volume_recent_30d_mean")
+    water_latest = metrics.get("water_volume_recent_30d_latest")
+
+    return "\n".join(
+        [
+            "Recent Production (Last 30 Days)",
+            f"Oil: mean {_fmt_metric(oil_mean)} bbl/d  | latest {_fmt_metric(oil_latest)} bbl/d",
+            f"Gas: mean {_fmt_metric(gas_mean)} mcf/d  | latest {_fmt_metric(gas_latest)} mcf/d",
+            f"Water: mean {_fmt_metric(water_mean)} bbl/d  | latest {_fmt_metric(water_latest)} bbl/d",
+        ]
+    )
+
+
 def _create_prediction_record(
     well: str, action: str, proba: Optional[float], 
     metrics: Dict[str, Any], lift_type: str
@@ -338,6 +750,7 @@ def _create_prediction_record(
     else:
         priority = 'LOW'
     
+    _ts = datetime.now(timezone.utc).isoformat()
     rec = {
         'well_id': well,
         'action': action,
@@ -351,46 +764,27 @@ def _create_prediction_record(
         'prediction_source': 'ml_model',
         'probability': proba,
         'metrics': metrics,
-        'created_at': datetime.now(timezone.utc).isoformat(),
+        'created_at': _ts,
+        'updated_at': _ts,
         'id': str(uuid.uuid4()),
-        'category': ACTION_CATEGORY_MAP.get(action, 'Production')
+        'category': ACTION_CATEGORY_MAP.get(action, 'Production'),
+        'user_id': None,
+        'user_name': None,
     }
 
-    # Derive impact fields for downstream Prisma mapping.
-    # Use available metrics (e.g., oil_volume_slope) as a proxy for production uplift.
+    prod_imp = derive_production_impact_from_metrics(metrics)
+    rec['production_increase_bbl_day'] = prod_imp.get('production_increase_bbl_day')
+    rec['production_increase_percent'] = prod_imp.get('production_increase_percent')
+
+    # Financial impact: EIA Brent for revenue; financial model for one-time implementation.
+    meta: Dict[str, Any] = {}
     try:
-        oil_slope = metrics.get('oil_volume_slope')
-        oil_roll_mean = metrics.get('oil_volume_roll_mean')
-        # Approximate production increase as "avoided decline" or uplift
-        if oil_slope is not None:
-            rec['production_increase_bbl_day'] = round(float(abs(oil_slope)), 2)
-        if oil_roll_mean is not None and oil_roll_mean:
-            base = float(oil_roll_mean)
-            uplift = float(rec.get('production_increase_bbl_day') or 0.0)
-            if base > 0:
-                rec['production_increase_percent'] = round((uplift / base) * 100.0, 2)
-    except Exception:
-        rec.setdefault('production_increase_bbl_day', None)
-        rec.setdefault('production_increase_percent', None)
-
-    # Map confidence_percent into a rough financial impact estimate.
-    # Assumes $70/bbl and simple payback with 30 days of benefit.
-    try:
-        bbl_per_day = float(rec.get('production_increase_bbl_day') or 0.0)
-        price_per_bbl = float(os.getenv("OPERATIONS_OIL_PRICE_USD", "70") or 70)
-        daily_benefit = bbl_per_day * price_per_bbl
-        rec['daily_expense_benefit_usd'] = round(daily_benefit, 2) if daily_benefit else 0.0
-
-        # Implementation cost: simple heuristic as a few days of benefit
-        rec['implementation_cost_usd'] = round(daily_benefit * 3, 2) if daily_benefit else 0.0
-        rec['net_daily_benefit_usd'] = round(
-            daily_benefit - (rec['implementation_cost_usd'] / 30.0), 2
-        ) if daily_benefit else 0.0
-
-        # Asset value increase as 1 year of net daily benefit
-        rec['asset_value_increase_usd'] = round(
-            rec['net_daily_benefit_usd'] * 365.0, 2
-        ) if rec['net_daily_benefit_usd'] else 0.0
+        fin = compute_financial_impact_fields(metrics, rec.get('production_increase_bbl_day'))
+        meta = fin.pop("_financial_meta", {}) or {}
+        rec['daily_expense_benefit_usd'] = fin.get('daily_expense_benefit_usd', 0.0)
+        rec['implementation_cost_usd'] = fin.get('implementation_cost_usd', 0.0)
+        rec['net_daily_benefit_usd'] = fin.get('net_daily_benefit_usd', 0.0)
+        rec['asset_value_increase_usd'] = fin.get('asset_value_increase_usd', 0.0)
     except Exception:
         rec.setdefault('daily_expense_benefit_usd', 0.0)
         rec.setdefault('implementation_cost_usd', 0.0)
@@ -399,39 +793,44 @@ def _create_prediction_record(
 
     # Enrich from rule templates (ACTION_MAPPING) so citations and narrative fields are populated.
     cfg = CLASS_TO_ACTION_CONFIG.get(action)
+    target_hint: Optional[str] = None
     if cfg:
         rec['detailed_analysis'] = cfg.get('high_action') or cfg.get('low_action') or action
         templates = cfg.get('templates') or []
         if templates:
             tpl = templates[0]
             try:
-                rec['optimal_performance'] = tpl.format(current=metrics.get('oil_volume_roll_mean') or '—', target='optimal')
+                raw_val = metrics.get('oil_volume_roll_mean') or '—'
+                try:
+                    cur_val = round(float(raw_val), 2)
+                except Exception:
+                    cur_val = raw_val
+                target_hint = tpl.format(current=cur_val, target='optimal')
             except Exception:
-                rec['optimal_performance'] = tpl
+                target_hint = tpl
         else:
-            rec['optimal_performance'] = cfg.get('high_action') or cfg.get('low_action')
+            target_hint = cfg.get('high_action') or cfg.get('low_action')
     else:
         rec['detailed_analysis'] = rec.get('reason') or action
-        rec['optimal_performance'] = None
+        target_hint = None
 
-    # Current performance: one-line summary of key metrics
-    _parts = []
-    for k in ('oil_volume_slope', 'oil_volume_roll_mean', 'gas_volume_slope'):
-        v = metrics.get(k)
-        if v is not None:
-            try:
-                _parts.append(f"{k}: {float(v):.2f}")
-            except Exception:
-                pass
-    rec['current_performance'] = "; ".join(_parts) if _parts else "Metrics from sensor and production parquet"
+    # Build user-visible performance blocks.
+    current_vs_opt = _build_current_vs_optimal_performance(metrics, rec.get("production_increase_bbl_day"))
+    if target_hint:
+        current_vs_opt = current_vs_opt + f"\nOptimal Target: {target_hint}"
+    rec["current_performance"] = current_vs_opt
+    rec["historical_trend"] = _build_recent_production_30d_block(metrics)
 
     # Citations and references for audit/supporting analysis
-    rec['citations'] = json.dumps({
+    cite_obj: Dict[str, Any] = {
         "source": "ML model + operational rule templates",
         "referenced_data": ["well_sensor_readings", "daily_production"],
         "supporting_analysis": "Recommendation from decision-tree classifier and sensor/production metrics.",
         "data_quality": "Parquet-based sensor and daily production data used for trends.",
-    })
+    }
+    if meta:
+        cite_obj["financial_pricing"] = meta
+    rec['citations'] = json.dumps(cite_obj)
     rec['referenced_data'] = json.dumps(["well_sensor_readings", "daily_production"])
     rec['supporting_analysis'] = "Recommendation based on sensor trends, production metrics, and operational rules."
     rec['data_quality'] = "Sensor and production parquet used for metrics; ML confidence threshold applied."
@@ -444,6 +843,8 @@ def _create_prediction_record(
     rec.setdefault('status_reason', None)
     rec.setdefault('mute_till', None)
     rec.setdefault('open_up', None)
+    rec.setdefault('user_id', None)
+    rec.setdefault('user_name', None)
     
     # Try category model
     try:
@@ -467,7 +868,7 @@ def recommend_from_metrics(
     confidence_threshold: float = 0.6,
 ) -> List[Dict[str, Any]]:
     """
-    Generate operational recommendations from pre-computed metrics only (no Snowflake).
+    Generate operational recommendations from pre-computed metrics only (S3 / stateless).
     Use this for stateless inference (e.g. SageMaker endpoint).
 
     Args:
@@ -500,6 +901,22 @@ def recommend_from_metrics(
     results = []
     for pred_action, proba in candidates:
         rec = _create_prediction_record(well_id, pred_action, proba, metrics, lift_type)
+        # Production-ready acceptance rules (model-driven economics):
+        # - Don't recommend if predicted production uplift is tiny/zero.
+        # - Don't recommend if net daily benefit is not positive.
+        min_uplift = float(os.getenv("OPS_MIN_PRODUCTION_INCREASE_BBL_DAY", "0.5") or 0.5)
+        try:
+            uplift = float(rec.get("production_increase_bbl_day") or 0.0)
+        except Exception:
+            uplift = 0.0
+        try:
+            net = float(rec.get("net_daily_benefit_usd") or 0.0)
+        except Exception:
+            net = 0.0
+        if uplift < min_uplift:
+            continue
+        if net <= 0:
+            continue
         results.append(rec)
     return results
 
@@ -550,7 +967,7 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         "time_reduced_hours",
         "detailed_analysis",
         "current_performance",
-        "optimal_performance",
+        "historical_trend",
         "conservative_approach",
         "aggressive_optimization",
         "hybrid_model",
@@ -564,10 +981,26 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         "mute_till",
         "open_up",
         "metrics_json",
+        "user_id",
+        "user_name",
         "created_at",
         "updated_at",
         "organization_id",
     )
+    # Numeric fields to round to 2 decimal places
+    _NUMERIC_FIELDS = {
+        "confidence_percent",
+        "confidence",
+        "probability",
+        "production_increase_bbl_day",
+        "production_increase_percent",
+        "daily_expense_benefit_usd",
+        "implementation_cost_usd",
+        "net_daily_benefit_usd",
+        "asset_value_increase_usd",
+        "time_reduced_hours",
+    }
+
     rows = []
     for r in recommendations:
         row = {k: r.get(k) for k in flat_keys}
@@ -583,6 +1016,8 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
                 row["organization_id"] = get_organization_id()
             except Exception:
                 row["organization_id"] = None
+        if row.get("created_at") is None:
+            row["created_at"] = datetime.now(timezone.utc).isoformat()
         if row.get("updated_at") is None:
             row["updated_at"] = row.get("created_at")
 
@@ -592,6 +1027,15 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
             row["metrics_json"] = serialized
         elif row.get("metrics_json") is None:
             row["metrics_json"] = None
+
+        # Round all numeric fields to 2 decimal places
+        for field in _NUMERIC_FIELDS:
+            if row.get(field) is not None:
+                try:
+                    row[field] = round(float(row[field]), 2)
+                except Exception:
+                    pass
+
         rows.append(row)
     df = pd.DataFrame(rows)
     buf = io.BytesIO()

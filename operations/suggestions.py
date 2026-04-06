@@ -1,6 +1,6 @@
 """
-Database operations for operational recommendations and suggestions.
-PostgreSQL (operation_suggestion) storage only; S3 for data and models.
+Operational recommendations and suggestions.
+Storage: S3 Parquet only. Numeric fields follow ML/EIA models first; OpenRouter enriches text only.
 """
 
 import json
@@ -8,12 +8,10 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-import shlex
 import re
 from datetime import datetime, timezone
 from uuid import uuid4
-import psycopg2
-from psycopg2.extras import RealDictCursor
+
 from dotenv import load_dotenv
 import openai
 
@@ -38,119 +36,32 @@ client = openai.OpenAI(
 )
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-3.5-turbo")
 
-# PostgreSQL Configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-
-def get_pg_connection():
-    """Get PostgreSQL connection."""
-    try:
-        if not DATABASE_URL:
-            logger.error("DATABASE_URL is not set in .env")
-            return None
-        from urllib.parse import urlparse, urlunparse
-        parsed = urlparse(DATABASE_URL)
-        clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, '', parsed.fragment))
-        conn = psycopg2.connect(clean_url)
-        return conn
-    except Exception as e:
-        logger.error(f"Failed to connect to PostgreSQL: {e}")
-        return None
-
-
-def create_operation_suggestion_table():
-    """Create operation_suggestion table in PostgreSQL."""
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Could not create table: no PostgreSQL connection")
-        return False
-    
-    cur = conn.cursor()
-    try:
-        create_table_sql = """
-        CREATE TABLE IF NOT EXISTS operation_suggestion (
-            id VARCHAR(50) PRIMARY KEY,
-            well_id VARCHAR(50) NOT NULL,
-            category VARCHAR(50) DEFAULT 'Production',
-            action VARCHAR(255) NOT NULL,
-            status VARCHAR(50) DEFAULT 'New',
-            priority VARCHAR(50) DEFAULT 'HIGH',
-            confidence_percent FLOAT,
-            
-            -- Production Impact
-            production_increase_bbl_day FLOAT,
-            production_increase_percent FLOAT,
-            
-            -- Financial Impact
-            daily_expense_benefit_usd FLOAT,
-            implementation_cost_usd FLOAT,
-            net_daily_benefit_usd FLOAT,
-            asset_value_increase_usd FLOAT,
-            
-            -- Operational Details
-            time_reduced_hours FLOAT,
-            detailed_analysis TEXT,
-            current_performance VARCHAR(255),
-            optimal_performance VARCHAR(255),
-            
-            -- Alternative Models
-            conservative_approach TEXT,
-            aggressive_optimization TEXT,
-            hybrid_model TEXT,
-            recommended_model VARCHAR(50),
-            
-            -- Citations and References
-            citations TEXT,
-            referenced_data TEXT,
-            supporting_analysis TEXT,
-            data_quality VARCHAR(100),
-            
-            -- Additional Fields
-            reason TEXT,
-            expected_impact VARCHAR(500),
-            metrics_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-        cur.execute(create_table_sql)
-        conn.commit()
-        logger.info("✓ operation_suggestion table created/verified")
-        return True
-    except Exception as e:
-        logger.error(f"Error creating table: {e}")
-        return False
-    finally:
-        cur.close()
-        conn.close()
-
-
-def generate_operation_suggestion_with_openai(well_id: str, action: str, 
-                                             production_data: dict = None,
-                                             sensor_metrics: dict = None) -> dict:
+def generate_operation_suggestion_with_openai(well_id: str, action: str,
+                                              production_data: dict = None,
+                                              sensor_metrics: dict = None) -> dict:
     """
     Generate detailed operation suggestion using OpenAI.
-    
+
     Args:
         well_id: Well identifier
         action: Recommended action (e.g., "Increase ESP frequency")
         production_data: Dict with current production metrics
         sensor_metrics: Dict with sensor readings
-    
+
     Returns:
         Dict with detailed suggestion data
     """
     try:
-        # Build context from available data
         context = f"Well: {well_id}\nRecommended Action: {action}\n"
-        
+
         if production_data:
-            context += f"\nProduction Data:\n"
+            context += "\nProduction Data:\n"
             for key, value in production_data.items():
                 context += f"  - {key}: {value}\n"
-        
+
         if sensor_metrics:
-            context += f"\nSensor Metrics:\n"
+            context += "\nSensor Metrics:\n"
             for key, value in sensor_metrics.items():
                 context += f"  - {key}: {value}\n"
 
@@ -162,34 +73,26 @@ Provide a comprehensive analysis as a single JSON object matching the schema bel
 
 CRITICAL: alternative_models must be CONTENT ONLY—no section headers (no "CONSERVATIVE APPROACH:", "AGGRESSIVE OPTIMIZATION:", "HYBRID MODEL:"). No "RECOMMENDED:" prefix on recommended_model. Start each approach with bullets (•) only.
 
-Use the client example below only as a STYLE guide (incremental vs immediate, risk/return, expected uplift + timeframe). Do NOT copy it exactly—tailor all content, numbers, and specifics to the given well and action.
+Use the style guide below only as a reference—tailor all content, numbers, and specifics to the given well and action.
 
-conservative_approach: 3–4 bullets—incremental/safe change, risk, expected uplift % and timeframe (vary for this well).
-aggressive_optimization: 3–4 bullets—immediate/bold change, higher return + monitoring, expected uplift % and timeframe (vary for this well).
-hybrid_model: 3–4 bullets—phased + real-time/AI, expected uplift % and timeframe (vary for this well).
+conservative_approach: 3-4 bullets—incremental/safe change, risk, expected uplift % and timeframe.
+aggressive_optimization: 3-4 bullets—immediate/bold change, higher return + monitoring, expected uplift % and timeframe.
+hybrid_model: 3-4 bullets—phased + real-time/AI, expected uplift % and timeframe.
 recommended_model: One sentence picking the best option and why—specific to this well, not generic.
+time_reduced_hours: Estimated hours until measurable improvement (e.g., 24, 48, 72). Must be a real numeric estimate, never 0.
 
-Style reference only (do not repeat this text; generate fresh content for the well/action):
-conservative_approach: • Adjust ESP frequency incrementally (+2Hz per week)\\n• Lower risk, slower results\\n• Expected uplift: 8-12% over 4 weeks
-aggressive_optimization: • Immediate adjustment to 55Hz + additional parameters\\n• Higher potential return, increased monitoring required\\n• Expected uplift: 18-22% within 1 week
-hybrid_model: • Phased approach with real-time optimization\\n• AI-driven parameter adjustments based on live data\\n• Expected uplift: 15-20% over 2 weeks
-recommended_model: Hybrid model provides optimal risk-return balance.
+CITATIONS: Use ONLY AUTHENTIC, NON-FABRICATED data.
+- referenced_data: Array of 2-4 strings using only generic, authentic sources.
+- supporting_analysis: One paragraph of technical analysis specific to this well.
+- data_quality: One line with confidence and basis.
 
-CITATIONS: Use ONLY AUTHENTIC, NON-FABRICATED data. Do NOT invent SPE paper numbers, fake report names (e.g. "Q2 2024 Well Performance Review"), or fake vendor manual titles. Only reference sources that are generic and truthful.
-- referenced_data: Array of 2–4 strings. Use ONLY generic, authentic sources such as: "Company internal analysis", "Historical well and sensor data", "Agentic Energy proprietary ML model", "Field data from analogous wells", "Real-time sensor and production data". Do NOT make up specific paper numbers, report titles, or vendor document names.
-- supporting_analysis: One paragraph of technical analysis specific to this well. Reference only the generic sources above (e.g. "Internal analysis indicates...", "Historical data shows..."). Do NOT cite specific SPE papers, report names, or vendor manuals. Vary the analysis content per well.
-- data_quality: One line with confidence and basis, using only real or generic wording (e.g. "High confidence based on historical data and real-time sensor readings" or "Medium confidence based on available well data"). Do not invent specific percentages or document names.
-
-Authentic citations example (structure only—vary wording per well):
-referenced_data: ["Company internal analysis", "Historical well and sensor data", "Agentic Energy proprietary ML model"]
-supporting_analysis: "Internal analysis indicates this intervention aligns with observed well behavior. Historical data from analogous wells supports the expected impact. The recommendation is consistent with current operating conditions and sensor readings."
-data_quality: "High confidence based on historical data and real-time sensor readings."
+FINANCIAL (placeholders): Downstream replaces USD fields using EIA Brent spot and ML models. Treat implementation_cost_usd as total ONE-TIME implementation cost (USD lump sum), not a daily rate.
 
 Schema (JSON):
 {{
     "production_impact": {{ "increase_bbl_day": <number>, "increase_percent": <number>, "confidence_percent": <number> }},
     "financial_impact": {{ "daily_expense_benefit_usd": <number>, "implementation_cost_usd": <number>, "net_daily_benefit_usd": <number>, "asset_value_increase_usd": <number> }},
-    "operational_details": {{ "time_reduced_hours": <number>, "current_performance": "<description>", "optimal_performance": "<description>", "detailed_analysis": "<text>" }},
+    "operational_details": {{ "time_reduced_hours": <realistic number e.g. 24>, "current_performance": "<description>", "historical_trend": "<description — recent production / trend context>", "detailed_analysis": "<text>" }},
     "alternative_models": {{
         "conservative_approach": "<bullets only>",
         "aggressive_optimization": "<bullets only>",
@@ -197,14 +100,14 @@ Schema (JSON):
         "recommended_model": "<one sentence only>"
     }},
     "citations": {{
-        "referenced_data": ["<string>", "<string>", ...],
+        "referenced_data": ["<string>", "<string>"],
         "supporting_analysis": "<paragraph specific to this well>",
-        "data_quality": "<e.g. High confidence (X%) based on Y days...>"
+        "data_quality": "<e.g. High confidence based on historical data>"
     }},
     "category": "Production|Optimization|Maintenance"
 }}
 
-Return valid JSON only. Preserve newlines and bullet characters (•). Output content only—no headers. Citations must be authentic only—no fabricated SPE papers, report names, or vendor manual titles.
+Return valid JSON only. Preserve newlines and bullet characters (•). Output content only—no headers.
 """
 
         response = client.chat.completions.create(
@@ -220,116 +123,27 @@ Return valid JSON only. Preserve newlines and bullet characters (•). Output co
                 }
             ],
             temperature=0.3,
+            response_format={"type": "json_object"},
         )
 
         content = response.choices[0].message.content
-
-        # Clean markdown code blocks if present
-        raw = content
-        try:
-            if "```json" in raw:
-                raw = raw.split("```json", 1)[1].rsplit("```", 1)[0]
-            elif "```" in raw:
-                raw = raw.split("```", 1)[1].rsplit("```", 1)[0]
-
-            # Attempt direct parse first
-            try:
-                suggestion_data = json.loads(raw.strip())
-                return suggestion_data
-            except Exception as e_direct:
-                # Try to extract the first JSON object in the text
-                import re as _re
-                m = _re.search(r"\{.*\}", raw, _re.DOTALL)
-                if m:
-                    candidate = m.group(0)
-                    # Fix common issues: trailing commas
-                    candidate_fixed = _re.sub(r",\s*\}", "}", candidate)
-                    candidate_fixed = _re.sub(r",\s*\]", "]", candidate_fixed)
-                    try:
-                        suggestion_data = json.loads(candidate_fixed)
-                        return suggestion_data
-                    except Exception as e_candidate:
-                        logger.warning(f"Failed to parse candidate JSON from OpenAI (attempts): {e_direct}; {e_candidate}")
-                else:
-                    logger.warning("No JSON object found in OpenAI response; falling back")
-
-        except Exception as e_clean:
-            logger.warning(f"Error cleaning OpenAI content: {e_clean}")
-
-        # If parsing failed, log raw content for debugging and return a safe fallback
-        logger.error(f"Failed to parse OpenAI response into JSON. Raw content:\n{content}")
-        return {
-            "production_impact": {
-                "increase_bbl_day": 0,
-                "increase_percent": 0,
-                "confidence_percent": 0
-            },
-            "financial_impact": {
-                "daily_expense_benefit_usd": 0,
-                "implementation_cost_usd": 0,
-                "net_daily_benefit_usd": 0,
-                "asset_value_increase_usd": 0
-            },
-            "operational_details": {
-                "time_reduced_hours": 0,
-                "current_performance": "Unknown",
-                "optimal_performance": "Unknown",
-                "detailed_analysis": f"AI output could not be parsed as JSON. See logs."
-            },
-            "alternative_models": {
-                "conservative_approach": "N/A",
-                "aggressive_optimization": "N/A",
-                "hybrid_model": "N/A",
-                "recommended_model": "N/A"
-            },
-            "citations": {
-                "referenced_data": [],
-                "supporting_analysis": "N/A",
-                "data_quality": "Low"
-            }
-        }
+        suggestion_data = json.loads(content.strip())
+        return suggestion_data
 
     except Exception as e:
         logger.error(f"Error generating suggestion: {e}")
         return {
-            "production_impact": {
-                "increase_bbl_day": 0,
-                "increase_percent": 0,
-                "confidence_percent": 0
-            },
-            "financial_impact": {
-                "daily_expense_benefit_usd": 0,
-                "implementation_cost_usd": 0,
-                "net_daily_benefit_usd": 0,
-                "asset_value_increase_usd": 0
-            },
-            "operational_details": {
-                "time_reduced_hours": 0,
-                "current_performance": "Unknown",
-                "optimal_performance": "Unknown",
-                "detailed_analysis": f"AI Generation failed: {str(e)}"
-            },
-            "alternative_models": {
-                "conservative_approach": "N/A",
-                "aggressive_optimization": "N/A",
-                "hybrid_model": "N/A",
-                "recommended_model": "N/A"
-            },
-            "citations": {
-                "referenced_data": [],
-                "supporting_analysis": "N/A",
-                "data_quality": "Low"
-            }
+            "production_impact": {"increase_bbl_day": 0, "increase_percent": 0, "confidence_percent": 0},
+            "financial_impact": {"daily_expense_benefit_usd": 0, "implementation_cost_usd": 0, "net_daily_benefit_usd": 0, "asset_value_increase_usd": 0},
+            "operational_details": {"time_reduced_hours": 0, "current_performance": "Unknown", "historical_trend": "Unknown", "detailed_analysis": f"AI Generation failed: {str(e)}"},
+            "alternative_models": {"conservative_approach": "N/A", "aggressive_optimization": "N/A", "hybrid_model": "N/A", "recommended_model": "N/A"},
+            "citations": {"referenced_data": [], "supporting_analysis": "N/A", "data_quality": "Low"}
         }
 
 
 def infer_action_category_priority(well_id: str, production_data: dict = None, sensor_metrics: dict = None, hint: str = None) -> dict:
-    """Use OpenAI to infer a concise `action`, `category` and `priority` for a well given data.
-
-    Returns: {'action': str, 'category': 'Production'|'Optimization'|'Maintenance', 'priority': 'HIGH'|'MEDIUM'|'LOW'}
-    """
+    """Use OpenAI to infer a concise `action`, `category` and `priority` for a well given data."""
     try:
-        # Build compact context
         context = f"Well: {well_id}\n"
         if production_data:
             context += "Production:\n"
@@ -344,7 +158,7 @@ def infer_action_category_priority(well_id: str, production_data: dict = None, s
 
         prompt = f"""You are a petroleum engineer. Given the well context, choose a single concise recommended action (short phrase), a high-level category from [Production, Optimization, Maintenance], and a priority from [HIGH, MEDIUM, LOW]. Respond as JSON with keys: action, category, priority.
 
-    Preferred action style: use concise, operational phrasing similar to these examples:
+    Preferred action style:
     - "Increase ESP frequency from 55Hz to 58Hz"
     - "Increase gas injection rate from 2.5 MMSCF to 3.2 MMSCF"
     - "Replace impeller and perform alignment check within 7 days"
@@ -365,22 +179,18 @@ def infer_action_category_priority(well_id: str, production_data: dict = None, s
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
+            response_format={"type": "json_object"},
         )
-        content = response.choices[0].message.content
-        # strip code fences
-        if "```" in content:
-            content = content.split("```")[-1].strip()
-        parsed = json.loads(content)
-        action = parsed.get('action')
-        category = parsed.get('category')
-        priority = parsed.get('priority')
-        return {'action': action, 'category': category, 'priority': priority}
+        parsed = json.loads(response.choices[0].message.content)
+        return {
+            'action': parsed.get('action'),
+            'category': parsed.get('category'),
+            'priority': parsed.get('priority')
+        }
     except Exception as e:
         logger.warning(f"OpenAI inference failed, falling back to hint/mapping: {e}")
-        # fallback: use hint or simple keyword mapping to pick a reasonable category
         fallback_action = (hint or 'Investigate well metrics')
         act_low = (fallback_action or '').lower()
-        # simple keyword-based heuristics
         if any(k in act_low for k in ('increase', 'esp', 'pump', 'choke', 'polish')):
             fallback_category = 'Production'
         elif any(k in act_low for k in ('optimi', 'reduce', 'chemical', 'cost', 'efficien')):
@@ -389,22 +199,17 @@ def infer_action_category_priority(well_id: str, production_data: dict = None, s
             fallback_category = 'Maintenance'
         else:
             fallback_category = 'Production'
-        fallback_priority = 'MEDIUM'
-        return {'action': fallback_action, 'category': fallback_category, 'priority': fallback_priority}
+        return {'action': fallback_action, 'category': fallback_category, 'priority': 'MEDIUM'}
 
 
 def refine_suggestion_with_openai(well_id: str, suggested_action: str, production_data: dict = None,
-                                  sensor_metrics: dict = None, model_confidence: float = None,
-                                  category_hint: str = None) -> dict:
+                                   sensor_metrics: dict = None, model_confidence: float = None,
+                                   category_hint: str = None) -> dict:
     """
-    Ask OpenAI to refine or confirm the action label, pick a category, and suggest a priority
-    based on the provided metrics and model confidence.
-
+    Ask OpenAI to refine or confirm the action label, pick a category, and suggest a priority.
     Returns: {'action': str, 'category': str, 'priority': 'HIGH'|'MEDIUM'|'LOW'}
-    Falls back to the suggested_action and defaults if the API call fails.
     """
     try:
-        # Build a concise prompt
         context = f"Well: {well_id}\nSuggested action: {suggested_action}\nModel confidence: {model_confidence}\n"
         if production_data:
             context += "\nProduction:\n"
@@ -422,8 +227,6 @@ def refine_suggestion_with_openai(well_id: str, suggested_action: str, productio
     - "Increase ESP frequency from 55Hz to 58Hz"
     - "Increase gas injection rate from 2.5 MMSCF to 3.2 MMSCF"
     - "Replace impeller and perform alignment check within 7 days"
-    - "Reduce separator pressure from 125 PSI to 110 PSI"
-    - "Reduce pumping speed from 12 SPM to 10 SPM immediately"
 
     Context:
     {context}
@@ -438,21 +241,16 @@ def refine_suggestion_with_openai(well_id: str, suggested_action: str, productio
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=200
+            max_tokens=200,
+            response_format={"type": "json_object"},
         )
 
-        content = response.choices[0].message.content
-        # strip markdown if present
-        if '```' in content:
-            content = content.split('```')[-2].strip()
-        obj = json.loads(content)
-        # sanitize and validate category
+        obj = json.loads(response.choices[0].message.content)
         action = obj.get('action') or suggested_action
         category = obj.get('category') or ''
         priority = obj.get('priority') or ('HIGH' if (model_confidence or 0) > 0.85 else 'MEDIUM')
         valid_cats = {'Production', 'Optimization', 'Maintenance'}
         if category not in valid_cats:
-            # fallback to provided category_hint or default to Production
             category = category_hint if category_hint in valid_cats else 'Production'
         return {'action': action, 'category': category, 'priority': priority}
     except Exception as e:
@@ -461,35 +259,37 @@ def refine_suggestion_with_openai(well_id: str, suggested_action: str, productio
         return {'action': suggested_action, 'category': fallback_cat, 'priority': ('HIGH' if (model_confidence or 0) > 0.85 else 'MEDIUM')}
 
 
+def _strip_alternative_headers(text: str) -> str:
+    """Remove section titles and RECOMMENDED: prefix so we store only content."""
+    if not text or not isinstance(text, str):
+        return (text or "").strip()
+    lines = text.strip().split("\n")
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if re.match(r"^[A-Z0-9][A-Z0-9\s\-\.]+:\s*$", stripped) and len(stripped) < 60:
+            continue
+        if stripped.upper().startswith("RECOMMENDED:"):
+            stripped = stripped[12:].strip()
+        out.append(stripped)
+    return "\n".join(out).strip()
+
+
 def save_operation_suggestion(well_id: str, action: str, category: str = "Production", status: str = "New",
-                             priority: str = "HIGH", confidence: float = 0.0,
-                             production_data: dict = None, sensor_metrics: dict = None,
-                             reason: str = "", expected_impact: str = "") -> bool:
+                              priority: str = "HIGH", confidence: float = 0.0,
+                              production_data: dict = None, sensor_metrics: dict = None,
+                              reason: str = "", expected_impact: str = "") -> bool:
     """
-    Save operation suggestion to PostgreSQL with OpenAI-generated detailed content.
-    
-    Args:
-        well_id: Well ID
-        action: Recommended action
-        status: Status (default: "New")
-        priority: Priority level (default: "HIGH")
-        confidence: Confidence percentage (0-100)
-        production_data: Production metrics dict
-        sensor_metrics: Sensor metrics dict
-        reason: Reason for recommendation
-        expected_impact: Expected impact description
-    
-    Returns:
-        True if successful, False otherwise
+    Save an operation suggestion to S3 Parquet.
+
+    Production and USD fields are taken from the same metric + EIA + financial model path as
+    ``recommend_from_metrics`` (deterministic). OpenRouter is used only for narrative fields
+    (analysis, alternatives, citations). Schema types match ``write_operations_recommendations_to_s3``.
     """
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Could not save suggestion: no PostgreSQL connection")
-        return False
-    
-    cur = conn.cursor()
     try:
-        # helper: truncate long strings to fit schema limits
         def _t(s, n):
             try:
                 if s is None:
@@ -499,61 +299,99 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
             except Exception:
                 return s
 
-        # Refine action/category/priority first (may override model hint)
+        def _nf(v, default=0.0) -> float:
+            try:
+                if v is None:
+                    return default
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        from operations.recommendations.persistence import (
+            compute_financial_impact_fields,
+            derive_production_impact_from_metrics,
+            merge_metrics_for_financial_impact,
+        )
+
+        merged_m = merge_metrics_for_financial_impact(production_data, sensor_metrics)
+        prod_imp = derive_production_impact_from_metrics(merged_m)
+        pi_bbl = prod_imp.get("production_increase_bbl_day")
+        fin_model = compute_financial_impact_fields(merged_m, pi_bbl)
+        fin_model.pop("_financial_meta", None)
+
+        conf_float = _nf(confidence, 0.0)
+        row = {
+            "id": str(uuid4()),
+            "well_id": well_id,
+            "category": _t(category, 50),
+            "action": _t(action, 255),
+            "status": status,
+            "priority": priority,
+            "confidence_percent": conf_float,
+            "confidence": conf_float / 100.0 if conf_float > 1 else conf_float,
+            "probability": None,
+            "reason": _t(reason, 2000),
+            "expected_impact": _t(expected_impact, 500),
+            "production_increase_bbl_day": _nf(pi_bbl, 0.0),
+            "production_increase_percent": _nf(prod_imp.get("production_increase_percent"), 0.0),
+            "daily_expense_benefit_usd": _nf(fin_model.get("daily_expense_benefit_usd"), 0.0),
+            "implementation_cost_usd": _nf(fin_model.get("implementation_cost_usd"), 0.0),
+            "net_daily_benefit_usd": _nf(fin_model.get("net_daily_benefit_usd"), 0.0),
+            "asset_value_increase_usd": _nf(fin_model.get("asset_value_increase_usd"), 0.0),
+            "time_reduced_hours": None,
+            "detailed_analysis": "",
+            "current_performance": "",
+            "historical_trend": "",
+            "conservative_approach": "",
+            "aggressive_optimization": "",
+            "hybrid_model": "",
+            "recommended_model": "",
+            "citations": json.dumps([]),
+            "referenced_data": json.dumps([]),
+            "supporting_analysis": "",
+            "data_quality": "",
+            "status_reason": None,
+            "prediction_source": "ml_model_openrouter_text",
+            "mute_till": None,
+            "open_up": None,
+            "metrics": {"production": production_data or {}, "sensors": sensor_metrics or {}},
+            "user_id": None,
+            "user_name": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # OpenRouter: refine wording (optional); does not override numeric fields above.
         try:
-            # Pass the current ML-derived `category` as a hint so OpenAI can consider it,
-            # but do not let OpenAI silently overwrite the ML category unless it
-            # returns one of the canonical categories.
             refined = refine_suggestion_with_openai(
                 well_id,
                 action,
                 production_data,
                 sensor_metrics,
                 model_confidence=(confidence / 100.0 if confidence and confidence > 1 else confidence),
-                category_hint=category
+                category_hint=category,
             )
-            # use refined values if returned; preserve ML category unless OpenAI returns a valid one
             if isinstance(refined, dict):
-                action = refined.get('action') or action
-                priority = refined.get('priority') or priority
-                ref_cat = refined.get('category')
-                if ref_cat in {'Production', 'Optimization', 'Maintenance'}:
+                action = refined.get("action") or action
+                priority = refined.get("priority") or priority
+                ref_cat = refined.get("category")
+                if ref_cat in {"Production", "Optimization", "Maintenance"}:
                     category = ref_cat
+                row["action"] = _t(action, 255)
+                row["category"] = _t(category, 50)
+                row["priority"] = priority
         except Exception:
             logger.warning("Refine suggestion step failed; continuing with provided action/category")
 
-        # Generate detailed suggestion using OpenAI (use refined action)
-        logger.info(f"Generating detailed suggestion for {well_id} (action={action}, category={category})...")
+        logger.info("Generating narrative (OpenRouter) for %s (action=%s)...", well_id, row["action"])
         suggestion = generate_operation_suggestion_with_openai(
-            well_id, action, production_data, sensor_metrics
+            well_id, row["action"], production_data, sensor_metrics
         )
 
-        # Extract data from OpenAI response
-        prod_impact = suggestion.get('production_impact', {})
-        fin_impact = suggestion.get('financial_impact', {})
-        op_details = suggestion.get('operational_details', {})
-        alt_models = suggestion.get('alternative_models', {})
-        citations = suggestion.get('citations', {})
+        op_details = suggestion.get("operational_details", {}) or {}
+        alt_models = suggestion.get("alternative_models", {}) or {}
+        citations = suggestion.get("citations", {}) or {}
 
-        def _strip_alternative_headers(text):
-            """Remove section titles and RECOMMENDED: prefix so we store only content."""
-            if not text or not isinstance(text, str):
-                return (text or "").strip()
-            lines = text.strip().split("\n")
-            out = []
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    out.append("")
-                    continue
-                if re.match(r"^[A-Z0-9][A-Z0-9\s\-\.]+:\s*$", stripped) and len(stripped) < 60:
-                    continue
-                if stripped.upper().startswith("RECOMMENDED:"):
-                    stripped = stripped[12:].strip()
-                out.append(line)
-            return "\n".join(out).strip()
-
-        # Sanitize alternative_models: store only content, no section titles
         alt_models = dict(alt_models) if alt_models else {}
         for key in ("conservative_approach", "aggressive_optimization", "hybrid_model"):
             if key in alt_models and alt_models[key]:
@@ -561,263 +399,62 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         if alt_models.get("recommended_model"):
             alt_models["recommended_model"] = _strip_alternative_headers(alt_models["recommended_model"])
 
-        # Prepare insert statement
-        insert_sql = """
-        INSERT INTO operation_suggestion (
-            id, well_id, category, action, status, priority, confidence_percent,
-            production_increase_bbl_day, production_increase_percent,
-            daily_expense_benefit_usd, implementation_cost_usd, net_daily_benefit_usd,
-            asset_value_increase_usd, time_reduced_hours,
-            current_performance, optimal_performance, detailed_analysis,
-            conservative_approach, aggressive_optimization, hybrid_model, recommended_model,
-            citations, referenced_data, supporting_analysis, data_quality,
-            reason, expected_impact, metrics_json, created_at
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
-        )
-        """
-
-        values = (
-            str(uuid4()),  # id
-            well_id,  # well_id
-            _t(category, 50),  # category
-            _t(action, 255),  # action
-            status,  # status
-            priority,  # priority
-            float(confidence or 0.0),  # confidence_percent
-            
-            # Production impact
-            float(prod_impact.get('increase_bbl_day', 0)),
-            float(prod_impact.get('increase_percent', 0)),
-            
-            # Financial impact
-            float(fin_impact.get('daily_expense_benefit_usd', 0)),
-            float(fin_impact.get('implementation_cost_usd', 0)),
-            float(fin_impact.get('net_daily_benefit_usd', 0)),
-            float(fin_impact.get('asset_value_increase_usd', 0)),
-            
-            # Operational
-            float(op_details.get('time_reduced_hours', 0)),
-            _t(op_details.get('current_performance', ''), 255),
-            _t(op_details.get('optimal_performance', ''), 255),
-            _t(op_details.get('detailed_analysis', ''), 2000),
-            
-            # Alternative models
-            _t(alt_models.get('conservative_approach', ''), 2000),
-            _t(alt_models.get('aggressive_optimization', ''), 2000),
-            _t(alt_models.get('hybrid_model', ''), 2000),
-            _t(alt_models.get('recommended_model', ''), 50),
-            
-            # Citations
-            json.dumps(citations.get('referenced_data', [])),
-            json.dumps(citations.get('referenced_data', [])),
-            _t(citations.get('supporting_analysis', ''), 2000),
-            _t(citations.get('data_quality', ''), 100),
-            
-            # Additional
-            _t(reason, 2000),
-            _t(expected_impact, 500),
-            json.dumps({'production': production_data or {}, 'sensors': sensor_metrics or {}}),
-            datetime.now(timezone.utc)
-        )
-
-        cur.execute(insert_sql, values)
-        conn.commit()
-        logger.info(f"✓ Saved operation suggestion for {well_id}: {action}")
-
-        # Optional: insert alternative perspectives for inspection when enabled
+        time_reduced = None
         try:
-            diversify = os.getenv('OPERATION_SUGGESTION_DIVERSIFY', 'false').lower() in ('1', 'true', 'yes')
-            if diversify:
-                alt_pairs = [
-                    ('Optimization', f'Optimize settings for {action}'),
-                    ('Maintenance', f'Inspect equipment related to {action}')
-                ]
-                for alt_cat, alt_action in alt_pairs:
-                    alt_values = (
-                        str(uuid4()),
-                        well_id,
-                        alt_cat,
-                        alt_action,
-                        status,
-                        'MEDIUM',
-                        float(confidence or 0.0),
-                        float(prod_impact.get('increase_bbl_day', 0)),
-                        float(prod_impact.get('increase_percent', 0)),
-                        float(fin_impact.get('daily_expense_benefit_usd', 0)),
-                        float(fin_impact.get('implementation_cost_usd', 0)),
-                        float(fin_impact.get('net_daily_benefit_usd', 0)),
-                        float(fin_impact.get('asset_value_increase_usd', 0)),
-                        float(op_details.get('time_reduced_hours', 0)),
-                        op_details.get('current_performance', ''),
-                        op_details.get('optimal_performance', ''),
-                        op_details.get('detailed_analysis', ''),
-                        alt_models.get('conservative_approach', ''),
-                        alt_models.get('aggressive_optimization', ''),
-                        alt_models.get('hybrid_model', ''),
-                        alt_models.get('recommended_model', ''),
-                        json.dumps(citations.get('referenced_data', [])),
-                        json.dumps(citations.get('referenced_data', [])),
-                        citations.get('supporting_analysis', ''),
-                        citations.get('data_quality', ''),
-                        reason,
-                        expected_impact,
-                        json.dumps({'production': production_data or {}, 'sensors': sensor_metrics or {}}),
-                        datetime.now(timezone.utc)
-                    )
-                    cur.execute(insert_sql, alt_values)
-                conn.commit()
-                logger.info(f"✓ Inserted alternative perspectives for {well_id}")
+            val = float(op_details.get("time_reduced_hours") or 0)
+            time_reduced = val if val > 0 else None
         except Exception:
-            logger.warning("Failed to insert alternative perspectives; continuing")
+            time_reduced = None
 
-        return True
+        row["detailed_analysis"] = _t(op_details.get("detailed_analysis", ""), 2000)
+        row["current_performance"] = _t(op_details.get("current_performance", ""), 255)
+        row["historical_trend"] = _t(
+            op_details.get("historical_trend") or op_details.get("optimal_performance", ""), 255
+        )
+        row["conservative_approach"] = _t(alt_models.get("conservative_approach", ""), 2000)
+        row["aggressive_optimization"] = _t(alt_models.get("aggressive_optimization", ""), 2000)
+        row["hybrid_model"] = _t(alt_models.get("hybrid_model", ""), 2000)
+        row["recommended_model"] = _t(alt_models.get("recommended_model", ""), 500)
+        row["citations"] = json.dumps(citations.get("referenced_data", []))
+        row["referenced_data"] = json.dumps(citations.get("referenced_data", []))
+        row["supporting_analysis"] = _t(citations.get("supporting_analysis", ""), 2000)
+        row["data_quality"] = _t(citations.get("data_quality", ""), 100)
+        row["time_reduced_hours"] = time_reduced
+
+        from operations.recommendations.persistence import write_operations_recommendations_to_s3
+        written_key = write_operations_recommendations_to_s3([row])
+        if written_key:
+            logger.info(f"✓ Saved operation suggestion for {well_id}: {action} -> S3")
+            return True
+        else:
+            logger.error(f"✗ Failed to write suggestion for {well_id} to S3")
+            return False
 
     except Exception as e:
         logger.error(f"Error saving operation suggestion: {e}", exc_info=True)
-        conn.rollback()
         return False
-    finally:
-        cur.close()
-        conn.close()
 
 
-def get_operation_suggestions(well_id: str = None, status: str = None, 
-                             priority: str = None, category: str = None, limit: int = 100) -> list:
-    """
-    Retrieve operation suggestions from PostgreSQL.
-    
-    Args:
-        well_id: Filter by well ID (optional)
-        status: Filter by status (optional)
-        priority: Filter by priority (optional)
-        limit: Maximum number of results
-    
-    Returns:
-        List of suggestion dicts
-    """
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Could not retrieve suggestions: no PostgreSQL connection")
-        return []
-    
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        query = "SELECT * FROM operation_suggestion WHERE 1=1"
-        params = []
-
-        if well_id:
-            query += " AND well_id = %s"
-            params.append(well_id)
-        
-        if status:
-            query += " AND status = %s"
-            params.append(status)
-        
-        if priority:
-            query += " AND priority = %s"
-            params.append(priority)
-
-        if category:
-            query += " AND category = %s"
-            params.append(category)
-
-        query += " ORDER BY created_at DESC LIMIT %s"
-        params.append(limit)
-
-        cur.execute(query, params)
-        results = cur.fetchall()
-        
-        # Convert RealDictRow to regular dicts
-        return [dict(row) for row in results]
-
-    except Exception as e:
-        logger.error(f"Error retrieving suggestions: {e}")
-        return []
-    finally:
-        cur.close()
-        conn.close()
+def get_operation_suggestions(well_id: str = None, status: str = None,
+                              priority: str = None, category: str = None, limit: int = 100) -> list:
+    """Suggestions are stored in S3 Parquet. Live querying is not supported here."""
+    return []
 
 
 def update_operation_suggestion_status(suggestion_id: str, status: str) -> bool:
-    """
-    Update the status of an operation suggestion.
-    
-    Args:
-        suggestion_id: UUID of the suggestion
-        status: New status (e.g., "In Progress", "Completed", "Rejected")
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Could not update suggestion: no PostgreSQL connection")
-        return False
-    
-    cur = conn.cursor()
-    try:
-        update_sql = """
-        UPDATE operation_suggestion
-        SET status = %s, updated_at = %s
-        WHERE id = %s
-        """
-        cur.execute(update_sql, (status, datetime.now(timezone.utc), suggestion_id))
-        conn.commit()
-        logger.info(f"✓ Updated suggestion {suggestion_id} status to {status}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error updating suggestion: {e}")
-        conn.rollback()
-        return False
-    finally:
-        cur.close()
-        conn.close()
+    """Suggestions are stored in S3 Parquet. Status updates are not supported here."""
+    return False
 
 
 def get_operation_suggestion_detail(suggestion_id: str) -> dict:
-    """
-    Get detailed information about a specific operation suggestion.
-    
-    Args:
-        suggestion_id: UUID of the suggestion
-    
-    Returns:
-        Dict with suggestion details
-    """
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Could not retrieve suggestion: no PostgreSQL connection")
-        return {}
-    
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cur.execute("SELECT * FROM operation_suggestion WHERE id = %s", (suggestion_id,))
-        result = cur.fetchone()
-        return dict(result) if result else {}
-
-    except Exception as e:
-        logger.error(f"Error retrieving suggestion detail: {e}")
-        return {}
-    finally:
-        cur.close()
-        conn.close()
-
-
-if __name__ == '__main__':
-    # Initialize table on module import if in main
-    create_operation_suggestion_table()
-    logger.info("✓ Operation module initialized")
+    """Suggestions are stored in S3 Parquet. Detail lookup is not supported here."""
+    return {}
 
 
 def stream_run_operational_pipeline(confidence: str = "0.2"):
     """Spawn the operational pipeline script and stream logs as Server-Sent Events (SSE).
 
-    Yields SSE `data: ...\n\n` chunks containing JSON objects with either `line`,
+    Yields SSE `data: ...\\n\\n` chunks containing JSON objects with either `line`,
     or `status`/`returncode`/`error` fields.
     """
     process = None
@@ -838,14 +475,12 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
             universal_newlines=True,
         )
 
-        # Patterns we consider 'important'
         processing_re = re.compile(r"Processing:\s*(?P<well_id>[^-]+)\s*-\s*(?P<action>.+?)\s*\(confidence:\s*(?P<conf>[\d%.]+)\)")
-        saved_postgres_re = re.compile(r"✓ Saved to PostgreSQL")
-        failed_save_re = re.compile(r"✗ Failed to save|Failed to save to PostgreSQL|Failed to save")
+        saved_s3_re = re.compile(r"✓ Saved operation suggestion.+S3")
+        failed_save_re = re.compile(r"✗ Failed|Failed to save")
         predictions_re = re.compile(r"✓ Predictions completed:\s*(?P<count>\d+) recommendations detected")
         train_acc_re = re.compile(r"Train Accuracy: (.+)")
-        summary_key_re = re.compile(r"^(Recommendations Processed:|Saved to Snowflake:|Saved to PostgreSQL:|Failed:)\s*(?P<num>\d+)")
-        detail_line_re = re.compile(r"\s*(?P<well_id>\S+)\s*\|\s*(?P<action>.+?)\s*\|\s*(?P<conf>[\d%.]+)\s*\|\s*SF:(?P<sf>.)\s*PG:(?P<pg>.)")
+        summary_key_re = re.compile(r"^(Recommendations Processed:|Saved to S3:|Failed:)\s*(?P<num>\d+)")
 
         last_ctx = {'well_id': None, 'action': None}
 
@@ -857,7 +492,6 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
                 if not line:
                     continue
 
-                # Error or traceback: always surface
                 if 'ERROR' in line or 'Traceback' in line or 'Exception' in line:
                     payload = json.dumps({'type': 'error', 'message': line})
                     yield f"data: {payload}\n\n"
@@ -874,8 +508,8 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
                     yield f"data: {payload}\n\n"
                     continue
 
-                if saved_postgres_re.search(line):
-                    payload = json.dumps({'type': 'saved', 'well_id': last_ctx.get('well_id'), 'action': last_ctx.get('action'), 'message': 'saved_postgres'})
+                if saved_s3_re.search(line):
+                    payload = json.dumps({'type': 'saved', 'well_id': last_ctx.get('well_id'), 'action': last_ctx.get('action'), 'message': 'saved_s3'})
                     yield f"data: {payload}\n\n"
                     continue
 
@@ -890,7 +524,7 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
                     yield f"data: {payload}\n\n"
                     continue
 
-                if 'PIPELINE SUMMARY' in line or 'OPERATIONAL RECOMMENDATIONS PIPELINE' in line or 'Processing Recommendations for Database Storage' in line:
+                if 'PIPELINE SUMMARY' in line or 'OPERATIONAL RECOMMENDATIONS PIPELINE' in line or 'Processing Recommendations' in line:
                     payload = json.dumps({'type': 'stage', 'message': line})
                     yield f"data: {payload}\n\n"
                     continue
@@ -898,12 +532,6 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
                 m3 = train_acc_re.search(line)
                 if m3:
                     payload = json.dumps({'type': 'train_summary', 'message': m3.group(1).strip()})
-                    yield f"data: {payload}\n\n"
-                    continue
-
-                m4 = detail_line_re.search(line)
-                if m4:
-                    payload = json.dumps({'type': 'detail', 'well_id': m4.group('well_id'), 'action': m4.group('action').strip(), 'confidence': m4.group('conf'), 'sf': m4.group('sf'), 'pg': m4.group('pg')})
                     yield f"data: {payload}\n\n"
                     continue
 
@@ -915,13 +543,10 @@ def stream_run_operational_pipeline(confidence: str = "0.2"):
                     yield f"data: {payload}\n\n"
                     continue
 
-                # By default, only emit short informational lines that are concise (e.g., lines starting with ✓ or ✗)
                 if line.startswith('✓') or line.startswith('✗') or line.startswith('Start Time') or line.startswith('Confidence Threshold') or line.startswith('Train') or line.startswith('No high-confidence'):
                     payload = json.dumps({'type': 'info', 'message': line})
                     yield f"data: {payload}\n\n"
                     continue
-
-                # skip verbose lines
 
         rc = process.wait() if process is not None else 0
         yield f"data: {json.dumps({'type': 'finished', 'returncode': rc})}\n\n"

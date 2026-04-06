@@ -518,6 +518,7 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
         cv = (tp_std / tp_avg) * 100  # Coefficient of Variation
         if cv > PRESSURE_INSTABILITY_CV_MIN_PCT:
             revenue_loss = ctx.get('oil_volume', 0) * 0.15 * OIL_PRICE
+            boe_loss = ctx.get('oil_volume', 0) * 0.15
             
             data_summary = f"""
             DETECTION TYPE: Pressure Volatility
@@ -534,7 +535,7 @@ def check_pressure_instability(ctx: Dict) -> Optional[Dict]:
                 "impact_value": revenue_loss,
                 "impact_payload": {
                     "financial": {"value": revenue_loss, "label": f"${format_number(revenue_loss)}/day (Risk)"},
-                    "production": {"value": 0, "label": "N/A"}
+                    "production": {"value": boe_loss, "label": f"{format_number(boe_loss)} BOE/day"}
                 },
                 "chart_metric": "pressure_trend",
                 "diagnosis": {
@@ -638,7 +639,9 @@ def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[D
     # Estimate operational risk impact (so every anomaly has a non-zero impact for UI/clarity)
     recent_oil = float(recent["oil_volume"].mean()) if "oil_volume" in recent.columns and not recent["oil_volume"].empty else 0.0
     pattern_impact = recent_oil * 0.10 * OIL_PRICE if recent_oil > 0 else 50.0 * OIL_PRICE  # 10% risk or ~$3750 placeholder
+    boe_loss = pattern_impact / OIL_PRICE if OIL_PRICE else 0.0
     impact_label = f"${format_number(pattern_impact)}/day (Operational Risk)" if pattern_impact > 0 else "Operational Review"
+    production_impact_label = f"{format_number(boe_loss)} BOE/day (Operational Risk)" if boe_loss > 0 else f"{format_number(boe_loss)} BOE/day"
 
     # Trigger on shutdown increase (sustained events only)
     shutdown_trigger = recent_shutdown >= 1 and (
@@ -664,14 +667,18 @@ def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[D
             "raw_data": data_summary.strip(),
             "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
             "impact_value": pattern_impact,
-            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "impact_payload": {
+                "financial": {"value": pattern_impact, "label": impact_label},
+                "production": {"value": boe_loss, "label": production_impact_label},
+            },
             "chart_metric": "mechanical_failure_view",
             "diagnosis": {"type": "Recurring Operational Events", "confidence": "High", "indicators": f"Shutdown: {recent_shutdown}/30d vs {prev_shutdown_per_30d:.2f}/30d"},
             "chart_payload": {"recent_count": recent_shutdown, "historical_avg": prev_shutdown_per_30d, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
         }
     # Trigger on other event types only (no shutdown increase)
     if events_detected:
-        name, r, p = events_detected[0]
+        # Pick the primary event by highest recent count so the UI title isn't biased.
+        name, r, p = max(events_detected, key=lambda e: e[1])
         increase_pct = ((r - p) / p) * 100 if p > 0 else 100
         data_summary = f"""
         DETECTION TYPE: Operational pattern change
@@ -685,7 +692,10 @@ def check_event_frequency(ctx: Dict, full_df: pd.DataFrame = None) -> Optional[D
             "raw_data": data_summary.strip(),
             "severity_metrics": {'frequency_increase_pct': increase_pct, 'impact_value': pattern_impact},
             "impact_value": pattern_impact,
-            "impact_payload": {"financial": {"value": pattern_impact, "label": impact_label}, "production": {"value": 0, "label": "N/A"}},
+            "impact_payload": {
+                "financial": {"value": pattern_impact, "label": impact_label},
+                "production": {"value": boe_loss, "label": production_impact_label},
+            },
             "chart_metric": "mechanical_failure_view",
             "diagnosis": {"type": "Recurring Operational Events", "confidence": "Moderate", "indicators": f"Increased: {', '.join(e[0] for e in events_detected)}"},
             "chart_payload": {"recent_count": r, "historical_avg": p, "increase_pct": increase_pct, "event_types": [e[0] for e in events_detected]},
@@ -919,6 +929,7 @@ def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
     is_active = amps > DATA_MISMATCH_AMPS_ACTIVE_MIN or spm > 1.0
     if is_active and total_vol < DATA_MISMATCH_ZERO_VOL_MAX and baseline_vol > DATA_MISMATCH_BASELINE_VOL_MIN:
         revenue_loss = _f(ctx.get('oil_baseline_90d')) * OIL_PRICE
+        boe_loss = _f(ctx.get('oil_baseline_90d'))
         
         data_summary = f"""
         DETECTION TYPE: Sensor State Mismatch (Ghost Production)
@@ -936,7 +947,7 @@ def check_sensor_state_mismatch(ctx: Dict) -> Optional[Dict]:
             "impact_value": revenue_loss,
             "impact_payload": {
                 "financial": {"value": revenue_loss, "label": f"${format_number(revenue_loss)}/day (Risk)"},
-                "production": {"value": 0, "label": "N/A"}
+                "production": {"value": boe_loss, "label": f"{format_number(boe_loss)} BOE/day (Risk)"}
             },
             "chart_metric": "ghost_production_view",
             "diagnosis": {

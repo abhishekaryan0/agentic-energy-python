@@ -1,0 +1,135 @@
+"""
+Latest Brent spot ($/BBL) from the U.S. EIA Open Data API v2.
+
+Uses EIA_API_KEY from the environment. Caches successful responses (TTL configurable)
+with a thread-safe lock. Retries transient failures. Validates plausible prices.
+
+Docs: https://www.eia.gov/opendata/
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+_lock = threading.Lock()
+_CACHE: Dict[str, Any] = {"ts": 0.0, "price": None, "period": None, "raw": None}
+
+_EIA_BRENT_URL = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
+_DEFAULT_TTL = 3600.0
+_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_RETRIES = 3
+# Reject absurd API/malformed values; fall back to OPERATIONS_OIL_PRICE_USD
+_MIN_PRICE = 5.0
+_MAX_PRICE = 500.0
+
+
+def _cache_ttl_sec() -> float:
+    try:
+        return float(os.getenv("EIA_CACHE_TTL_SEC", str(_DEFAULT_TTL)) or _DEFAULT_TTL)
+    except ValueError:
+        return _DEFAULT_TTL
+
+
+def _http_timeout() -> float:
+    try:
+        return float(os.getenv("EIA_HTTP_TIMEOUT_SEC", str(_DEFAULT_TIMEOUT)) or _DEFAULT_TIMEOUT)
+    except ValueError:
+        return _DEFAULT_TIMEOUT
+
+
+def _retry_count() -> int:
+    try:
+        return max(1, int(os.getenv("EIA_HTTP_RETRIES", str(_DEFAULT_RETRIES)) or _DEFAULT_RETRIES))
+    except ValueError:
+        return _DEFAULT_RETRIES
+
+
+def _fallback_price() -> float:
+    return float(os.getenv("OPERATIONS_OIL_PRICE_USD", "70") or 70)
+
+
+def _validate_price(price: float) -> bool:
+    return _MIN_PRICE <= price <= _MAX_PRICE
+
+
+def _fetch_brent_once(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
+    params = {
+        "api_key": api_key,
+        "frequency": "daily",
+        "data[0]": "value",
+        "facets[product][]": "EPCBRENT",
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+        "length": "1",
+    }
+    qs = urllib.parse.urlencode(params)
+    url = f"{_EIA_BRENT_URL}?{qs}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    data = json.loads(body)
+    rows = (data.get("response") or {}).get("data") or []
+    if not rows:
+        raise ValueError("EIA response has no data rows")
+    row0 = rows[0]
+    val = row0.get("value")
+    period = row0.get("period")
+    price = float(val)
+    if not _validate_price(price):
+        raise ValueError(f"EIA price out of bounds: {price}")
+    return price, period
+
+
+def get_brent_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
+    """
+    Return (price_usd_per_bbl, source, period).
+
+    source is 'eia_brent' on success, 'eia_brent_cached' when served from cache,
+    or 'env_fallback' if the request fails or EIA_API_KEY is missing.
+    """
+    now = time.time()
+    ttl = _cache_ttl_sec()
+    with _lock:
+        if (
+            _CACHE["price"] is not None
+            and now - float(_CACHE["ts"]) < ttl
+        ):
+            return float(_CACHE["price"]), "eia_brent_cached", _CACHE.get("period")
+
+    api_key = (os.getenv("EIA_API_KEY") or "").strip()
+    if not api_key:
+        p = _fallback_price()
+        logger.warning("EIA_API_KEY not set; using OPERATIONS_OIL_PRICE_USD=%s", p)
+        return p, "env_fallback", None
+
+    timeout = _http_timeout()
+    last_err: Optional[BaseException] = None
+    for attempt in range(_retry_count()):
+        try:
+            price, period = _fetch_brent_once(api_key, timeout)
+            with _lock:
+                _CACHE["ts"] = time.time()
+                _CACHE["price"] = price
+                _CACHE["period"] = period
+                _CACHE["raw"] = None
+            return price, "eia_brent", period
+        except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+            last_err = e
+            if attempt < _retry_count() - 1:
+                delay = 0.5 * (2**attempt)
+                logger.warning("EIA Brent fetch attempt %s failed: %s; retry in %.1fs", attempt + 1, e, delay)
+                time.sleep(delay)
+
+    p = _fallback_price()
+    logger.warning("EIA Brent fetch failed after retries (%s); using fallback %s $/BBL", last_err, p)
+    return p, "env_fallback", None

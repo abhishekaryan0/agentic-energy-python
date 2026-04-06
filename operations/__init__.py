@@ -19,7 +19,7 @@ Quick Start:
     >>> analyzer = TrendAnalyzer(sensor_df, lift_type='ESP')
     >>> metrics = analyzer.compute_metrics()
     >>> 
-    >>> # Get recommendations (metrics from S3 parquet; RuleEngine(conn=None) for rules only)
+    >>> # Get recommendations from metrics (S3 parquet)
     >>> from operations.recommendations.persistence import recommend_from_metrics
     >>> recs = recommend_from_metrics(well_id, lift_type, metrics, confidence_threshold=0.6)
 
@@ -73,8 +73,7 @@ from operations.utils import (
     get_project_root,
     get_models_dir,
     get_model_path,
-    
-    # Database utilities
+    retry_with_backoff,
     retry_db_operation,
     
     # Type conversion
@@ -109,6 +108,7 @@ from operations.recommendations.persistence import (
     predict_with_model,
     recommend_from_metrics,
     write_operations_recommendations_to_s3,
+    derive_production_impact_from_metrics,
     _features_from_metrics,
 )
 
@@ -119,7 +119,7 @@ from operations.train_models import (
 )
 
 # ============================================================================
-# PUBLIC API (no PostgreSQL; model + output use S3 only)
+# PUBLIC API (model + I/O use S3 only)
 # ============================================================================
 
 __all__ = [
@@ -152,6 +152,7 @@ __all__ = [
     'get_project_root',
     'get_models_dir',
     'get_model_path',
+    'retry_with_backoff',
     'retry_db_operation',
     'to_native_type',
     'safe_float',
@@ -172,6 +173,7 @@ __all__ = [
     'predict_with_model',
     'recommend_from_metrics',
     'write_operations_recommendations_to_s3',
+    'derive_production_impact_from_metrics',
     
     # Training (S3/parquet only)
     'train_operations_from_parquet',

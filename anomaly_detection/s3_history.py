@@ -24,6 +24,9 @@ WELL_ANOMALIES_COLUMNS = [
     "mute_till",
     "severity",
     "category",
+    "user_id",
+    "user_name",
+    "updated_at",
 ]
 
 ANOMALY_VIOLATIONS_COLUMNS = [
@@ -36,6 +39,9 @@ ANOMALY_VIOLATIONS_COLUMNS = [
     "expected_max",
     "unit",
     "deviation_percent",
+    "user_id",
+    "user_name",
+    "updated_at",
 ]
 
 ANOMALY_SUGGESTIONS_COLUMNS = [
@@ -61,6 +67,9 @@ ANOMALY_SUGGESTIONS_COLUMNS = [
     "category",
     "well_status",
     "organization_id",
+    "user_id",
+    "user_name",
+    "updated_at",
 ]
 
 
@@ -120,6 +129,9 @@ def _normalize_well_anomalies_records(records: List[Dict[str, Any]]) -> pd.DataF
             "mute_till",
             "severity",
             "category",
+            "user_id",
+            "user_name",
+            "updated_at",
         ],
     )
     return df
@@ -136,7 +148,19 @@ def _normalize_anomaly_violations_records(records: List[Dict[str, Any]]) -> pd.D
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=ANOMALY_VIOLATIONS_COLUMNS)
-    df = _coerce_string_columns(df, ["anomaly_id", "well_id", "timestamp", "parameter_name", "unit"])
+    df = _coerce_string_columns(
+        df,
+        [
+            "anomaly_id",
+            "well_id",
+            "timestamp",
+            "parameter_name",
+            "unit",
+            "user_id",
+            "user_name",
+            "updated_at",
+        ],
+    )
     return df
 
 

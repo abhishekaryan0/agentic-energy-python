@@ -3,7 +3,18 @@ Configuration for the operations module.
 
 This module contains configuration dataclasses and constants used throughout
 the operations package for recommendations, predictions, and training.
-Uses S3 only (no Snowflake). ORGANIZATION_ID from env for model path.
+Uses S3 only. ORGANIZATION_ID from env for model path.
+
+Production-related environment variables (non-exhaustive):
+
+- **S3_BUCKET**, **ORGANIZATION_ID**, **AWS_REGION** — model sync and parquet I/O.
+- **OPERATIONS_MODEL_S3_URI** — optional override for the operations model tarball prefix or URI.
+- **OPERATIONS_MODELS_DIR** — local directory for extracted joblibs (set by training / runtime).
+- **EIA_API_KEY** — U.S. EIA Open Data API key for Brent spot; if unset, **OPERATIONS_OIL_PRICE_USD**
+  (default 70) is used for revenue-side pricing.
+- **EIA_CACHE_TTL_SEC**, **EIA_HTTP_TIMEOUT_SEC**, **EIA_HTTP_RETRIES** — tune EIA HTTP client.
+- **FINANCIAL_MODEL_PATH** — optional file or directory for ``financial_implementation_cost.joblib``.
+- **IMPLEMENTATION_LUMP_DAYS**, **IMPLEMENTATION_AMORTIZATION_DAYS** — convert financial model daily rate to one-time lump and amortize for net daily benefit in ``recommendations.persistence``.
 """
 
 import os

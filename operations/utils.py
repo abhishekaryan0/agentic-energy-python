@@ -1,8 +1,7 @@
 """
 Shared utilities for the operations module.
 
-This module contains common functions used across the operations package,
-including path resolution, database operations, and type conversion.
+Path resolution, S3 model sync, retries, and type conversion (S3-only; no database).
 """
 
 import json
@@ -25,16 +24,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_MODELS_DIR = _PROJECT_ROOT / 'models'
 MODELS_DIR = _DEFAULT_MODELS_DIR  # backward compat; use get_models_dir() for env override
 
-# One-time sync of operations models from S3 (bucket + ORGANIZATION_ID from env)
+# One-time sync of SageMaker training artifacts from S3 (operations + financial joblibs)
 _OPERATIONS_MODELS_S3_SYNCED = False
 
 
 def _ensure_operations_models_from_s3() -> None:
     """
-    If S3_BUCKET and ORGANIZATION_ID are set, download the latest operations-train-* model
-    from s3://BUCKET/{ORGANIZATION_ID}/model/operations-train-*/output/model.tar.gz,
-    extract to a local cache, and set OPERATIONS_MODELS_DIR. Uses ORGANIZATION_ID from env.
-    Only runs once per process.
+    If S3_BUCKET and ORGANIZATION_ID are set, download the latest training outputs under
+    ``s3://BUCKET/{ORG}/model/``: ``operations-train-*/output/model.tar.gz`` and
+    ``financial-train-*/output/model.tar.gz``, extract into one cache dir, set
+    OPERATIONS_MODELS_DIR. Latest job = lexicographically greatest key name (run id in name).
+    Override single tarball via OPERATIONS_MODEL_S3_URI (that file only; financial listing still runs when prefix mode).
     """
     global _OPERATIONS_MODELS_S3_SYNCED
     if _OPERATIONS_MODELS_S3_SYNCED:
@@ -59,37 +59,54 @@ def _ensure_operations_models_from_s3() -> None:
             prefix = ""
         elif not prefix.endswith("/"):
             prefix = prefix + "/"
+
+        cache_dir = os.environ.get("OPERATIONS_MODEL_CACHE_DIR") or tempfile.mkdtemp(prefix="operations_models_")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        keys_to_download: List[str] = []
+
         if base.rstrip("/").endswith("model.tar.gz"):
-            key = parsed.path.lstrip("/")
+            keys_to_download.append(parsed.path.lstrip("/"))
         else:
             paginator = s3.get_paginator("list_objects_v2")
-            candidates = []
+            all_keys: List[str] = []
             for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     k = obj["Key"]
-                    if "operations-train-" in k and k.endswith("output/model.tar.gz"):
-                        candidates.append(k)
-            if not candidates:
-                logger.warning("No operations-train-*/output/model.tar.gz under s3://%s/%s", bucket, prefix)
-                return
-            candidates.sort(reverse=True)
-            key = candidates[0]
-        logger.info("Downloading operations model from s3://%s/%s", bucket, key)
-        cache_dir = os.environ.get("OPERATIONS_MODEL_CACHE_DIR") or tempfile.mkdtemp(prefix="operations_models_")
-        os.makedirs(cache_dir, exist_ok=True)
-        local_tar = os.path.join(cache_dir, "model.tar.gz")
-        s3.download_file(bucket, key, local_tar)
-        with tarfile.open(local_tar, "r:gz") as tf:
-            tf.extractall(cache_dir)
-        try:
-            os.remove(local_tar)
-        except OSError:
-            pass
+                    if k.endswith("output/model.tar.gz"):
+                        all_keys.append(k)
+            for pattern, label in (
+                ("operations-train-", "operations"),
+                ("financial-train-", "financial"),
+            ):
+                cand = [k for k in all_keys if pattern in k]
+                if not cand:
+                    logger.warning("No %s model tarball under s3://%s/%s", label, bucket, prefix)
+                    continue
+                cand.sort(reverse=True)
+                keys_to_download.append(cand[0])
+                logger.info("Selected latest %s artifact: s3://%s/%s", label, bucket, cand[0])
+
+        if not keys_to_download:
+            logger.warning("No model.tar.gz artifacts found under s3://%s/%s", bucket, prefix)
+            return
+
+        for idx, key in enumerate(keys_to_download):
+            logger.info("Downloading s3://%s/%s", bucket, key)
+            local_tar = os.path.join(cache_dir, f"model_{idx}.tar.gz")
+            s3.download_file(bucket, key, local_tar)
+            with tarfile.open(local_tar, "r:gz") as tf:
+                tf.extractall(cache_dir)
+            try:
+                os.remove(local_tar)
+            except OSError:
+                pass
+
         os.environ["OPERATIONS_MODELS_DIR"] = cache_dir
         _OPERATIONS_MODELS_S3_SYNCED = True
-        logger.info("Operations models loaded from S3 -> %s (ORGANIZATION_ID from env)", cache_dir)
+        logger.info("ML models (operations + financial when present) -> %s", cache_dir)
     except Exception as e:
-        logger.warning("Failed to sync operations models from S3: %s", e)
+        logger.warning("Failed to sync models from S3: %s", e)
 
 
 def get_project_root() -> Path:
@@ -123,40 +140,21 @@ def get_model_path(relative_path: str) -> str:
 
 
 # ============================================================================
-# DATABASE OPERATIONS
+# RETRIES (generic; no database)
 # ============================================================================
 
 T = TypeVar('T')
 
 
-def retry_db_operation(
+def retry_with_backoff(
     func: Callable[[], T],
     max_retries: int = 3,
     delay: float = 1.0,
-    backoff_factor: float = 2.0
+    backoff_factor: float = 2.0,
 ) -> T:
-    """
-    Retry a database operation with exponential backoff.
-    
-    Args:
-        func: Callable that performs the database operation
-        max_retries: Maximum number of retry attempts
-        delay: Initial delay between retries in seconds
-        backoff_factor: Multiplier for delay after each retry
-        
-    Returns:
-        Result of the function call
-        
-    Raises:
-        Exception: The last exception if all retries fail
-        
-    Example:
-        >>> def save_record():
-        ...     cursor.execute("INSERT INTO ...")
-        >>> retry_db_operation(save_record, max_retries=3)
-    """
+    """Retry a callable with exponential backoff (I/O, S3, HTTP)."""
     last_error: Optional[Exception] = None
-    
+
     for attempt in range(max_retries):
         try:
             return func()
@@ -165,12 +163,14 @@ def retry_db_operation(
             if attempt < max_retries - 1:
                 wait_time = delay * (backoff_factor ** attempt)
                 time.sleep(wait_time)
-            else:
-                pass
-    
+
     if last_error is not None:
         raise last_error
-    raise RuntimeError("Unexpected error in retry_db_operation")
+    raise RuntimeError("Unexpected error in retry_with_backoff")
+
+
+# Backward-compatible alias
+retry_db_operation = retry_with_backoff
 
 
 # ============================================================================
@@ -181,7 +181,7 @@ def to_native_type(value: Any) -> Any:
     """
     Convert numpy/pandas types and complex objects to plain Python types.
     
-    Useful for JSON serialization and database operations.
+    Useful for JSON serialization and API responses.
     
     Args:
         value: Any value to convert

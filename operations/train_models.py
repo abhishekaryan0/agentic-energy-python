@@ -2,7 +2,7 @@
 """
 Training module for operational recommendation models.
 
-Uses S3 parquet data only (no Snowflake). Data paths: well_sensor_readings.parquet and
+Uses S3 parquet data only. Data paths: well_sensor_readings.parquet and
 daily_production.parquet under s3://bucket/<org_id>/sensor_data/ or local paths.
 
 Trains action models (per lift-type + fallback) via train_operations_from_parquet.
@@ -66,8 +66,7 @@ from operations.recommendations.persistence import _features_from_metrics
 try:
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import classification_report
+    from sklearn.metrics import accuracy_score
     from sklearn.calibration import CalibratedClassifierCV
     import joblib
     SKLEARN_AVAILABLE = True
@@ -75,33 +74,88 @@ except Exception:
     DecisionTreeClassifier = None
     RandomForestClassifier = None
     CalibratedClassifierCV = None
-    train_test_split = None
-    classification_report = None
+    accuracy_score = None
     joblib = None
     SKLEARN_AVAILABLE = False
 
 
 def _load_parquet(path: str) -> pd.DataFrame:
     """Load parquet from local path or s3://."""
-    if path.startswith("s3://"):
-        import boto3
-        from urllib.parse import urlparse
-        parsed = urlparse(path)
-        s3 = boto3.client("s3")
-        buf = __import__("io").BytesIO()
-        s3.download_fileobj(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"), Fileobj=buf)
-        buf.seek(0)
-        return pd.read_parquet(buf)
-    return pd.read_parquet(path)
+    try:
+        if path.startswith("s3://"):
+            import boto3
+            from urllib.parse import urlparse
+
+            parsed = urlparse(path)
+            s3 = boto3.client("s3")
+            buf = __import__("io").BytesIO()
+            s3.download_fileobj(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"), Fileobj=buf)
+            buf.seek(0)
+            return pd.read_parquet(buf)
+        return pd.read_parquet(path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load parquet: {path!r}") from e
 
 
-def build_metrics_from_parquet(sensor_parquet_path: str, production_parquet_path: str) -> list:
+def _fit_random_forest_classifier(X: np.ndarray, y: np.ndarray, lift_label: str):
+    """
+    Fit RandomForest, optionally with probability calibration when sample size allows.
+    Calibration is skipped for small datasets to avoid sklearn split errors in production.
+    """
+    if not RandomForestClassifier:
+        raise RuntimeError("sklearn RandomForestClassifier not available")
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_split=3,
+        min_samples_leaf=2,
+        random_state=42,
+        class_weight="balanced",
+        n_jobs=-1,
+    )
+    n = len(y)
+    n_classes = len(np.unique(y))
+    if CalibratedClassifierCV and n >= 15:
+        cv_folds = min(3, max(2, n // max(5, n_classes)))
+        cv_folds = min(cv_folds, n - 1)
+        if cv_folds >= 2 and n > cv_folds:
+            try:
+                cal = CalibratedClassifierCV(rf, method="sigmoid", cv=cv_folds)
+                cal.fit(X, y)
+                return cal
+            except Exception as ex:
+                logger.warning(
+                    "CalibratedClassifierCV failed for %s (n=%s, cv=%s): %s; using uncalibrated RandomForest",
+                    lift_label,
+                    n,
+                    cv_folds,
+                    ex,
+                )
+    rf.fit(X, y)
+    return rf
+
+
+def build_metrics_from_parquet(
+    sensor_parquet_path: str,
+    production_parquet_path: str,
+    invoices_parquet_paths: Optional[List[str]] = None,
+) -> list:
     """
     Build (well, lift_type, metrics) list from sensor and production parquet files.
-    For use with train_with_synthetic_labels(..., all_metrics=...) when running without Snowflake.
+    For use with train_with_synthetic_labels(..., all_metrics=...).
+
+    If `invoices_parquet_paths` is provided, also computes invoice/workover roll features
+    expected by the financial implementation-cost model:
+    - invoice_total_usd_roll{window}d
+    - invoice_count_roll{window}d
+    - workover_total_usd_roll{window}d
+    - workover_count_roll{window}d
     """
+    from datetime import timedelta
+
     sensor_df = _load_parquet(sensor_parquet_path)
     prod_df = _load_parquet(production_parquet_path)
+    min_rows = int(os.getenv("OPS_MIN_SENSOR_ROWS_PER_WELL", "24") or 24)
     well_col = "well_id" if "well_id" in sensor_df.columns else "asset_id"
     if well_col not in sensor_df.columns:
         well_col = sensor_df.columns[0]
@@ -114,10 +168,90 @@ def build_metrics_from_parquet(sensor_parquet_path: str, production_parquet_path
     oil_col = "oil_volume" if "oil_volume" in prod_df.columns else "true_oil"
     gas_col = "gas_volume" if "gas_volume" in prod_df.columns else "true_gas"
     water_col = "water_volume" if "water_volume" in prod_df.columns else "true_water"
+
+    # Invoice roll windows to compute. We compute multiple windows so whichever
+    # latest financial model loads (e.g. 30d or 180d) has matching feature keys.
+    windows_to_compute = [30, 180, 365]
+
+    inv_day: Optional[pd.DataFrame] = None
+    if invoices_parquet_paths:
+        inv_frames: List[pd.DataFrame] = []
+        for p in invoices_parquet_paths:
+            try:
+                inv_frames.append(_load_parquet(p))
+            except Exception as e:
+                logger.warning("Failed to load invoices parquet %s: %s", p, e)
+
+        if inv_frames:
+            inv_all = pd.concat(inv_frames, ignore_index=True)
+
+            # Normalize column names and types to match financial/train_models.py expectations.
+            if "asset_id" in inv_all.columns and "well_id" not in inv_all.columns:
+                inv_all["well_id"] = inv_all["asset_id"].astype(str)
+            elif "well_id" in inv_all.columns:
+                inv_all["well_id"] = inv_all["well_id"].astype(str)
+            else:
+                inv_all["well_id"] = None
+
+            if "invoice_date" in inv_all.columns:
+                inv_all["invoice_date"] = pd.to_datetime(inv_all["invoice_date"], errors="coerce").dt.date
+            else:
+                inv_all["invoice_date"] = None
+
+            if "total_usd" in inv_all.columns:
+                inv_all["total_usd"] = pd.to_numeric(inv_all["total_usd"], errors="coerce")
+            else:
+                inv_all["total_usd"] = np.nan
+
+            if "category" in inv_all.columns:
+                inv_all["category"] = inv_all["category"].astype(str)
+            else:
+                inv_all["category"] = ""
+
+            def _is_workover_like(category: Optional[str]) -> bool:
+                if not category:
+                    return False
+                s = str(category).lower()
+                return any(k in s for k in ("workover", "work over", "repair", "work_over"))
+
+            inv_all["is_workover_like"] = inv_all["category"].apply(_is_workover_like)
+            inv_all["total_usd_workover"] = inv_all["total_usd"].where(inv_all["is_workover_like"], 0.0)
+            inv_all["workover_flag"] = inv_all["is_workover_like"].astype(int)
+
+            # Invoice count: in our synthetic invoices, `invoice_id` is present and non-null,
+            # so row-count equals invoice-count. This mirrors financial/train_models.py default behavior.
+            inv_all["invoice_row_count"] = 1
+            inv_day = (
+                inv_all.groupby(["well_id", "invoice_date"], as_index=False)
+                .agg(
+                    invoice_total_usd=("total_usd", "sum"),
+                    invoice_count=("invoice_row_count", "sum"),
+                    workover_total_usd=("total_usd_workover", "sum"),
+                    workover_count=("workover_flag", "sum"),
+                )
+                .copy()
+            )
+
+            # Ensure numeric types.
+            for c in (
+                "invoice_total_usd",
+                "invoice_count",
+                "workover_total_usd",
+                "workover_count",
+            ):
+                inv_day[c] = pd.to_numeric(inv_day[c], errors="coerce").fillna(0.0)
+    def _inv_keys(w: int):
+        return (
+            f"invoice_total_usd_roll{w}d",
+            f"invoice_count_roll{w}d",
+            f"workover_total_usd_roll{w}d",
+            f"workover_count_roll{w}d",
+        )
+
     all_metrics = []
     for well in sensor_df[well_col].dropna().astype(str).unique():
         well_sensor = sensor_df[sensor_df[well_col].astype(str) == well].copy()
-        if len(well_sensor) < 24:
+        if len(well_sensor) < min_rows:
             continue
         well_sensor["timestamp"] = pd.to_datetime(well_sensor[ts_col])
         well_sensor = well_sensor.set_index("timestamp").sort_index()
@@ -125,15 +259,108 @@ def build_metrics_from_parquet(sensor_parquet_path: str, production_parquet_path
         ta = TrendAnalyzer(well_sensor, lift_type=lift_type)
         metrics = ta.compute_metrics(include_all_sensors=True)
         well_prod = prod_df[prod_df[prod_well_col].astype(str) == well].copy() if prod_well_col in prod_df.columns else pd.DataFrame()
-        if len(well_prod) >= 3 and prod_date_col and prod_date_col in well_prod.columns:
-            well_prod[prod_date_col] = pd.to_datetime(well_prod[prod_date_col])
-            well_prod = well_prod.set_index(prod_date_col).sort_index()
-            for f, col in [("oil_volume", oil_col), ("gas_volume", gas_col), ("water_volume", water_col)]:
+
+        # Convert production date to an index early so we can derive `last_date`
+        # for invoice roll-window computation even when we have <3 production rows.
+        if prod_date_col and prod_date_col in well_prod.columns and len(well_prod) > 0:
+            well_prod[prod_date_col] = pd.to_datetime(well_prod[prod_date_col], errors="coerce")
+            well_prod = well_prod.dropna(subset=[prod_date_col]).set_index(prod_date_col).sort_index()
+
+        # Optionally compute invoice roll features for financial implementation-cost prediction.
+        if invoices_parquet_paths:
+            for w in windows_to_compute:
+                invoice_total_key, invoice_count_key, workover_total_key, workover_count_key = _inv_keys(w)
+                metrics[invoice_total_key] = 0.0
+                metrics[invoice_count_key] = 0.0
+                metrics[workover_total_key] = 0.0
+                metrics[workover_count_key] = 0.0
+
+            if inv_day is not None and len(well_prod) > 0:
+                # Mirror financial/train_models.py:
+                # 1) join invoice aggregates onto *daily production dates* for the well
+                # 2) fill missing invoice values with 0.0
+                # 3) compute rolling(window=window_days).sum() and take the latest value
+                dates = pd.Index([d.date() if hasattr(d, "date") else d for d in well_prod.index])
+                inv_well = inv_day[inv_day["well_id"].astype(str) == str(well)].set_index("invoice_date")
+                if len(inv_well) > 0:
+                    for w in windows_to_compute:
+                        invoice_total_key, invoice_count_key, workover_total_key, workover_count_key = _inv_keys(w)
+                        for src_col, dst_key in [
+                            ("invoice_total_usd", invoice_total_key),
+                            ("invoice_count", invoice_count_key),
+                            ("workover_total_usd", workover_total_key),
+                            ("workover_count", workover_count_key),
+                        ]:
+                            s = inv_well[src_col].reindex(dates, fill_value=0.0)
+                            s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+                            rolled = s.rolling(window=w, min_periods=1).sum()
+                            metrics[dst_key] = float(rolled.iloc[-1]) if len(rolled) else 0.0
+
+        # Production-derived signals for operational trends (slopes + short roll mean).
+        if len(well_prod) >= 3 and len(well_prod.columns) > 0:
+            for f, col in [
+                ("oil_volume", oil_col),
+                ("gas_volume", gas_col),
+                ("water_volume", water_col),
+            ]:
                 if col in well_prod.columns:
                     yv = well_prod[col].dropna().values[::-1]
                     if len(yv) >= 3:
                         metrics[f"{f}_slope"] = float(np.polyfit(np.arange(len(yv)), yv, 1)[0])
-                        metrics[f"{f}_roll_mean"] = float(well_prod[col].rolling(window=min(7, len(well_prod))).mean().iloc[-1])
+                        metrics[f"{f}_roll_mean"] = float(
+                            well_prod[col].rolling(window=min(7, len(well_prod))).mean().iloc[-1]
+                        )
+
+            # Latest 30 days production snapshot (mean + latest value).
+            # This is used to render "Recent Production (Last 30 Days)" in the output parquet.
+            try:
+                recent_start = well_prod.index.max() - pd.Timedelta(days=29)
+                recent_slice = well_prod.loc[well_prod.index >= recent_start]
+            except Exception:
+                recent_slice = None
+
+            if recent_slice is not None and len(recent_slice) > 0:
+                for f, col in [
+                    ("oil_volume", oil_col),
+                    ("gas_volume", gas_col),
+                    ("water_volume", water_col),
+                ]:
+                    if col not in recent_slice.columns:
+                        continue
+                    s = pd.to_numeric(recent_slice[col], errors="coerce").dropna()
+                    if s.empty:
+                        continue
+                    metrics[f"{f}_recent_30d_mean"] = float(s.mean())
+                    metrics[f"{f}_recent_30d_latest"] = float(s.iloc[-1])
+
+            # Baseline-vs-current deltas (data-driven uplift proxy).
+            # These help avoid tiny “slope-only” uplifts when production is actually recoverable.
+            #
+            # current = last 7-day rolling mean
+            # baseline = mean of prior 30 days excluding the most recent 7 days (when available)
+            baseline_days = 30
+            current_days = 7
+            for f, col in [
+                ("oil_volume", oil_col),
+                ("gas_volume", gas_col),
+                ("water_volume", water_col),
+            ]:
+                if col not in well_prod.columns:
+                    continue
+                s = pd.to_numeric(well_prod[col], errors="coerce").dropna()
+                if s.empty:
+                    continue
+                cur = float(s.rolling(window=min(current_days, len(s))).mean().iloc[-1])
+                base_slice = s.iloc[: max(0, len(s) - current_days)]
+                if len(base_slice) >= 3:
+                    base_tail = base_slice.iloc[-min(baseline_days, len(base_slice)) :]
+                    baseline = float(base_tail.mean()) if len(base_tail) else float(base_slice.mean())
+                else:
+                    baseline = float(s.mean())
+                metrics[f"{f}_baseline_mean"] = baseline
+                metrics[f"{f}_current_mean"] = cur
+                # Expected recoverable uplift (only positive deltas)
+                metrics[f"{f}_recoverable_uplift"] = max(0.0, baseline - cur)
         all_metrics.append((well, lift_type, metrics))
     logger.info("Built metrics for %s wells from parquet", len(all_metrics))
     return all_metrics
@@ -146,14 +373,15 @@ def train_operations_from_parquet(
     model_path: str = "models/decision_tree_alldata.joblib",
 ) -> dict:
     """
-    Train operations action models from parquet (no Snowflake). Writes joblibs to output_dir.
+    Train operations action models from parquet. Writes joblibs to output_dir.
     Sets OPERATIONS_MODELS_DIR so get_models_dir() returns output_dir. Used by SageMaker training.
     """
     os.environ["OPERATIONS_MODELS_DIR"] = output_dir
     all_metrics = build_metrics_from_parquet(sensor_parquet_path, production_parquet_path)
     if not all_metrics:
         raise ValueError(
-            "No metrics from parquet. Ensure sensor parquet has well_id/asset_id, timestamp, and at least 24 rows per well. "
+            "No metrics from parquet. Ensure sensor parquet has well_id/asset_id, timestamp, and enough rows per well "
+            "(see OPS_MIN_SENSOR_ROWS_PER_WELL, default 24). "
             "Production parquet should have date and well_id/asset_id."
         )
     if len(all_metrics) < 3:
@@ -161,19 +389,14 @@ def train_operations_from_parquet(
             f"Need at least 3 wells with sufficient data for training; got {len(all_metrics)}. "
             "Add more wells or ensure well_sensor_readings.parquet and daily_production.parquet have enough rows."
         )
-    return train_with_synthetic_labels(snowflake_conn=None, model_path=model_path, all_metrics=all_metrics)
+    return train_with_synthetic_labels(model_path=model_path, all_metrics=all_metrics)
 
 
 def train_with_synthetic_labels(
-    snowflake_conn=None,
     model_path: str = 'models/decision_tree_alldata.joblib',
     all_metrics: list = None,
 ) -> dict:
-    """Train action models (per lift-type + fallback) using data-driven synthetic labels.
-
-    Uses S3/parquet only: call train_operations_from_parquet(sensor_path, production_path, output_dir)
-    to build all_metrics from parquet. snowflake_conn is ignored (kept for API compatibility).
-    """
+    """Train action models (per lift-type + fallback) using data-driven synthetic labels from parquet metrics."""
     if not SKLEARN_AVAILABLE or DecisionTreeClassifier is None:
         raise RuntimeError('scikit-learn not available')
     if not all_metrics:
@@ -273,33 +496,25 @@ def train_with_synthetic_labels(
         if len(X) < 3:
             logger.warning(f"Insufficient samples ({len(X)}) for {lift_label}")
             return None
-        stratify = y if min((y == c).sum() for c in np.unique(y)) >= 2 else None
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
-        if RandomForestClassifier and CalibratedClassifierCV:
-            rf = RandomForestClassifier(n_estimators=200, max_depth=8, min_samples_split=3, min_samples_leaf=2, random_state=42, class_weight='balanced', n_jobs=-1)
-            try:
-                cal = CalibratedClassifierCV(rf, method='sigmoid', cv=min(3, len(np.unique(y_tr))))
-                cal.fit(X_tr, y_tr)
-                clf = cal
-            except Exception:
-                rf.fit(X_tr, y_tr)
-                clf = rf
+        X_tr, y_tr = X, y
+        if RandomForestClassifier:
+            clf = _fit_random_forest_classifier(X_tr, y_tr, lift_label)
         else:
             clf = DecisionTreeClassifier(max_depth=5, min_samples_split=3, min_samples_leaf=2, random_state=42, class_weight='balanced')
             clf.fit(X_tr, y_tr)
-        from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-        tr_acc = accuracy_score(y_tr, clf.predict(X_tr))
-        te_acc = accuracy_score(y_te, clf.predict(X_te))
-        prec, rec, _, _ = precision_recall_fscore_support(y_te, clf.predict(X_te), average='weighted', zero_division=0)
-        logger.info(f"  {lift_label}: acc={te_acc:.3f}, prec={prec:.3f}, rec={rec:.3f}")
+        tr_acc = float(accuracy_score(y_tr, clf.predict(X_tr)))
+        logger.info(f"  {lift_label}: train_accuracy={tr_acc:.3f} (n={len(y_tr)})")
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        classes_py = [str(c) for c in np.unique(y)]
         joblib.dump({
             'model': clf,
             'features': feature_names or CANONICAL_FEATURES,
             'lift_type': lift_label,
-            'classes': list(np.unique(y))
+            'classes': classes_py,
         }, save_path)
-        return {'train_accuracy': tr_acc, 'test_accuracy': te_acc, 'precision': prec, 'recall': rec, 'trained_on': len(y)}
+        if not Path(save_path).is_file():
+            raise RuntimeError(f"Model write failed: {save_path}")
+        return {'train_accuracy': tr_acc, 'trained_on': len(y)}
 
     results = {}
     models_dir = Path(model_path).parent
@@ -323,14 +538,17 @@ def train_with_synthetic_labels(
         if res:
             results['_fallback'] = {**res, 'model_path': model_path, 'features': common_features}
     fallback = results.get('_fallback') or (list(results.values())[0] if results else {})
-    if not results and len(X_all) >= 3:
-        logger.warning("No per-lift-type or fallback model was trained; check sample counts and labels.")
+    if not results:
+        raise RuntimeError(
+            "Operations training produced no model artifacts. "
+            "Need at least 3 wells with metrics, and enough samples per lift (>=5) or a successful combined model. "
+            f"Wells in dataset: {len(all_metrics)}."
+        )
     return {
         'model_path': model_path,
         'per_lift_type': results,
         'label_distribution': label_dist,
         'train_accuracy': fallback.get('train_accuracy', 0),
-        'test_accuracy': fallback.get('test_accuracy', 0),
         'trained_on': len(y_all),
     }
 

@@ -164,6 +164,9 @@ def run_bulk_anomaly_detection(
             "mute_till": None,
             "severity": calculated_severity,
             "category": lift_type,
+            "user_id": None,
+            "user_name": None,
+            "updated_at": None,
         }
 
         violations_records: List[Dict[str, Any]] = []
@@ -182,6 +185,9 @@ def run_bulk_anomaly_detection(
                     "expected_max": e_max,
                     "unit": v.get("unit", ""),
                     "deviation_percent": dev_pct,
+                    "user_id": None,
+                    "user_name": None,
+                    "updated_at": None,
                 }
             )
 

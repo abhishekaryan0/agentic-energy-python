@@ -7,7 +7,7 @@ Split from the original recommendations.py for better maintainability.
 Modules:
     - analyzer: TrendAnalyzer for computing metrics from sensor data
     - rules: RuleEngine, ImpactEstimator, and ACTION_MAPPING
-    - persistence: Database persistence and ML prediction functions
+    - persistence: ML prediction and S3 parquet output
 
 Usage:
     >>> from operations.recommendations import TrendAnalyzer, RuleEngine, recommend_from_metrics

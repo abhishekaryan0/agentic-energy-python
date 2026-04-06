@@ -51,8 +51,13 @@ def main():
 
     from operations.train_models import train_operations_from_parquet
 
-    train_operations_from_parquet(sensor_path, production_path, model_dir)
-    logger.info("Operations training job finished successfully.")
+    summary = train_operations_from_parquet(sensor_path, production_path, model_dir)
+    expected = os.path.join(model_dir, "decision_tree_alldata.joblib")
+    if not os.path.isfile(expected):
+        logger.error("Training did not produce required artifact: %s", expected)
+        sys.exit(1)
+    logger.info("Operations training finished: train_accuracy=%s trained_on=%s artifact=%s",
+                summary.get("train_accuracy"), summary.get("trained_on"), expected)
 
 
 if __name__ == "__main__":

@@ -995,7 +995,7 @@ def setup_postgres():
                 time_reduced_hours FLOAT,
                 detailed_analysis TEXT,
                 current_performance VARCHAR(255),
-                optimal_performance VARCHAR(255),
+                historical_trend VARCHAR(255),
                 conservative_approach TEXT,
                 aggressive_optimization TEXT,
                 hybrid_model TEXT,
@@ -1060,6 +1060,8 @@ def setup_postgres():
             CREATE TABLE IF NOT EXISTS anomaly_review (
                 id VARCHAR(100) PRIMARY KEY,
                 organization_id UUID,
+                user_id VARCHAR(100),
+                user_name VARCHAR(200),
                 well_id VARCHAR(100) NOT NULL,
                 event_date DATE NOT NULL,
                 detected_at TIMESTAMP,
@@ -1087,6 +1089,12 @@ def setup_postgres():
         )
         cur.execute(
             "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS open_up BOOLEAN;"
+        )
+        cur.execute(
+            "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS user_id VARCHAR(100);"
+        )
+        cur.execute(
+            "ALTER TABLE anomaly_review ADD COLUMN IF NOT EXISTS user_name VARCHAR(200);"
         )
         logger.info("PostgreSQL: anomaly_review OK")
 

@@ -12,17 +12,207 @@ Notes:
 - A standalone invoice extract is also maintained separately as Invoices.json.
 """
 
+import argparse
+import io
 import json
-import warnings
-import pandas as pd
-import numpy as np
+import os
 import random
+import warnings
 from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
 
 # --- CONFIGURATION ---
 START_DATE = datetime(2014, 1, 1)
 END_DATE = datetime(2024, 6, 1)
 TOTAL_DAYS = (END_DATE - START_DATE).days
+
+# Load environment variables from project .env if present
+_sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_env_path = os.path.join(_sys_root, ".env")
+if os.path.isfile(_env_path):
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(_env_path)
+    except Exception:
+        # If python-dotenv isn't installed, rely on existing environment variables.
+        pass
+
+# --- S3 PARQUET OUTPUT CONFIG ---
+S3_SENSOR_DATA_PREFIX = "sensor_data"  # under {ORGANIZATION_ID}/
+HOURLY_NOISE_PCT = 0.01  # ±1% per hour so 24h has small variance
+
+
+def _uniform_production_df(master_df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with uniform dtypes and column names for parquet."""
+    df = master_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for col in df.columns:
+        if col == "date":
+            continue
+        if df[col].dtype == "float64":
+            df[col] = df[col].astype("float32")
+    return df
+
+
+def _uniform_well_metadata(well_meta: list[dict]) -> pd.DataFrame:
+    """Convert well_meta list of dicts to a uniform DataFrame for parquet."""
+    rows = []
+    for w in well_meta:
+        rows.append(
+            {
+                "asset_id": w["asset_id"],
+                "lease": w["lease"],
+                "facility_id": w.get("facility_id"),
+                "lift_type": w["lift_type"],
+                "orientation": w.get("orientation"),
+                "spud_date": w["spud_date"].strftime("%Y-%m-%d") if w.get("spud_date") else None,
+                "current_status_goal": w.get("current_status_goal"),
+                "base_rate": float(w.get("base_rate", 0)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _clean_val(val):
+    if pd.isna(val) or val is None:
+        return None
+    try:
+        return round(float(val), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_well_sensor_readings_df(master_df: pd.DataFrame, well_meta: list[dict], organization_id: str) -> pd.DataFrame:
+    """Build hourly well_sensor_readings from daily master_df."""
+    lift_type_by_well_id = {w["asset_id"]: w.get("lift_type") for w in well_meta}
+    sensor_cols = [
+        "organization_id",
+        "well_id",
+        "timestamp",
+        "lift_type",
+        # canonical sensor columns (subset produced by this twin generator)
+        "tubing_pressure",
+        "casing_pressure",
+        "strokes_per_minute",
+        "pump_fillage",
+        "motor_current",
+        "pump_intake_pressure",
+        "motor_temp",
+        "freq_hz",
+        "injection_rate",
+        "surface_stroke_length",
+        "downhole_net_stroke",
+        "injection_pressure",
+        # operational context
+        "well_status",
+    ]
+    twin_to_sensor = {
+        "avg_tubing_pressure": "tubing_pressure",
+        "avg_casing_pressure": "casing_pressure",
+        "spm": "strokes_per_minute",
+        "pump_fillage_pct": "pump_fillage",
+        "avg_motor_amps": "motor_current",
+        "pump_intake_pressure": "pump_intake_pressure",
+        "motor_temp_f": "motor_temp",
+        "freq_hz": "freq_hz",
+        "injection_rate_mcf": "injection_rate",
+        "gross_stroke_len": "surface_stroke_length",
+        "net_stroke_len": "downhole_net_stroke",
+    }
+
+    rows = []
+    for _, row in master_df.iterrows():
+        base_ts = pd.Timestamp(row["date"])
+        for hour in range(24):
+            ts = base_ts + pd.Timedelta(hours=hour)
+            rec = {c: None for c in sensor_cols}
+            rec["organization_id"] = organization_id
+            rec["well_id"] = row["asset_id"]
+            rec["timestamp"] = ts
+            rec["lift_type"] = lift_type_by_well_id.get(row["asset_id"])
+            rec["well_status"] = str(row["status"]) if row.get("status") else None
+
+            for twin_col, out_col in twin_to_sensor.items():
+                if twin_col in row.index:
+                    val = _clean_val(row[twin_col])
+                    if val is not None:
+                        # Add small hourly variation
+                        noise = 1.0 + np.random.uniform(-HOURLY_NOISE_PCT, HOURLY_NOISE_PCT)
+                        rec[out_col] = round(val * noise, 2)
+
+            # Gas lift fallback: injection_pressure often approximates casing pressure
+            if rec.get("lift_type") == "Gas Lift" and rec.get("injection_pressure") is None:
+                rec["injection_pressure"] = _clean_val(row.get("avg_casing_pressure"))
+
+            rows.append(rec)
+
+    df = pd.DataFrame(rows, columns=sensor_cols)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    float_cols = [
+        "tubing_pressure",
+        "casing_pressure",
+        "strokes_per_minute",
+        "pump_fillage",
+        "motor_current",
+        "pump_intake_pressure",
+        "motor_temp",
+        "freq_hz",
+        "injection_rate",
+        "surface_stroke_length",
+        "downhole_net_stroke",
+        "injection_pressure",
+    ]
+    for col in float_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("float32")
+    return df
+
+
+def upload_to_s3(master_df: pd.DataFrame, well_meta: list[dict], organization_id: str) -> None:
+    """Write digital twin data to S3 under org's sensor_data folder."""
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        print("S3_BUCKET not set (.env). Skipping S3 upload.")
+        return
+
+    # Lazy-import so local runs without boto3 still work
+    try:
+        import boto3
+    except ImportError:
+        print("boto3 not installed. pip install boto3")
+        return
+
+    sensor_prefix = f"{organization_id}/{S3_SENSOR_DATA_PREFIX}"
+
+    prod_df = _uniform_production_df(master_df)
+    meta_df = _uniform_well_metadata(well_meta)
+    sensor_df = _build_well_sensor_readings_df(master_df, well_meta, organization_id)
+
+    buf_prod = io.BytesIO()
+    buf_meta = io.BytesIO()
+    buf_sensor = io.BytesIO()
+
+    prod_df.to_parquet(buf_prod, index=False)
+    meta_df.to_parquet(buf_meta, index=False)
+    sensor_df.to_parquet(buf_sensor, index=False)
+
+    buf_prod.seek(0)
+    buf_meta.seek(0)
+    buf_sensor.seek(0)
+
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/daily_production.parquet", Body=buf_prod.getvalue())
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/well_metadata.parquet", Body=buf_meta.getvalue())
+    s3.put_object(Bucket=bucket, Key=f"{sensor_prefix}/well_sensor_readings.parquet", Body=buf_sensor.getvalue())
+
+    print(f"SUCCESS: Uploaded parquet to s3://{bucket}/{sensor_prefix}/")
+    print(f"  - daily_production.parquet ({len(prod_df):,} rows)")
+    print(f"  - well_metadata.parquet ({len(meta_df):,} rows)")
+    print(f"  - well_sensor_readings.parquet ({len(sensor_df):,} rows)")
 
 # --- 1. FAILURE LIBRARY (KPI IMPACT) ---
 FAILURE_MODES = {
@@ -244,7 +434,7 @@ def generate_well_timeline(well):
     })
 
 # --- 4. MASTER SIMULATION ---
-def run_simulation():
+def run_simulation(upload_s3: bool = True, write_json: bool = False, organization_id: str | None = None):
     print("Generating Engineering-Grade Digital Twin base dataset (v3.1)...")
     well_meta, fac_meta = build_hierarchy()
 
@@ -271,69 +461,102 @@ def run_simulation():
         )
         master_df = pd.concat(non_empty_dfs).sort_values(["date", "facility_id"])
 
-    output = {"company": "Apex Permian", "assets": {}}
-    for w in well_meta:
-        output["assets"][w["asset_id"]] = {
-            "type": "Well",
-            "lift": w["lift_type"],
-            "history": []
-        }
-    for fid in fac_meta:
-        output["assets"][fid] = {"type": "Facility", "history": []}
-
+    # Precompute facility/day ESD decisions so we can apply them consistently to parquet and/or JSON.
+    esd_decisions: dict[tuple[str, datetime], bool] = {}
     for fid in master_df["facility_id"].unique():
         fac_df = master_df[master_df["facility_id"] == fid]
-        for date, day_data in fac_df.groupby("date"):
-            d_str = date.strftime("%Y-%m-%d")
+        for date, _day_data in fac_df.groupby("date"):
+            d = random.random() < 0.0005
+            esd_decisions[(fid, date)] = d
+            if d:
+                mask = (master_df["facility_id"] == fid) & (master_df["date"] == date)
+                master_df.loc[mask, "status"] = "SHUT_IN"
 
-            esd = False
-            if random.random() < 0.0005:
-                esd = True
+    if write_json:
+        # Build the packaged engineering JSON only when requested.
+        output = {"company": "Apex Permian", "assets": {}}
+        for w in well_meta:
+            output["assets"][w["asset_id"]] = {"type": "Well", "lift": w["lift_type"], "history": []}
+        for fid in fac_meta:
+            output["assets"][fid] = {"type": "Facility", "history": []}
 
-            total_oil = day_data["true_oil"].sum() if not esd else 0
+        def clean(val):
+            return None if pd.isna(val) else round(val, 2)
 
-            output["assets"][fid]["history"].append({
-                "date": d_str,
-                "oil_prod": round(total_oil, 2),
-                "status": "ESD" if esd else "OK"
-            })
+        for fid in master_df["facility_id"].unique():
+            fac_df = master_df[master_df["facility_id"] == fid]
+            for date, day_data in fac_df.groupby("date"):
+                d_str = date.strftime("%Y-%m-%d")
+                esd = esd_decisions.get((fid, date), False)
 
-            sum_true = day_data["true_oil"].sum()
-            for _, row in day_data.iterrows():
-                alloc_oil = 0
-                if not esd and sum_true > 0:
-                    alloc_oil = total_oil * (row["true_oil"] / sum_true)
+                total_oil = day_data["true_oil"].sum() if not esd else 0
+                output["assets"][fid]["history"].append(
+                    {
+                        "date": d_str,
+                        "oil_prod": round(total_oil, 2),
+                        "status": "ESD" if esd else "OK",
+                    }
+                )
 
-                def clean(val):
-                    return None if pd.isna(val) else round(val, 2)
+                sum_true = day_data["true_oil"].sum()
+                for _, row in day_data.iterrows():
+                    alloc_oil = 0
+                    if not esd and sum_true > 0:
+                        alloc_oil = total_oil * (row["true_oil"] / sum_true)
 
-                output["assets"][row["asset_id"]]["history"].append({
-                    "date": d_str,
-                    "allocated_oil": round(alloc_oil, 2),
-                    "test_oil": row["test_oil"],
-                    "avg_tubing_pressure": clean(row["avg_tubing_pressure"]),
-                    "avg_casing_pressure": clean(row["avg_casing_pressure"]),
-                    "avg_motor_amps": clean(row["avg_motor_amps"]),
-                    "gross_stroke_len": clean(row["gross_stroke_len"]),
-                    "net_stroke_len": clean(row["net_stroke_len"]),
-                    "spm": clean(row["spm"]),
-                    "pump_fillage_pct": clean(row["pump_fillage_pct"]),
-                    "freq_hz": clean(row["freq_hz"]),
-                    "pump_intake_pressure": clean(row["pump_intake_pressure"]),
-                    "motor_temp_f": clean(row["motor_temp_f"]),
-                    "injection_rate_mcf": clean(row["injection_rate_mcf"]),
-                    "status": "SHUT_IN" if esd else row["status"],
-                    "notes": row["notes"]
-                })
+                    output["assets"][row["asset_id"]]["history"].append(
+                        {
+                            "date": d_str,
+                            "allocated_oil": round(alloc_oil, 2),
+                            "test_oil": row["test_oil"],
+                            "avg_tubing_pressure": clean(row["avg_tubing_pressure"]),
+                            "avg_casing_pressure": clean(row["avg_casing_pressure"]),
+                            "avg_motor_amps": clean(row["avg_motor_amps"]),
+                            "gross_stroke_len": clean(row["gross_stroke_len"]),
+                            "net_stroke_len": clean(row["net_stroke_len"]),
+                            "spm": clean(row["spm"]),
+                            "pump_fillage_pct": clean(row["pump_fillage_pct"]),
+                            "freq_hz": clean(row["freq_hz"]),
+                            "pump_intake_pressure": clean(row["pump_intake_pressure"]),
+                            "motor_temp_f": clean(row["motor_temp_f"]),
+                            "injection_rate_mcf": clean(row["injection_rate_mcf"]),
+                            "status": "SHUT_IN" if esd else row["status"],
+                            "notes": row["notes"],
+                        }
+                    )
 
-    with open("apex_permian_v3_1_engineering.json", "w") as f:
-        json.dump(output, f, indent=2, default=str)
+        with open("apex_permian_v3_1_engineering.json", "w") as f:
+            json.dump(output, f, indent=2, default=str)
 
-    print(
-        "Done: apex_permian_v3_1_engineering.json\n"
-        "Note: Master.json is maintained separately as the unified packaged dataset, "
-        "and Invoices.json is maintained separately as the invoice-only extract."
-    )
+        print(
+            "Done: apex_permian_v3_1_engineering.json\n"
+            "Note: Master.json is maintained separately as the unified packaged dataset, "
+            "and Invoices.json is maintained separately as the invoice-only extract."
+        )
+
+    if upload_s3:
+        org_id = organization_id or os.getenv("ORGANIZATION_ID")
+        if not org_id:
+            print("ORGANIZATION_ID not set (env or argument). Skipping S3 upload.")
+            return
+        upload_to_s3(master_df, well_meta, organization_id=org_id)
 
 if __name__ == "__main__":
-    run_simulation()
+    parser = argparse.ArgumentParser(description="Generate digital twin data (parquet to S3 and/or JSON).")
+    parser.add_argument("--json", action="store_true", help="Also write apex_permian_v3_1_engineering.json locally.")
+    parser.add_argument(
+        "--no-s3",
+        action="store_true",
+        help="Disable S3 parquet upload (default uploads parquet to S3).",
+    )
+    parser.add_argument(
+        "--organization-id",
+        default=os.getenv("ORGANIZATION_ID"),
+        help="Organization/tenant UUID. Default: ORGANIZATION_ID env.",
+    )
+    args = parser.parse_args()
+
+    if args.organization_id:
+        os.environ["ORGANIZATION_ID"] = args.organization_id
+
+    run_simulation(upload_s3=not args.no_s3, write_json=args.json, organization_id=args.organization_id)
