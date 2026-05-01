@@ -737,6 +737,34 @@ def _build_recent_production_30d_block(metrics: Dict[str, Any]) -> str:
     )
 
 
+def _financial_pricing_sentence(meta: Dict[str, Any]) -> str:
+    """Create a compact, human-readable pricing blurb (keep <80 words)."""
+    if not meta or not isinstance(meta, dict):
+        return ""
+    price = meta.get("oil_spot_usd_per_bbl")
+    src = meta.get("oil_spot_source")
+    period = meta.get("oil_spot_period")
+    basis = meta.get("implementation_cost_basis")
+    parts: List[str] = []
+    try:
+        parts.append(f"Oil spot: ${float(price):.2f}/bbl")
+    except Exception:
+        if price is not None:
+            parts.append(f"Oil spot: {price}/bbl")
+    if src:
+        parts.append(f"source: {src}")
+    if period:
+        parts.append(f"period: {period}")
+    if basis:
+        parts.append(f"implementation cost basis: {basis}")
+    s = "; ".join(parts).strip()
+    # Hard-cap to keep logs/UI readable.
+    words = s.split()
+    if len(words) > 80:
+        s = " ".join(words[:80]).rstrip()
+    return s
+
+
 def _create_prediction_record(
     well: str, action: str, proba: Optional[float], 
     metrics: Dict[str, Any], lift_type: str
@@ -829,13 +857,18 @@ def _create_prediction_record(
         "data_quality": "Parquet-based sensor and daily production data used for trends.",
     }
     if meta:
-        cite_obj["financial_pricing"] = meta
+        # Store as a short readable sentence (not a nested JSON object).
+        fp = _financial_pricing_sentence(meta)
+        if fp:
+            cite_obj["financial_pricing"] = fp
     rec['citations'] = json.dumps(cite_obj)
     rec['referenced_data'] = json.dumps(["well_sensor_readings", "daily_production"])
     rec['supporting_analysis'] = "Recommendation based on sensor trends, production metrics, and operational rules."
     rec['data_quality'] = "Sensor and production parquet used for metrics; ML confidence threshold applied."
 
-    rec.setdefault('time_reduced_hours', None)
+    # Keep output schema stable: never emit null for numeric columns.
+    # `time_reduced_hours` is deterministically computed later in the pipeline; if unavailable, default to 0.0.
+    rec.setdefault('time_reduced_hours', 0.0)
     rec.setdefault('conservative_approach', None)
     rec.setdefault('aggressive_optimization', None)
     rec.setdefault('hybrid_model', None)

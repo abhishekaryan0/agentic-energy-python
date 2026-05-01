@@ -12,17 +12,28 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(repo_root))
 
 from anomaly_detection.bulk_detect import run_bulk_anomaly_detection
+from anomaly_detection.bulk_detect import run_incremental_anomaly_detection
 
 
 def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    last_n = int(os.getenv("ANOMALY_BULK_LAST_N", "15"))
+    mode = (os.getenv("ANOMALY_DETECTION_MODE") or "incremental").strip().lower()
     max_wells = os.getenv("ANOMALY_BULK_MAX_WELLS")
     max_wells_int = int(max_wells) if max_wells else None
 
-    result = run_bulk_anomaly_detection(last_n=last_n, per_well=True, max_wells=max_wells_int)
+    if mode == "bulk":
+        last_n = int(os.getenv("ANOMALY_BULK_LAST_N", "15"))
+        result = run_bulk_anomaly_detection(last_n=last_n, per_well=True, max_wells=max_wells_int)
+    else:
+        window_minutes = int(os.getenv("ANOMALY_WINDOW_MINUTES", "15"))
+        safety_lag = int(os.getenv("ANOMALY_SAFETY_LAG_SECONDS", "90"))
+        result = run_incremental_anomaly_detection(
+            window_minutes=window_minutes,
+            safety_lag_seconds=safety_lag,
+            max_wells=max_wells_int,
+        )
     print(json.dumps(result, indent=2))
 
 

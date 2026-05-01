@@ -399,12 +399,22 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         if alt_models.get("recommended_model"):
             alt_models["recommended_model"] = _strip_alternative_headers(alt_models["recommended_model"])
 
-        time_reduced = None
+        # Prefer deterministic numeric fields (set earlier in `row`). Only use OpenRouter if missing/0.
+        time_reduced = 0.0
         try:
-            val = float(op_details.get("time_reduced_hours") or 0)
-            time_reduced = val if val > 0 else None
+            existing = float(row.get("time_reduced_hours") or 0.0)
         except Exception:
-            time_reduced = None
+            existing = 0.0
+        try:
+            llm_val = float(op_details.get("time_reduced_hours") or 0.0)
+        except Exception:
+            llm_val = 0.0
+        if existing > 0.0:
+            time_reduced = existing
+        elif llm_val > 0.0:
+            time_reduced = llm_val
+        else:
+            time_reduced = 0.0
 
         row["detailed_analysis"] = _t(op_details.get("detailed_analysis", ""), 2000)
         row["current_performance"] = _t(op_details.get("current_performance", ""), 255)
@@ -419,7 +429,7 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         row["referenced_data"] = json.dumps(citations.get("referenced_data", []))
         row["supporting_analysis"] = _t(citations.get("supporting_analysis", ""), 2000)
         row["data_quality"] = _t(citations.get("data_quality", ""), 100)
-        row["time_reduced_hours"] = time_reduced
+        row["time_reduced_hours"] = float(round(time_reduced, 2)) if time_reduced > 0 else 0.0
 
         from operations.recommendations.persistence import write_operations_recommendations_to_s3
         written_key = write_operations_recommendations_to_s3([row])

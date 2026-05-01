@@ -1,0 +1,45 @@
+{
+  "family": "TASK_FAMILY_VALUE",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "sagemaker-training-launcher",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "LOG_GROUP_NAME",
+          "awslogs-region": "AWS_REGION_VALUE",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "environment": [
+        { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+        { "name": "AWS_ACCOUNT_ID", "value": "AWS_ACCOUNT_ID_VALUE" },
+        { "name": "S3_BUCKET", "value": "S3_BUCKET_VALUE" },
+        { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
+        { "name": "SAGEMAKER_ROLE_ARN", "value": "SAGEMAKER_ROLE_ARN_VALUE" },
+        { "name": "IMAGE_TAG", "value": "IMAGE_TAG_VALUE" },
+        { "name": "PER_WELL_LIMIT", "value": "PER_WELL_LIMIT_VALUE" },
+        { "name": "MODEL_KEY", "value": "MODEL_KEY_VALUE" },
+
+        { "name": "ECR_REPO_TRAIN", "value": "ECR_REPO_TRAIN_VALUE" },
+        { "name": "ECR_REPO_TRAIN_REVIEW", "value": "ECR_REPO_TRAIN_REVIEW_VALUE" },
+        { "name": "ECR_REPO_TRAIN_OPERATIONS", "value": "ECR_REPO_TRAIN_OPERATIONS_VALUE" },
+        { "name": "ECR_REPO_TRAIN_FINANCIAL", "value": "ECR_REPO_TRAIN_FINANCIAL_VALUE" },
+
+        { "name": "INSTANCE_TYPE_ANOMALY_DETECTION", "value": "INSTANCE_TYPE_ANOMALY_DETECTION_VALUE" },
+        { "name": "INSTANCE_TYPE_ANOMALY_REVIEW", "value": "INSTANCE_TYPE_ANOMALY_REVIEW_VALUE" },
+        { "name": "INSTANCE_TYPE_OPERATIONS", "value": "INSTANCE_TYPE_OPERATIONS_VALUE" },
+        { "name": "INSTANCE_TYPE_FINANCIAL", "value": "INSTANCE_TYPE_FINANCIAL_VALUE" }
+      ]
+    }
+  ]
+}
+

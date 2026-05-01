@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+# Batch image for incremental anomaly detection on ECS Fargate (S3 only).
+# Runs every 15 minutes via EventBridge.
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY deploy/requirements.anomaly_detection.batch.txt ./requirements.anomaly_detection.batch.txt
+RUN pip install --no-cache-dir -r requirements.anomaly_detection.batch.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+# Incremental mode by default (watermark checkpoint in S3)
+ENV ANOMALY_DETECTION_MODE=incremental
+ENV ANOMALY_WINDOW_MINUTES=15
+ENV ANOMALY_SAFETY_LAG_SECONDS=90
+
+# Default OFF to avoid costs in batch. Enable by setting env in task definition.
+ENV ANOMALY_ENABLE_LLM_SUGGESTIONS=0
+
+CMD ["python", "-m", "anomaly_detection.run"]
+

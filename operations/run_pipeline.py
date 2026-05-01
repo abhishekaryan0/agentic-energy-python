@@ -226,11 +226,21 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
                             hours = recovery_days * 24.0
                             if hours > max_hours:
                                 hours = max_hours
-                            rec["time_reduced_hours"] = float(round(hours, 2)) if hours > 0 else None
+                            rec["time_reduced_hours"] = float(round(hours, 2)) if hours > 0 else 0.0
                         else:
-                            rec["time_reduced_hours"] = None
+                            rec["time_reduced_hours"] = 0.0
                     except Exception:
-                        rec["time_reduced_hours"] = None
+                        rec["time_reduced_hours"] = 0.0
+
+                    # If deterministic time is unavailable (0.0), allow OpenRouter to provide a fallback.
+                    # This does not override a valid deterministic value.
+                    try:
+                        if float(rec.get("time_reduced_hours") or 0.0) <= 0.0:
+                            llm_hours = float(op.get("time_reduced_hours") or 0.0)
+                            if llm_hours > 0.0:
+                                rec["time_reduced_hours"] = float(round(llm_hours, 2))
+                    except Exception:
+                        pass
 
                     # Also enrich financial/production/operational fields from LLM if not set
                     if not rec.get("detailed_analysis"):

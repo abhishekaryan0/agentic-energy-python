@@ -227,6 +227,23 @@ To run **well status update** (read sensor parquet from S3, compute RUNNING/IDLE
 
 5. **Logs**: CloudWatch log group `/ecs/well-status`.
 
+## SageMaker training per model (recommended)
+
+This creates **separate scheduled rules** (so you can change timing per model independently):
+- `anomaly_detection` → `deploy/schedule_sagemaker_training_anomaly_detection.sh`
+- `anomaly_review` → `deploy/schedule_sagemaker_training_anomaly_review.sh`
+- `operations` → `deploy/schedule_sagemaker_training_operations.sh`
+- `financial` → `deploy/schedule_sagemaker_training_financial.sh`
+
+Run them (they will pick up `.env` if present):
+
+```bash
+./deploy/schedule_sagemaker_training_anomaly_detection.sh
+./deploy/schedule_sagemaker_training_anomaly_review.sh
+./deploy/schedule_sagemaker_training_operations.sh
+./deploy/schedule_sagemaker_training_financial.sh
+```
+
 ## Anomaly review (S3 only, no Snowflake)
 
 Anomaly review uses **S3 only** for input and output (Snowflake removed).
