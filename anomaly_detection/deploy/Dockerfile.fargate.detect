@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+# Batch image for incremental anomaly detection on ECS Fargate (S3 only).
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY anomaly_detection/deploy/requirements.batch.txt ./requirements.batch.txt
+RUN pip install --no-cache-dir -r requirements.batch.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+ENV ANOMALY_DETECTION_MODE=incremental
+ENV ANOMALY_BOOTSTRAP_ROWS=100
+ENV ANOMALY_BOOTSTRAP_PARTITION_DAYS=30
+ENV ANOMALY_DETECTION_FORCE_WINDOW=0
+ENV ANOMALY_DETECTION_FORCE_WINDOW_DAYS=30
+ENV ANOMALY_INCREMENTAL_LAST_N=15
+ENV ANOMALY_HISTORY_PARTITION_DAYS=3
+ENV ANOMALY_SENSOR_PARTITION_DAYS=30
+ENV ANOMALY_WINDOW_MINUTES=15
+ENV ANOMALY_SAFETY_LAG_SECONDS=90
+ENV ANOMALY_ENABLE_LLM_SUGGESTIONS=1
+
+CMD ["python", "-m", "anomaly_detection.run"]

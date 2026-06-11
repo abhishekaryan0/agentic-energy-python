@@ -68,6 +68,9 @@ FRONTEND_GUIDE.md
 # Miscellaneous
 *.sql
 
+# Trained ML artifacts — always download from S3 at runtime, never bake into image
+models/
+
 # Local virtualenvs
 .venv
 .venv311

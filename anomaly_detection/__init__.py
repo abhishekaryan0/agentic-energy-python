@@ -53,14 +53,22 @@ from anomaly_detection.detector import (
     CONTAMINATION_RATIO,
 )
 
-from anomaly_detection.train_models import (
-    train_all_models,
-    train_isolation_forest,
-    train_statistical_model,
-    train_lstm_autoencoder,
-    get_well_ids_from_snowflake,
-    load_training_data_for_well_from_snowflake,
-)
+_TRAINING_EXPORTS = {
+    "train_all_models",
+    "train_isolation_forest",
+    "train_statistical_model",
+    "train_lstm_autoencoder",
+}
+
+
+def __getattr__(name: str):
+    """Lazy import training helpers so detection batch jobs do not load train_models at startup."""
+    if name in _TRAINING_EXPORTS:
+        from anomaly_detection import train_models as _tm
+
+        return getattr(_tm, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Configuration
@@ -84,8 +92,6 @@ __all__ = [
     'train_isolation_forest',
     'train_statistical_model',
     'train_lstm_autoencoder',
-    'get_well_ids_from_snowflake',
-    'load_training_data_for_well_from_snowflake',
     
     # Utilities
     'get_safe_value',

@@ -1,0 +1,13 @@
+# Container image for AWS Lambda: Red Bluff synthetic data → Snowflake.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY RED_BUFF/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY RED_BUFF ${LAMBDA_TASK_ROOT}/RED_BUFF
+COPY transformations/__init__.py ${LAMBDA_TASK_ROOT}/transformations/__init__.py
+COPY transformations/columns.py ${LAMBDA_TASK_ROOT}/transformations/columns.py
+
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+CMD ["RED_BUFF.handler.handler"]

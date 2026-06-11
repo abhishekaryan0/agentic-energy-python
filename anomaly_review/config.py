@@ -35,7 +35,7 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 AUTOENCODER_THRESHOLD_SIGMA = 1.5
 # How many days of well data we fetch for anomaly review (baselines, models, pattern-shift).
 # Pattern-shift compares last 30d vs previous 90d within this window (no full-year history).
-ANOMALY_REVIEW_FETCH_DAYS = 180
+ANOMALY_REVIEW_FETCH_DAYS = int(os.getenv("ANOMALY_REVIEW_FETCH_DAYS", "180"))
 # S3 layout (aligned with operations and deploy): input/output prefixes
 # Input: s3://BUCKET/{ORG}/sensor_data/well_sensor_readings.parquet, daily_production.parquet
 # Output: s3://BUCKET/{ORG}/detections/anomaly_review/run_ts=.../anomaly_reviews.parquet

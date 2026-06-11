@@ -1,0 +1,10 @@
+# Container image for AWS Lambda: well status (S3 sensor -> PostgreSQL).
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY well_status/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY well_status ${LAMBDA_TASK_ROOT}/well_status
+COPY s3_to_postgres ${LAMBDA_TASK_ROOT}/s3_to_postgres
+
+CMD ["well_status.handler.handler"]

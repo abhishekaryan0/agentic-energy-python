@@ -1,0 +1,6 @@
+# Lambda container: pin versions with manylinux wheels (no compiler in base image).
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+python-dotenv>=1.0.0
+snowflake-connector-python[pandas]==3.12.3

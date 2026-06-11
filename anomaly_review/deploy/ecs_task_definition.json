@@ -1,0 +1,36 @@
+{
+  "family": "anomaly-review-detection-batch",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "anomaly-review-detection",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "environment": [
+        { "name": "S3_BUCKET", "value": "S3_BUCKET_VALUE" },
+        { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
+        { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+        { "name": "ANOMALY_REVIEW_FETCH_DAYS", "value": "180" },
+        { "name": "ANOMALY_REVIEW_INITIAL_DAYS", "value": "180" },
+        { "name": "ANOMALY_REVIEW_DETECTION_DAYS", "value": "7" },
+        { "name": "ANOMALY_REVIEW_FORCE_WINDOW", "value": "ANOMALY_REVIEW_FORCE_WINDOW_VALUE" },
+        { "name": "ANOMALY_REVIEW_MAX_WORKERS", "value": "5" },
+        { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
+        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "LOG_GROUP_NAME",
+          "awslogs-region": "AWS_REGION_VALUE",
+          "awslogs-stream-prefix": "anomaly-review-detection"
+        }
+      }
+    }
+  ]
+}

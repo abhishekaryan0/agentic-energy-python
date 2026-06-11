@@ -3,7 +3,7 @@ Unified Anomaly Detection Module
 ================================
 
 Integrates statistical rules, Isolation Forest, and LSTM for comprehensive anomaly detection.
-Loads sensor configurations dynamically from Snowflake instead of hardcoding.
+Loads sensor configurations from S3 parquet (sensor_ranges) when available.
 
 Features:
     - Rule-based detection using sensor thresholds from database
@@ -23,6 +23,7 @@ import numpy as np
 import logging
 import os
 import re
+import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
@@ -34,7 +35,7 @@ import joblib
 # ============================================================================
 
 try:
-    from config.sensor_config import get_sensor_ranges, get_features_for_lift_type, get_lift_types
+    from anomaly_detection.sensor_config import get_sensor_ranges, get_features_for_lift_type, get_lift_types
     SENSOR_CONFIG_AVAILABLE = True
 except ImportError:
     SENSOR_CONFIG_AVAILABLE = False
@@ -56,60 +57,92 @@ except ImportError:
 try:
     import torch
     import torch.nn as nn
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    logging.warning("PyTorch not available; LSTM disabled")
-    torch = None
-    nn = None
+except ImportError as e:
+    raise ImportError(
+        "PyTorch is required for anomaly detection (LSTM autoencoder). "
+        "Install with: pip install torch>=2.0.0"
+    ) from e
 
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-def _ensure_models_from_s3(models_dir_abs: str) -> bool:
-    """
-    If S3_BUCKET (and optionally S3_PREFIX, MODEL_VERSION) are set in env,
-    download anomaly_detection tarball from S3 and extract into models_dir_abs.
-    Returns True if extraction succeeded and anomaly_detection/ exists, else False.
-    """
-    bucket = os.environ.get("S3_BUCKET")
-    if not bucket:
-        return False
+def _download_and_extract_model_tarball(
+    bucket: str, key: str, models_dir_abs: str
+) -> bool:
+    """Download s3://bucket/key (.tar.gz) and extract under models_dir_abs."""
+    import boto3
+
+    s3 = boto3.client("s3")
+    tmp_path = None
     try:
-        import boto3
-    except ImportError:
-        logger.warning("boto3 not installed; cannot download models from S3. pip install boto3")
-        return False
-    prefix = (os.environ.get("S3_PREFIX") or "models/anomaly").rstrip("/")
-    version = os.environ.get("MODEL_VERSION") or "v1"
-    key = f"{prefix}/anomaly_detection_{version}.tar.gz"
-    logger.info("Downloading anomaly detection models from s3://%s/%s", bucket, key)
-    try:
-        s3 = boto3.client("s3")
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as f:
             tmp_path = f.name
-        try:
-            s3.download_file(bucket, key, tmp_path)
-        except Exception as e:
-            logger.warning("S3 download failed: %s", e)
-            return False
+        s3.download_file(bucket, key, tmp_path)
         os.makedirs(models_dir_abs, exist_ok=True)
+        # Remove stale per-well folders from a prior image layer or partial extract.
+        ad_dir = os.path.join(models_dir_abs, "anomaly_detection")
+        if os.path.isdir(ad_dir):
+            shutil.rmtree(ad_dir, ignore_errors=True)
         with tarfile.open(tmp_path, "r:gz") as tar:
             tar.extractall(path=models_dir_abs)
         logger.info("Extracted models to %s", models_dir_abs)
         base = os.path.join(models_dir_abs, "anomaly_detection")
         return os.path.isdir(base)
     except Exception as e:
-        logger.warning("Failed to fetch models from S3: %s", e)
+        logger.warning("Model tarball download/extract failed: %s", e)
         return False
     finally:
-        if "tmp_path" in dir() and os.path.isfile(tmp_path):
+        if tmp_path and os.path.isfile(tmp_path):
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
+
+
+def _ensure_models_from_s3(models_dir_abs: str) -> bool:
+    """
+    Download trained anomaly_detection models into models_dir_abs.
+
+    Priority:
+    1. ANOMALY_MODEL_S3_URI (e.g. SageMaker output model.tar.gz under {org}/model/...)
+    2. s3://S3_BUCKET/{S3_PREFIX}/anomaly_detection_{MODEL_VERSION}.tar.gz
+    """
+    try:
+        import boto3
+    except ImportError:
+        logger.warning("boto3 not installed; cannot download models from S3. pip install boto3")
+        return False
+
+    model_uri = (os.environ.get("ANOMALY_MODEL_S3_URI") or "").strip()
+    if model_uri.startswith("s3://"):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(model_uri)
+        bucket, key = parsed.netloc, parsed.path.lstrip("/")
+        logger.info("Downloading anomaly models from %s", model_uri)
+        return _download_and_extract_model_tarball(bucket, key, models_dir_abs)
+
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        return False
+
+    org = (os.environ.get("ORGANIZATION_ID") or "").strip()
+    if org and not model_uri:
+        # Default: latest SageMaker training artifact path pattern (override via ANOMALY_MODEL_S3_URI)
+        job = (os.environ.get("ANOMALY_MODEL_TRAINING_JOB") or "").strip()
+        if job:
+            key = f"{org}/model/{job}/output/model.tar.gz"
+            logger.info("Downloading anomaly models from s3://%s/%s", bucket, key)
+            if _download_and_extract_model_tarball(bucket, key, models_dir_abs):
+                return True
+
+    prefix = (os.environ.get("S3_PREFIX") or "models/anomaly").rstrip("/")
+    version = os.environ.get("MODEL_VERSION") or "v1"
+    key = f"{prefix}/anomaly_detection_{version}.tar.gz"
+    logger.info("Downloading anomaly detection models from s3://%s/%s", bucket, key)
+    return _download_and_extract_model_tarball(bucket, key, models_dir_abs)
 
 
 @dataclass
@@ -230,41 +263,33 @@ CRITICAL_SENSORS: Dict[str, List[str]] = {
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Fallback for when PyTorch is not available
-class FakeLSTMModule:
-    """Dummy module when torch is not available."""
-    pass
+class LSTMAutoencoder(nn.Module):
+    """LSTM-based autoencoder for sequence anomaly detection."""
 
-if nn is None:
-    nn = FakeLSTMModule()
-    nn.Module = object
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1):
+        super(LSTMAutoencoder, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.decoder = nn.LSTM(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_dim, input_dim)
 
-if TORCH_AVAILABLE:
-    class LSTMAutoencoder(nn.Module):
-        """LSTM-based autoencoder for sequence anomaly detection. Uses PyTorch LSTM."""
-        def __init__(self, input_dim, hidden_dim=64, num_layers=1):
-            super(LSTMAutoencoder, self).__init__()
-            self.input_dim = input_dim
-            self.hidden_dim = hidden_dim
-            self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-            self.decoder = nn.LSTM(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-            self.linear = nn.Linear(hidden_dim, input_dim)
+    def forward(self, x):
+        _, (hidden, _) = self.encoder(x)
+        decoder_input = hidden.permute(1, 0, 2).repeat(1, x.shape[1], 1)
+        decoded, _ = self.decoder(decoder_input)
+        return self.linear(decoded)
 
-        def forward(self, x):
-            _, (hidden, _) = self.encoder(x)
-            # hidden is (1, batch, hidden_dim), we want (batch, seq_len, hidden_dim)
-            decoder_input = hidden.permute(1, 0, 2).repeat(1, x.shape[1], 1)
-            decoded, _ = self.decoder(decoder_input)
-            reconstructed = self.linear(decoded)
-            return reconstructed
-else:
-    class LSTMAutoencoder:
-        """Dummy LSTM when PyTorch not available."""
-        def __init__(self, *args, **kwargs):
-            pass
-        
-        def forward(self, x):
-            return x
+def normalize_lift_type_for_models(lift_type: Optional[str]) -> str:
+    """Map sensor lift_type labels to training feature families (e.g. Pumping Unit -> Rod Pump)."""
+    aliases = {"Pumping Unit": "Rod Pump"}
+    lt = (lift_type or "").strip()
+    return aliases.get(lt, lt) if lt else lt
+
+
+def lift_type_model_key(lift_type: Optional[str]) -> str:
+    return normalize_lift_type_for_models(lift_type).lower().replace(" ", "_")
+
 
 def well_id_to_safe(well_id: Optional[str], normalize_lower: bool = True) -> str:
     """Convert well_id to a safe filename/key segment (alphanumeric and underscores, max 64 chars)."""
@@ -288,15 +313,15 @@ def get_safe_value(d: Dict, k: str, default: float = 0.0) -> float:
 # Dynamic rules loader function
 def get_well_type_rules(lift_type: str) -> Dict:
     """
-    Get sensor rules for a well type from dynamic config (Snowflake).
-    
+    Get sensor rules for a well type from sensor_config (S3 parquet).
+
     Returns a dict of client-provided ranges that can be used as hard bounds
-    around the statistically learned average band. In SageMaker (no Snowflake),
-    this returns an empty dict and rule-based checks rely purely on model stats.
+    around the statistically learned average band. When sensor_config is unavailable,
+    returns an empty dict and rule-based checks rely on ML model stats.
     """
     if os.environ.get("SAGEMAKER_REGION"):
         return {}
-    # When sensor_config / Snowflake is not available, allow pure ML/S3-based detection.
+    # When sensor_config is not available, allow pure ML/S3-based detection.
     if not SENSOR_CONFIG_AVAILABLE:
         logging.warning(
             "Dynamic sensor_config not available; get_well_type_rules returning empty rules "
@@ -314,8 +339,12 @@ def get_well_type_rules(lift_type: str) -> Dict:
             }
         return rules
     except Exception as e:
-        logger.error(f"Error loading dynamic rules for {lift_type}: {e}")
-        raise
+        logger.warning(
+            "Error loading dynamic rules for %s: %s (continuing with ML/LSTM only)",
+            lift_type,
+            e,
+        )
+        return {}
 
 class AnomalyDetector:
     """
@@ -342,7 +371,7 @@ class AnomalyDetector:
     
     def __init__(self, config: Optional[AnomalyConfig] = None):
         """
-        Initialize detector with rules from dynamic Snowflake config.
+        Initialize detector with rules from sensor_config (S3) or fallback bands.
         
         Args:
             config: Optional AnomalyConfig instance. Uses DEFAULT_CONFIG if not provided.
@@ -353,16 +382,16 @@ class AnomalyDetector:
         self.config = config or DEFAULT_CONFIG
         self.config.validate()
         
-        # In S3-only mode, allow running without sensor_config/Snowflake by using fallback rules.
+        # Allow running without sensor_config by using fallback rules and ML models.
         if not SENSOR_CONFIG_AVAILABLE and not os.environ.get("SAGEMAKER_REGION"):
             logger.warning(
-                "sensor_config (Snowflake) not available. "
+                "sensor_config not available. "
                 "Proceeding with fallback anomaly rules and ML models only."
             )
         
         self.trained_models: Dict[str, Any] = self._load_trained_models()
         
-        logger.info(f"✓ Anomaly detector initialized (using dynamic Snowflake config)")
+        logger.info("✓ Anomaly detector initialized (S3 / ML models)")
         logger.info(f"  - Threshold: {self.config.anomaly_threshold}")
         logger.info(f"  - Weights: {self.config.weights}")
         if self.trained_models:
@@ -413,25 +442,24 @@ class AnomalyDetector:
                         logger.info(f"✓ Loaded statistical model for {well_type}")
                 except Exception as e:
                     logger.error(f"Failed to load {stat_f}: {e}")
-            if TORCH_AVAILABLE:
-                lstm_pt = os.path.join(type_dir, self.config.lstm_pt_filename)
-                lstm_meta = os.path.join(type_dir, self.config.lstm_meta_filename)
-                lstm_sc = os.path.join(type_dir, self.config.lstm_scaler_filename)
-                if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
-                    try:
-                        meta = joblib.load(lstm_meta)
-                        scaler = joblib.load(lstm_sc)
-                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
-                        model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
-                        model.eval()
-                        trained_models[f'lstm_{well_type}'] = {
-                            'model': model, 'scaler': scaler,
-                            'seq_len': meta.get('seq_len', SEQ_LEN),
-                            'features': meta.get('features', [])
-                        }
-                        logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
-                    except Exception as e:
-                        logger.error(f"Failed to load LSTM for {well_type}: {e}")
+            lstm_pt = os.path.join(type_dir, self.config.lstm_pt_filename)
+            lstm_meta = os.path.join(type_dir, self.config.lstm_meta_filename)
+            lstm_sc = os.path.join(type_dir, self.config.lstm_scaler_filename)
+            if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
+                try:
+                    meta = joblib.load(lstm_meta)
+                    scaler = joblib.load(lstm_sc)
+                    model = LSTMAutoencoder(input_dim=meta['input_dim'])
+                    model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                    model.eval()
+                    trained_models[f'lstm_{well_type}'] = {
+                        'model': model, 'scaler': scaler,
+                        'seq_len': meta.get('seq_len', SEQ_LEN),
+                        'features': meta.get('features', [])
+                    }
+                    logger.info(f"✓ Loaded LSTM autoencoder for {well_type}")
+                except Exception as e:
+                    logger.error(f"Failed to load LSTM for {well_type}: {e}")
 
         def _load_well_from_folder(well_dir: str, safe_id: str) -> None:
             """Load iso/stat/lstm for one well from its folder."""
@@ -453,25 +481,24 @@ class AnomalyDetector:
                         logger.info(f"✓ Loaded statistical model for well {safe_id}")
                 except Exception as e:
                     logger.error(f"Failed to load {stat_f}: {e}")
-            if TORCH_AVAILABLE:
-                lstm_pt = os.path.join(well_dir, self.config.lstm_pt_filename)
-                lstm_meta = os.path.join(well_dir, self.config.lstm_meta_filename)
-                lstm_sc = os.path.join(well_dir, self.config.lstm_scaler_filename)
-                if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
-                    try:
-                        meta = joblib.load(lstm_meta)
-                        scaler = joblib.load(lstm_sc)
-                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
-                        model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
-                        model.eval()
-                        trained_models[f'lstm_well_{safe_id}'] = {
-                            'model': model, 'scaler': scaler,
-                            'seq_len': meta.get('seq_len', SEQ_LEN),
-                            'features': meta.get('features', [])
-                        }
-                        logger.info(f"✓ Loaded LSTM autoencoder for well {safe_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to load LSTM for well {safe_id}: {e}")
+            lstm_pt = os.path.join(well_dir, self.config.lstm_pt_filename)
+            lstm_meta = os.path.join(well_dir, self.config.lstm_meta_filename)
+            lstm_sc = os.path.join(well_dir, self.config.lstm_scaler_filename)
+            if os.path.exists(lstm_pt) and os.path.exists(lstm_meta) and os.path.exists(lstm_sc):
+                try:
+                    meta = joblib.load(lstm_meta)
+                    scaler = joblib.load(lstm_sc)
+                    model = LSTMAutoencoder(input_dim=meta['input_dim'])
+                    model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                    model.eval()
+                    trained_models[f'lstm_well_{safe_id}'] = {
+                        'model': model, 'scaler': scaler,
+                        'seq_len': meta.get('seq_len', SEQ_LEN),
+                        'features': meta.get('features', [])
+                    }
+                    logger.info(f"✓ Loaded LSTM autoencoder for well {safe_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load LSTM for well {safe_id}: {e}")
 
         # 1) Load well-type fallback: first from well_types/<type>/, then flat (backward compat)
         well_types = ['rod_pump', 'esp', 'gas_lift']
@@ -502,7 +529,7 @@ class AnomalyDetector:
                             logger.info(f"✓ Loaded statistical model for {well_type}")
                     except Exception as e:
                         logger.error(f"Failed to load {stat_file}: {e}")
-                if TORCH_AVAILABLE and os.path.exists(lstm_file) and os.path.exists(lstm_meta_file) and os.path.exists(lstm_scaler_file):
+                if os.path.exists(lstm_file) and os.path.exists(lstm_meta_file) and os.path.exists(lstm_scaler_file):
                     try:
                         meta = joblib.load(lstm_meta_file)
                         scaler = joblib.load(lstm_scaler_file)
@@ -554,7 +581,7 @@ class AnomalyDetector:
         rule_anomaly_score = 0.0
 
         # Look up statistical model (prefer per-well, then per lift-type)
-        well_type_clean = lift_type.lower().replace(" ", "_")
+        well_type_clean = lift_type_model_key(lift_type)
         safe_well = well_id_to_safe(well_id) if well_id else None
         stat_key = None
         if safe_well and f'stat_well_{safe_well}' in self.trained_models:
@@ -745,9 +772,9 @@ class AnomalyDetector:
         
         # LSTM on history if provided; prefer per-well model then lift_type
         seq_len = self.config.seq_len
-        if historical_data and TORCH_AVAILABLE and len(historical_data) >= seq_len - 1:
+        if historical_data and len(historical_data) >= seq_len - 1:
             try:
-                well_type_clean = lift_type.lower().replace(" ", "_")
+                well_type_clean = lift_type_model_key(lift_type)
                 lstm_key = (f'lstm_well_{well_id_to_safe(well_id)}' if well_id else None)
                 if lstm_key and lstm_key not in self.trained_models:
                     lstm_key = None
@@ -797,7 +824,7 @@ class AnomalyDetector:
     
     def _detect_anomaly_with_trained_models(self, readings: Dict, lift_type: str, well_id: Optional[str] = None) -> float:
         """Use trained Isolation Forest and statistical models; prefer per-well models over lift_type."""
-        well_type_clean = lift_type.lower().replace(" ", "_")
+        well_type_clean = lift_type_model_key(lift_type)
         safe_well = well_id_to_safe(well_id) if well_id else None
         # Prefer per-well models, then fall back to lift_type
         iso_key = f'iso_well_{safe_well}' if (well_id and f'iso_well_{safe_well}' in self.trained_models) else f'iso_{well_type_clean}'
@@ -914,9 +941,6 @@ class AnomalyDetector:
         Returns:
             Dict with 'model', 'scaler', and 'seq_len' keys, or None if failed
         """
-        if not TORCH_AVAILABLE:
-            logger.warning("PyTorch not available; skipping LSTM training")
-            return None
         if not SKLEARN_AVAILABLE or StandardScaler is None:
             logger.warning("scikit-learn not available; skipping LSTM training (scaler required)")
             return None

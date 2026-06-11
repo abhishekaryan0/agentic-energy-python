@@ -7,7 +7,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 if __package__ in (None, ""):
-    # Allow: python3 anomaly_detection/run.py
     repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root))
 
@@ -39,4 +38,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

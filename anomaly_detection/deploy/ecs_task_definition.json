@@ -1,0 +1,46 @@
+{
+  "family": "anomaly-detection-batch",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "anomaly-detection",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "environment": [
+        { "name": "S3_BUCKET", "value": "S3_BUCKET_VALUE" },
+        { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
+        { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+
+        { "name": "ANOMALY_DETECTION_MODE", "value": "incremental" },
+        { "name": "ANOMALY_BOOTSTRAP_ROWS", "value": "100" },
+        { "name": "ANOMALY_BOOTSTRAP_PARTITION_DAYS", "value": "30" },
+        { "name": "ANOMALY_DETECTION_FORCE_WINDOW", "value": "ANOMALY_DETECTION_FORCE_WINDOW_VALUE" },
+        { "name": "ANOMALY_DETECTION_FORCE_WINDOW_DAYS", "value": "30" },
+        { "name": "ANOMALY_INCREMENTAL_LAST_N", "value": "15" },
+        { "name": "ANOMALY_HISTORY_PARTITION_DAYS", "value": "3" },
+        { "name": "ANOMALY_SENSOR_PARTITION_DAYS", "value": "30" },
+        { "name": "ANOMALY_WINDOW_MINUTES", "value": "15" },
+        { "name": "ANOMALY_SAFETY_LAG_SECONDS", "value": "90" },
+        { "name": "ANOMALY_ENABLE_LLM_SUGGESTIONS", "value": "1" },
+        { "name": "ANOMALY_MODEL_TRAINING_JOB", "value": "ANOMALY_MODEL_TRAINING_JOB_VALUE" },
+
+        { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
+        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" },
+        { "name": "OPENAI_MODEL", "value": "OPENAI_MODEL_VALUE" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "LOG_GROUP_NAME",
+          "awslogs-region": "AWS_REGION_VALUE",
+          "awslogs-stream-prefix": "anomaly-detection"
+        }
+      }
+    }
+  ]
+}

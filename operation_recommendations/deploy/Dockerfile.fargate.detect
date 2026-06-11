@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+# Batch image for weekly operation recommendations detection on ECS Fargate (S3 only).
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY operation_recommendations/deploy/requirements.batch.txt ./requirements.batch.txt
+RUN pip install --no-cache-dir -r requirements.batch.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+CMD ["python", "-m", "operation_recommendations.run"]

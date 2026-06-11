@@ -10,12 +10,12 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
-from anomaly_detection.s3_history import write_anomaly_suggestions_history_to_s3
+from anomaly_detection.s3_history import normalize_anomaly_suggestion_record, write_anomaly_suggestions_history_to_s3
 
 logger = logging.getLogger(__name__)
 
 try:
-    from config.sensor_config import get_sensor_ranges
+    from anomaly_detection.sensor_config import get_sensor_ranges
     _SENSOR_CONFIG_AVAILABLE = True
 except ImportError:
     _SENSOR_CONFIG_AVAILABLE = False
@@ -218,33 +218,10 @@ def _openai_client():
 
 
 def _coerce_asset_history_to_strings(historical_context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure historical_context.asset_history.* are always strings.
+    """Backward-compatible wrapper; canonical normalization happens at persist time."""
+    from anomaly_detection.s3_history import _normalize_historical_context
 
-    This prevents schema drift in S3 parquet across runs (e.g. operating_hours
-    being sometimes int and sometimes str).
-    """
-    asset_history = historical_context.get("asset_history") or {}
-    if not isinstance(asset_history, dict):
-        asset_history = {}
-
-    def _to_str(v: Any, default: str) -> str:
-        if v is None:
-            return default
-        try:
-            if pd.isna(v):
-                return default
-        except Exception:
-            pass
-        return str(v)
-
-    historical_context = dict(historical_context)
-    historical_context["asset_history"] = {
-        "commissioned": _to_str(asset_history.get("commissioned"), "Data Not Available"),
-        "operating_hours": _to_str(asset_history.get("operating_hours"), "Data Not Available"),
-        "last_inspection": _to_str(asset_history.get("last_inspection"), "Data Not Available"),
-    }
-    return historical_context
+    return _normalize_historical_context(historical_context)
 
 
 def generate_suggestion(
@@ -392,7 +369,7 @@ Use comma-delimited numbers (e.g., "1,234,567.89" NOT "1234567.89"). This applie
 Use the exact formatted values provided in the 'Violations Detected' section above - they already have proper comma delimiters.
 
 8. "historical_context": Object containing:
-   - "asset_history": Object with keys "commissioned" (date), "operating_hours" (int), "last_inspection" (date). Since this data is not provided, you MUST use the string "Data Not Available" for each value.
+   - "asset_history": Object with keys "commissioned" (string), "operating_hours" (string), "last_inspection" (string). Since this data is not provided, you MUST use the string "Data Not Available" for each value.
    - "similar_incidents": A list of objects based ONLY on the 'Real Database History' provided above. If the history is empty, this MUST be an empty list []. For each incident in the history, create an object with the following keys:
      - "well": Use the "well" value from the history.
      - "date": Use the "date" value from the history, use format "MM/DD/YYYY HH:MM".
@@ -472,11 +449,27 @@ Ensure your entire output is a single, valid JSON object.
             "suggested_actions": ["Investigate manually"],
             "explanation": f"AI Generation failed: {str(e)}",
             "historical_context": {
-                "asset_history": {"commissioned": "N/A", "operating_hours": "N/A", "last_inspection": "N/A"},
+                "asset_history": {
+                    "commissioned": "Data Not Available",
+                    "operating_hours": "Data Not Available",
+                    "last_inspection": "Data Not Available",
+                },
                 "similar_incidents": [],
                 "key_learnings": "AI generation failed.",
             },
-            "risk_analysis": {},
+            "risk_analysis": {
+                "severity_breakdown": {
+                    "safety_risk": "",
+                    "production_impact": "",
+                    "financial_exposure": "",
+                },
+                "mitigation_strategies": {
+                    "immediate": "",
+                    "short_term": "",
+                    "long_term": "",
+                },
+                "decision_support": "",
+            },
         }
 
 
@@ -506,38 +499,28 @@ def persist_suggestion_to_s3(
     created_at = datetime.now(timezone.utc).isoformat()
     formatted_anomaly_details = format_anomaly_details_for_storage(anomaly_details)
 
-    # Normalize schema types before writing parquet.
-    # Specifically: historical_context.asset_history.operating_hours must be string.
-    suggestion_result["historical_context"] = _coerce_asset_history_to_strings(
-        suggestion_result.get("historical_context", {}) or {}
+    record = normalize_anomaly_suggestion_record(
+        {
+            "id": suggestion_id,
+            "well_id": well_id,
+            "timestamp": timestamp_str,
+            "alert_title": suggestion_result.get("alert_title"),
+            "severity": suggestion_result.get("severity"),
+            "status": suggestion_result.get("status"),
+            "confidence": suggestion_result.get("confidence"),
+            "description": suggestion_result.get("description"),
+            "suggested_actions": suggestion_result.get("suggested_actions"),
+            "explanation": suggestion_result.get("explanation"),
+            "created_at": created_at,
+            "historical_context": suggestion_result.get("historical_context", {}),
+            "risk_analysis": suggestion_result.get("risk_analysis", {}),
+            "asset_id": suggestion_result.get("asset_id"),
+            "raw_anomaly_data": formatted_anomaly_details,
+            "lift_type": lift_type,
+            "category": anomaly_details.get("category") or lift_type,
+            "well_status": well_status,
+            "organization_id": organization_id,
+        }
     )
-
-    record = {
-        "id": suggestion_id,
-        "well_id": well_id,
-        "timestamp": timestamp_str,
-        "alert_title": suggestion_result.get("alert_title"),
-        "severity": suggestion_result.get("severity"),
-        "status": suggestion_result.get("status"),
-        "open_up": None,
-        "mute_till": None,
-        "confidence": suggestion_result.get("confidence"),
-        "description": suggestion_result.get("description"),
-        "suggested_actions": suggestion_result.get("suggested_actions"),
-        "explanation": suggestion_result.get("explanation"),
-        "created_at": created_at,
-        "historical_context": suggestion_result.get("historical_context", {}),
-        "risk_analysis": suggestion_result.get("risk_analysis", {}),
-        "asset_id": suggestion_result.get("asset_id"),
-        "reason": None,
-        "raw_anomaly_data": formatted_anomaly_details,
-        "lift_type": lift_type,
-        "category": anomaly_details.get("category"),
-        "well_status": well_status,
-        "organization_id": organization_id,
-        "user_id": None,
-        "user_name": None,
-        "updated_at": None,
-    }
     write_anomaly_suggestions_history_to_s3([record])
 

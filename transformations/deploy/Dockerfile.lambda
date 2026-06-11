@@ -1,0 +1,9 @@
+# Container image for AWS Lambda: Snowflake -> S3 parquet export.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY transformations/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY transformations ${LAMBDA_TASK_ROOT}/transformations
+
+CMD ["transformations.handler.handler"]

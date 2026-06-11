@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Red Bluff Data Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="orb orb-a" aria-hidden="true"></div>
+  <div class="orb orb-b" aria-hidden="true"></div>
+
+  <div class="app">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">&#9672;</span>
+        <div>
+          <h1>Red Bluff Data Studio</h1>
+          <p class="subtitle">Synthetic upstream intelligence to Snowflake</p>
+        </div>
+      </div>
+      <div class="status-pill" id="connectionStatus">
+        <span class="dot"></span>
+        <span>Checking Snowflake</span>
+      </div>
+    </header>
+
+    <section class="panel generate-panel">
+      <h2>Generate data</h2>
+      <p class="hint">Incremental generation — adds new days since the last run.</p>
+      <p class="gen-preview" id="genPreview">Loading…</p>
+
+      <div class="controls">
+        <button type="button" class="btn-primary" id="generateBtn" disabled>
+          <span class="btn-label" id="generateBtnLabel">Generate</span>
+          <span class="btn-glow"></span>
+        </button>
+      </div>
+
+      <div class="progress-wrap hidden" id="progressWrap">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <p class="progress-text" id="progressText">Queued</p>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="runPanel">
+      <h2>Last run</h2>
+      <p class="run-window" id="runWindow"></p>
+      <div class="metric-grid" id="runMetrics"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Snowflake dataset summary</h2>
+        <button type="button" class="btn-ghost" id="refreshBtn">Refresh</button>
+      </div>
+      <div class="metric-grid" id="summaryMetrics">
+        <p class="loading">Loading</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Date coverage</h2>
+      <div class="coverage" id="coverage"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Sample wells (daily production)</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Well</th>
+              <th>Days</th>
+              <th>From</th>
+              <th>To</th>
+            </tr>
+          </thead>
+          <tbody id="wellTable"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel terminal-panel">
+      <h2>Activity log</h2>
+      <pre id="log" class="log"></pre>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

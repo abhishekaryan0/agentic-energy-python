@@ -1,0 +1,9 @@
+# Container image for AWS Lambda: S3 detection parquet -> PostgreSQL sync.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY s3_to_postgres/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY s3_to_postgres ${LAMBDA_TASK_ROOT}/s3_to_postgres
+
+CMD ["s3_to_postgres.handler.handler"]

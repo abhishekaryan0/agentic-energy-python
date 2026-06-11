@@ -1,0 +1,36 @@
+{
+  "family": "anomaly-detection-sagemaker-train-launch",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "sagemaker-train-launcher",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "environment": [
+        { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+        { "name": "AWS_ACCOUNT_ID", "value": "AWS_ACCOUNT_ID_VALUE" },
+        { "name": "S3_BUCKET", "value": "S3_BUCKET_VALUE" },
+        { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
+        { "name": "SAGEMAKER_ROLE_ARN", "value": "SAGEMAKER_ROLE_ARN_VALUE" },
+        { "name": "ECR_REPO_TRAIN", "value": "ECR_REPO_TRAIN_VALUE" },
+        { "name": "IMAGE_TAG", "value": "IMAGE_TAG_VALUE" },
+        { "name": "INSTANCE_TYPE", "value": "INSTANCE_TYPE_VALUE" },
+        { "name": "PER_WELL_LIMIT", "value": "PER_WELL_LIMIT_VALUE" },
+        { "name": "ANOMALY_SENSOR_PARTITION_DAYS", "value": "ANOMALY_SENSOR_PARTITION_DAYS_VALUE" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "LOG_GROUP_NAME",
+          "awslogs-region": "AWS_REGION_VALUE",
+          "awslogs-stream-prefix": "sagemaker-train-launch"
+        }
+      }
+    }
+  ]
+}

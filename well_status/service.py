@@ -13,6 +13,8 @@ Run this service periodically (e.g., every hour via cron) to update well statuse
 
 import os
 import logging
+import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -20,6 +22,7 @@ import io
 
 import boto3
 import pandas as pd
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,6 +33,17 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 SHUTDOWN_THRESHOLD_HOURS = 24  # No readings for 24 hours = SHUTDOWN
+PARTITIONED_SENSOR_DIR = "well_sensor_readings"
+DEFAULT_PARTITION_START_DATE = "2026-01-01"
+PARTITION_DATE_RE = re.compile(r"/date=(\d{4}-\d{2}-\d{2})/")
+DEFAULT_CHECKPOINT_FILENAME = "well_status_checkpoint.json"
+
+LIFT_TYPE_ALIASES = {
+    "rod pump": "Rod Pump",
+    "pumping unit": "Rod Pump",
+    "esp": "ESP",
+    "gas lift": "Gas Lift",
+}
 
 # IDLE detection thresholds - multiple metrics per lift type
 # Each metric has: field_name, threshold, operator ('lt' = less than, 'gt' = greater than), weight
@@ -89,14 +103,245 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     return parsed.netloc, parsed.path.lstrip("/")
 
 
+def _normalize_lift_type(lift_type: Optional[str]) -> Optional[str]:
+    if lift_type is None:
+        return None
+    text = str(lift_type).strip()
+    if not text:
+        return None
+    return LIFT_TYPE_ALIASES.get(text.lower(), text)
+
+
+def _get_source_well_status(well: Dict) -> Optional[str]:
+    for key in ("well_status", "run_status", "status"):
+        value = well.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _partition_prefix_from_sensor_uri(uri: str) -> str:
+    _bucket, key = _parse_s3_uri(uri)
+    clean = key.rstrip("/")
+    if clean.endswith(".parquet"):
+        base = clean.rsplit("/", 1)[0]
+        return f"{base}/{PARTITIONED_SENSOR_DIR}/"
+    return clean + "/"
+
+
+def _base_partition_start_date() -> Optional[pd.Timestamp]:
+    raw = (os.getenv("WELL_STATUS_PARTITION_START_DATE") or DEFAULT_PARTITION_START_DATE).strip()
+    if not raw:
+        return None
+    ts = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(ts):
+        logger.warning("Invalid WELL_STATUS_PARTITION_START_DATE=%r; scanning all partitions", raw)
+        return None
+    return ts.normalize()
+
+
+def _checkpoint_s3_uri(sensor_uri: str) -> str:
+    bucket, key = _parse_s3_uri(sensor_uri)
+    clean = key.rstrip("/")
+    base = clean.rsplit("/", 1)[0] if clean.endswith(".parquet") else clean
+    return f"s3://{bucket}/{base}/_state/{DEFAULT_CHECKPOINT_FILENAME}"
+
+
+def _load_checkpoint(checkpoint_uri: str) -> Optional[Dict]:
+    bucket, key = _parse_s3_uri(checkpoint_uri)
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+    return json.loads(obj["Body"].read().decode("utf-8"))
+
+
+def _save_checkpoint(checkpoint_uri: str, payload: Dict) -> None:
+    bucket, key = _parse_s3_uri(checkpoint_uri)
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(payload, indent=2).encode("utf-8"))
+
+
+def _checkpoint_timestamp(checkpoint: Optional[Dict]) -> Optional[pd.Timestamp]:
+    if not checkpoint:
+        return None
+    raw = checkpoint.get("sensor_high_watermark")
+    if not raw:
+        return None
+    ts = pd.to_datetime(raw, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _effective_partition_start_date(checkpoint: Optional[Dict]) -> Optional[pd.Timestamp]:
+    start_date = _base_partition_start_date()
+    checkpoint_ts = _checkpoint_timestamp(checkpoint)
+    if checkpoint_ts is None:
+        return start_date
+    checkpoint_date = checkpoint_ts.normalize()
+    if getattr(checkpoint_date, "tzinfo", None) is not None:
+        checkpoint_date = checkpoint_date.tz_localize(None)
+    if start_date is None:
+        return checkpoint_date
+    return max(start_date, checkpoint_date)
+
+
+def _extract_partition_date(key: str) -> Optional[pd.Timestamp]:
+    match = PARTITION_DATE_RE.search(f"/{key}")
+    if not match:
+        return None
+    ts = pd.to_datetime(match.group(1), errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.normalize()
+
+
+def _list_partition_parquet_keys(
+    bucket: str,
+    prefix: str,
+    *,
+    start_date: Optional[pd.Timestamp] = None,
+) -> List[str]:
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: List[str] = []
+    if start_date is not None:
+        logger.info("Well status partition scan start date: %s", start_date.date().isoformat())
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key", "")
+            if not key.endswith(".parquet"):
+                continue
+            partition_date = _extract_partition_date(key)
+            if start_date is not None and partition_date is not None and partition_date < start_date:
+                logger.info(
+                    "Skipping old partition file before start date: s3://%s/%s (partition=%s)",
+                    bucket,
+                    key,
+                    partition_date.date().isoformat(),
+                )
+                continue
+            logger.info("Including partition file for well status: s3://%s/%s", bucket, key)
+            keys.append(key)
+    keys.sort()
+    logger.info("Well status partition scan selected %s parquet files", len(keys))
+    return keys
+
+
+def _load_partitioned_sensor_parquet_from_s3(bucket: str, prefix: str) -> pd.DataFrame:
+    logger.info("Loading partitioned sensor parquet from s3://%s/%s", bucket, prefix)
+    keys = _list_partition_parquet_keys(bucket, prefix)
+    if not keys:
+        raise FileNotFoundError(f"No parquet files found under s3://{bucket}/{prefix}")
+
+    s3 = boto3.client("s3")
+    frames: List[pd.DataFrame] = []
+    for key in keys:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        frames.append(pd.read_parquet(io.BytesIO(obj["Body"].read())))
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _latest_rows_from_partitioned_s3(
+    bucket: str,
+    prefix: str,
+    *,
+    start_date: Optional[pd.Timestamp] = None,
+    exclusive_start_ts: Optional[pd.Timestamp] = None,
+) -> Tuple[List[Dict], Optional[pd.Timestamp]]:
+    """
+    Read partition parquet files one-by-one and keep only the newest row per well.
+
+    This avoids loading the full transformed dataset into memory for well status.
+    """
+    logger.info("Computing latest readings from partitioned sensor parquet at s3://%s/%s", bucket, prefix)
+    keys = _list_partition_parquet_keys(bucket, prefix, start_date=start_date)
+    if not keys:
+        return [], None
+
+    s3 = boto3.client("s3")
+    latest_by_well: Dict[str, Dict] = {}
+    latest_ts_by_well: Dict[str, pd.Timestamp] = {}
+    max_seen_ts: Optional[pd.Timestamp] = None
+
+    for key in keys:
+        logger.info("Checking partition file: s3://%s/%s", bucket, key)
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        batch = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        batch.columns = [c.lower() for c in batch.columns]
+        ts_col = None
+        for cand in ("timestamp", "time", "datetime"):
+            if cand in batch.columns:
+                ts_col = cand
+                break
+        if ts_col is None:
+            logger.warning("Skipping partition without timestamp column: s3://%s/%s", bucket, key)
+            continue
+        batch[ts_col] = pd.to_datetime(batch[ts_col], errors="coerce", utc=True)
+        batch = batch.dropna(subset=[ts_col])
+        if exclusive_start_ts is not None:
+            batch = batch[batch[ts_col] > exclusive_start_ts]
+            if batch.empty:
+                logger.info(
+                    "No rows after checkpoint in partition file: s3://%s/%s (checkpoint=%s)",
+                    bucket,
+                    key,
+                    exclusive_start_ts.isoformat(),
+                )
+                continue
+        batch_max = batch[ts_col].max()
+        if batch_max is not None and not pd.isna(batch_max):
+            max_seen_ts = batch_max if max_seen_ts is None else max(max_seen_ts, batch_max)
+        rows = _compute_latest_readings_from_df(batch)
+        for rec in rows:
+            well_id = str(rec.get("well_id"))
+            ts = pd.to_datetime(rec.get("last_reading_timestamp"), errors="coerce", utc=True)
+            if not well_id or pd.isna(ts):
+                continue
+            current = latest_ts_by_well.get(well_id)
+            if current is None or ts > current:
+                latest_ts_by_well[well_id] = ts
+                latest_by_well[well_id] = rec
+
+    wells = list(latest_by_well.values())
+    logger.info("Computed latest readings for %s wells from partitioned sensor parquet", len(wells))
+    return wells, max_seen_ts
+
+
 def _load_sensor_parquet_from_s3(uri: str) -> pd.DataFrame:
     bucket, key = _parse_s3_uri(uri)
+    if not key.endswith(".parquet"):
+        return _load_partitioned_sensor_parquet_from_s3(bucket, key.rstrip("/") + "/")
+
     logger.info("Loading sensor parquet from s3://%s/%s", bucket, key)
     s3 = boto3.client("s3")
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    data = obj["Body"].read()
-    buf = io.BytesIO(data)
-    return pd.read_parquet(buf)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        data = obj["Body"].read()
+        buf = io.BytesIO(data)
+        return pd.read_parquet(buf)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code not in ("NoSuchKey", "404", "NotFound"):
+            raise
+        partition_prefix = _partition_prefix_from_sensor_uri(uri)
+        logger.info(
+            "Root sensor parquet not found; falling back to partitioned dataset at s3://%s/%s",
+            bucket,
+            partition_prefix,
+        )
+        return _load_partitioned_sensor_parquet_from_s3(bucket, partition_prefix)
 
 
 def _compute_latest_readings_from_df(df: pd.DataFrame) -> List[Dict]:
@@ -141,9 +386,68 @@ def get_all_wells_from_s3(sensor_parquet_s3: Optional[str] = None) -> List[Dict]
     """
     Get all distinct wells with their latest reading from S3 parquet.
     """
+    wells, _max_seen_ts = _get_all_wells_from_s3_with_checkpoint(sensor_parquet_s3)
+    return wells
+
+
+def _get_all_wells_from_s3_with_checkpoint(
+    sensor_parquet_s3: Optional[str] = None,
+    checkpoint: Optional[Dict] = None,
+) -> Tuple[List[Dict], Optional[pd.Timestamp]]:
     sensor_uri = sensor_parquet_s3 or os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
-    df = _load_sensor_parquet_from_s3(sensor_uri)
-    return _compute_latest_readings_from_df(df)
+    bucket, key = _parse_s3_uri(sensor_uri)
+    start_date = _effective_partition_start_date(checkpoint)
+    checkpoint_ts = _checkpoint_timestamp(checkpoint)
+
+    if key.endswith(".parquet"):
+        partition_prefix = _partition_prefix_from_sensor_uri(sensor_uri)
+        partition_keys = _list_partition_parquet_keys(bucket, partition_prefix, start_date=start_date)
+        if partition_keys:
+            logger.info(
+                "Using partitioned sensor dataset for well status from s3://%s/%s",
+                bucket,
+                partition_prefix,
+            )
+            return _latest_rows_from_partitioned_s3(
+                bucket,
+                partition_prefix,
+                start_date=start_date,
+                exclusive_start_ts=checkpoint_ts,
+            )
+
+    if key.endswith(".parquet"):
+        try:
+            df = _load_sensor_parquet_from_s3(sensor_uri)
+            df.columns = [c.lower() for c in df.columns]
+            ts_col = None
+            for cand in ("timestamp", "time", "datetime"):
+                if cand in df.columns:
+                    ts_col = cand
+                    break
+            if ts_col and checkpoint_ts is not None:
+                df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+                df = df.dropna(subset=[ts_col])
+                df = df[df[ts_col] > checkpoint_ts]
+            max_seen_ts = None
+            if ts_col and not df.empty:
+                batch_max = pd.to_datetime(df[ts_col], errors="coerce", utc=True).max()
+                if batch_max is not None and not pd.isna(batch_max):
+                    max_seen_ts = batch_max
+            return _compute_latest_readings_from_df(df), max_seen_ts
+        except FileNotFoundError:
+            partition_prefix = _partition_prefix_from_sensor_uri(sensor_uri)
+            return _latest_rows_from_partitioned_s3(
+                bucket,
+                partition_prefix,
+                start_date=start_date,
+                exclusive_start_ts=checkpoint_ts,
+            )
+    return _latest_rows_from_partitioned_s3(
+        bucket,
+        key.rstrip("/") + "/",
+        start_date=start_date,
+        exclusive_start_ts=checkpoint_ts,
+    )
 
 
 def get_anomaly_counts(well_id: str, hours: int = 24, conn=None) -> Tuple[int, int]:
@@ -240,7 +544,9 @@ def determine_well_status(well: Dict) -> Tuple[str, str]:
     Returns: (status, reason)
     """
     last_timestamp = well.get('last_reading_timestamp')
-    lift_type = well.get('lift_type')
+    raw_lift_type = well.get('lift_type')
+    lift_type = _normalize_lift_type(raw_lift_type)
+    display_lift_type = raw_lift_type or lift_type
     
     # Check if we have timestamp
     if not last_timestamp:
@@ -272,7 +578,7 @@ def determine_well_status(well: Dict) -> Tuple[str, str]:
             # Summarize top reasons (max 3)
             top_reasons = idle_reasons[:3]
             reason_summary = "; ".join(top_reasons)
-            return ('IDLE', f'{lift_type} shows low activity (score={idle_score}/{IDLE_SCORE_THRESHOLD}): {reason_summary}')
+            return ('IDLE', f'{display_lift_type} shows low activity (score={idle_score}/{IDLE_SCORE_THRESHOLD}): {reason_summary}')
     
     # DEFAULT: RUNNING
     return ('RUNNING', f'Normal operation, last reading {hours_since_reading:.1f} hours ago')
@@ -310,6 +616,7 @@ def _build_status_rows(wells: List[Dict]) -> pd.DataFrame:
             {
                 "well_id": well_id,
                 "lift_type": well.get("lift_type"),
+                "well_status": _get_source_well_status(well),
                 "status": status,
                 "last_reading_timestamp": well.get("last_reading_timestamp"),
                 "last_reading_age_hours": reading_age_hours,
@@ -326,94 +633,73 @@ def _build_status_rows(wells: List[Dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _load_status_parquet_from_s3(output_s3: str) -> Optional[pd.DataFrame]:
-    """
-    Helper to load well_status.parquet from S3 if present.
-    """
-    try:
-        bucket, key = _parse_s3_uri(output_s3)
-        s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return pd.read_parquet(obj["Body"])
-    except Exception as e:
-        logger.warning("Could not load status parquet from %s: %s", output_s3, e)
-        return None
-
-
 def get_well_status(well_id: str) -> Optional[Dict]:
-    """
-    Get current status for a specific well from S3 well_status.parquet.
-    """
-    sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
-    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
-    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+    """Get current status for a specific well from PostgreSQL (org schema)."""
+    from well_status.postgres import get_well_status_row
 
-    df = _load_status_parquet_from_s3(output_uri)
-    if df is None or df.empty:
-        return None
-
-    df = df.copy()
-    if "well_id" not in df.columns:
-        return None
-    match = df[df["well_id"].astype(str) == str(well_id)]
-    if match.empty:
-        return None
-    row = match.iloc[0].to_dict()
-    return row
+    return get_well_status_row(well_id)
 
 
 def get_all_well_statuses() -> List[Dict]:
+    """Get all well statuses from PostgreSQL (org schema)."""
+    from well_status.postgres import get_all_well_status_rows
+
+    return get_all_well_status_rows()
+
+
+def update_all_well_statuses() -> Dict:
     """
-    Get all well statuses from S3 well_status.parquet.
+    Main function to update status for all wells.
+
+    Reads sensor parquet from S3 (partition layout), computes RUNNING/IDLE/SHUTDOWN,
+    and upserts rows into PostgreSQL schema ORGANIZATION_ID.well_status.
+    Checkpoint remains on S3 for incremental sensor reads.
     """
-    sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
-    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
-    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+    from well_status.postgres import upsert_well_status_dataframe
 
-    df = _load_status_parquet_from_s3(output_uri)
-    if df is None or df.empty:
-        return []
-
-    # Optional ordering similar to previous Snowflake query
-    if "status" in df.columns and "well_id" in df.columns:
-        status_order = {"SHUTDOWN": 1, "IDLE": 2}
-        df = df.copy()
-        df["_order"] = df["status"].map(status_order).fillna(3)
-        df = df.sort_values(by=["_order", "well_id"]).drop(columns=["_order"])
-
-    return [r._asdict() if hasattr(r, "_asdict") else dict(r) for _, r in df.iterrows()]
-
-
-def update_all_well_statuses():
-    """
-    Main function to update status for all wells using S3 parquet only.
-    Reads SENSOR_PARQUET_S3 (or default), computes status, and writes well_status.parquet
-    alongside the sensor parquet.
-    """
     logger.info("=" * 50)
-    logger.info("Starting well status update job (S3 parquet)")
+    logger.info("Starting well status update job (S3 sensor -> PostgreSQL)")
     logger.info("=" * 50)
 
     sensor_uri = os.environ.get("SENSOR_PARQUET_S3", DEFAULT_SENSOR_PARQUET_S3)
-    default_out = sensor_uri.rsplit("/", 1)[0] + "/well_status.parquet"
-    output_uri = os.environ.get("OUTPUT_PARQUET_S3", default_out)
+    checkpoint_uri = _checkpoint_s3_uri(sensor_uri)
+    checkpoint = _load_checkpoint(checkpoint_uri)
+    force_full = os.getenv("WELL_STATUS_FORCE_FULL", "").strip().lower() in ("1", "true", "yes")
+    if force_full:
+        logger.info("WELL_STATUS_FORCE_FULL enabled: ignoring checkpoint, full reprocess into PostgreSQL")
+        checkpoint = None
+    start_date = _effective_partition_start_date(checkpoint)
+    checkpoint_ts = _checkpoint_timestamp(checkpoint)
 
-    df_sensor = _load_sensor_parquet_from_s3(sensor_uri)
-    wells = _compute_latest_readings_from_df(df_sensor)
+    logger.info("Well status input sensor URI: %s", sensor_uri)
+    if start_date is not None:
+        logger.info("Well status partition start date: %s", start_date.date().isoformat())
+    logger.info("Well status checkpoint URI: %s", checkpoint_uri)
+    if checkpoint_ts is not None:
+        logger.info("Well status checkpoint timestamp: %s", checkpoint_ts.isoformat())
+    else:
+        logger.info("Well status checkpoint timestamp: none (first incremental run from start date)")
+
+    wells, max_seen_ts = _get_all_wells_from_s3_with_checkpoint(sensor_uri, checkpoint=checkpoint)
 
     if not wells:
-        logger.warning("No wells found in sensor parquet")
-        return {}
+        logger.warning("No new wells/readings found after checkpoint; PostgreSQL unchanged")
+        checkpoint_payload = dict(checkpoint or {})
+        checkpoint_payload["organization_id"] = os.getenv("ORGANIZATION_ID")
+        checkpoint_payload["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        checkpoint_payload["last_run_status"] = "skipped_no_new_rows"
+        if checkpoint_ts is not None:
+            checkpoint_payload["sensor_high_watermark"] = checkpoint_ts.isoformat()
+        _save_checkpoint(checkpoint_uri, checkpoint_payload)
+        return {
+            "status": "skipped",
+            "reason": "no_new_rows_since_checkpoint",
+            "wells_processed": 0,
+            "rows_upserted": 0,
+        }
 
     status_df = _build_status_rows(wells)
-
-    bucket, key = _parse_s3_uri(output_uri)
-    logger.info("Writing well status parquet to s3://%s/%s (%s rows)", bucket, key, len(status_df))
-    s3 = boto3.client("s3")
-    buf = io.BytesIO()
-    status_df.to_parquet(buf, index=False)
-    buf.seek(0)
-    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    rows_upserted = upsert_well_status_dataframe(status_df)
 
     status_counts = {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
     if "status" in status_df.columns:
@@ -422,10 +708,34 @@ def update_all_well_statuses():
 
     logger.info("=" * 50)
     logger.info("Well status update complete")
-    logger.info(f"Summary: RUNNING={status_counts['RUNNING']}, IDLE={status_counts['IDLE']}, SHUTDOWN={status_counts['SHUTDOWN']}")
+    logger.info(
+        "Summary: RUNNING=%s, IDLE=%s, SHUTDOWN=%s, rows_upserted=%s",
+        status_counts["RUNNING"],
+        status_counts["IDLE"],
+        status_counts["SHUTDOWN"],
+        rows_upserted,
+    )
     logger.info("=" * 50)
-    
-    return status_counts
+
+    checkpoint_payload = dict(checkpoint or {})
+    checkpoint_payload["organization_id"] = os.getenv("ORGANIZATION_ID")
+    checkpoint_payload["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    checkpoint_payload["last_run_status"] = "success"
+    if max_seen_ts is not None:
+        checkpoint_payload["sensor_high_watermark"] = pd.to_datetime(max_seen_ts, utc=True).isoformat()
+    _save_checkpoint(checkpoint_uri, checkpoint_payload)
+    logger.info(
+        "Saved well status checkpoint to %s (sensor_high_watermark=%s)",
+        checkpoint_uri,
+        checkpoint_payload.get("sensor_high_watermark"),
+    )
+
+    return {
+        "status": "success",
+        "wells_processed": len(status_df),
+        "rows_upserted": rows_upserted,
+        "summary": status_counts,
+    }
 
 
 def get_status_for_reading(well_id: str, lift_type: str, readings: Dict) -> str:
@@ -438,6 +748,7 @@ def get_status_for_reading(well_id: str, lift_type: str, readings: Dict) -> str:
     
     Uses the same multi-metric scoring as the background service.
     """
+    lift_type = _normalize_lift_type(lift_type)
     if not lift_type or lift_type not in IDLE_METRICS:
         return 'RUNNING'
     
