@@ -10,7 +10,11 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
-from anomaly_detection.s3_history import normalize_anomaly_suggestion_record, write_anomaly_suggestions_history_to_s3
+from anomaly_detection.s3_history import (
+    normalize_anomaly_suggestion_record,
+    normalize_violation_record,
+    write_anomaly_suggestions_history_to_s3,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,220 @@ def format_number_with_commas(num) -> Optional[str]:
         return str(num)
 
 
+def _format_value_with_unit(value: Any, unit: str = "") -> str:
+    formatted = format_number_with_commas(value)
+    if formatted is None:
+        return "N/A"
+    unit = (unit or "").strip()
+    return f"{formatted}{f' {unit}' if unit else ''}"
+
+
+def _format_band(min_val: Any, max_val: Any, unit: str = "") -> str:
+    lo = _format_value_with_unit(min_val, unit)
+    hi = _format_value_with_unit(max_val, unit)
+    return f"{lo}–{hi}"
+
+
+def _issue_label(value: Any, min_val: Any, max_val: Any) -> str:
+    """Short O&G-friendly direction label (no values or expected range in titles)."""
+    try:
+        val = float(value)
+        lo = float(min_val)
+        hi = float(max_val)
+        if val > hi:
+            pct_over = (val - hi) / max(abs(hi - lo), 1e-8) * 100.0
+            return "Above Normal" if pct_over < 50 else "High Spike"
+        if val < lo:
+            pct_under = (lo - val) / max(abs(hi - lo), 1e-8) * 100.0
+            return "Below Normal" if pct_under < 50 else "Sharp Drop"
+    except (TypeError, ValueError):
+        pass
+    return "Outside Normal Limits"
+
+
+def pseudo_violations_from_readings(
+    readings: Dict[str, Any],
+    lift_type: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Build violation-like records from readings vs expected Red Bluff bands."""
+    if not readings or not lift_type or not get_sensor_ranges:
+        return []
+
+    try:
+        bands = get_sensor_ranges(lift_type)
+    except Exception:
+        return []
+
+    pseudo: List[Dict[str, Any]] = []
+    for field, band in bands.items():
+        value = readings.get(field)
+        if value is None:
+            continue
+        try:
+            val = float(value)
+            lo = float(band.get("min"))
+            hi = float(band.get("max"))
+        except (TypeError, ValueError):
+            continue
+        if lo <= val <= hi:
+            continue
+        width = max(abs(hi - lo), 1e-8)
+        if val < lo:
+            deviation_pct = abs(lo - val) / width * 100.0
+        else:
+            deviation_pct = abs(val - hi) / width * 100.0
+        unit = band.get("unit") or ""
+        pseudo.append(
+            {
+                "field": field,
+                "value": val,
+                "min": lo,
+                "max": hi,
+                "unit": unit,
+                "deviation_pct": round(deviation_pct, 2),
+                "violation": (
+                    f"{format_field_name(field)} {_format_value_with_unit(val, unit)} "
+                    f"outside expected band {_format_band(lo, hi, unit)}"
+                ),
+            }
+        )
+    pseudo.sort(key=lambda x: float(x.get("deviation_pct", 0) or 0), reverse=True)
+    return pseudo
+
+
+def effective_violations(
+    anomaly_details: Dict[str, Any],
+    readings: Dict[str, Any],
+    lift_type: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Rule violations from detection, or band-derived pseudo-violations for ML-only hits."""
+    violations = list(anomaly_details.get("violations") or [])
+    if violations:
+        return violations
+    return pseudo_violations_from_readings(readings, lift_type)
+
+
+def generate_alert_title_from_violations(violations: List[Dict[str, Any]]) -> str:
+    """Short data-driven title: sensor name + direction (e.g. 'Injection Rate Sharp Drop')."""
+    if not violations:
+        return "Sensor Anomaly"
+
+    sorted_violations = sorted(
+        violations, key=lambda x: float(x.get("deviation_pct", 0) or 0), reverse=True
+    )
+    top = sorted_violations[0]
+    field_name = format_field_name(str(top.get("field") or "parameter"))
+    issue = _issue_label(top.get("value"), top.get("min"), top.get("max"))
+    return f"{field_name} {issue}"[:80]
+
+
+def generate_alert_title_from_anomaly(
+    anomaly_details: Dict[str, Any],
+    readings: Dict[str, Any],
+    lift_type: Optional[str] = None,
+) -> str:
+    violations = effective_violations(anomaly_details, readings, lift_type)
+    if violations:
+        return generate_alert_title_from_violations(violations)
+    try:
+        score = float(anomaly_details.get("anomaly_score", 0) or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score > 0:
+        return "Unusual Sensor Pattern"
+    return "Sensor Anomaly"
+
+
+def build_data_driven_description(
+    anomaly_details: Dict[str, Any],
+    readings: Dict[str, Any],
+    lift_type: Optional[str] = None,
+) -> str:
+    violations = effective_violations(anomaly_details, readings, lift_type)
+    score = float(anomaly_details.get("anomaly_score", 0) or 0)
+    rule_score = float(anomaly_details.get("rule_score", 0) or 0)
+    ml_score = float(anomaly_details.get("ml_score", 0) or 0)
+    lstm_score = float(anomaly_details.get("lstm_score", 0) or 0)
+
+    if not violations:
+        return (
+            f"Ensemble anomaly score {score:.2f} "
+            f"(rules {rule_score:.2f}, ML {ml_score:.2f}, LSTM {lstm_score:.2f}) "
+            f"indicates an unusual multivariate sensor pattern for this well."
+        )
+
+    parts: List[str] = []
+    for v in violations:
+        field = format_field_name(str(v.get("field") or "parameter"))
+        unit = str(v.get("unit") or "")
+        val_str = _format_value_with_unit(v.get("value"), unit)
+        band_str = _format_band(v.get("min"), v.get("max"), unit)
+        dev = float(v.get("deviation_pct", 0) or 0)
+        parts.append(
+            f"{field} read {val_str}, outside normal operating range {band_str} "
+            f"({dev:.1f}% beyond limit)."
+        )
+
+    summary = (
+        f"Anomaly score {score:.2f} across {len(violations)} sensor"
+        f"{'s' if len(violations) != 1 else ''}. "
+    )
+    return summary + " ".join(parts)
+
+
+def build_data_driven_suggested_actions(violations: List[Dict[str, Any]]) -> List[str]:
+    if not violations:
+        return [
+            "Review recent sensor trends and confirm data quality for this well.",
+            "Compare current readings to the well's recent operating baseline.",
+            "Escalate to production engineering if the pattern persists beyond one reading cycle.",
+        ]
+
+    top = max(violations, key=lambda x: float(x.get("deviation_pct", 0) or 0))
+    field = format_field_name(str(top.get("field") or "parameter"))
+    unit = str(top.get("unit") or "")
+    val_str = _format_value_with_unit(top.get("value"), unit)
+    band_str = _format_band(top.get("min"), top.get("max"), unit)
+
+    actions = [
+        f"Verify {field} reading {val_str} against normal operating range {band_str} and field instrumentation.",
+        f"Inspect related equipment and recent operational changes affecting {field}.",
+    ]
+    if len(violations) > 1:
+        others = ", ".join(format_field_name(str(v.get("field"))) for v in violations[1:4])
+        actions.append(f"Review correlated sensors also outside normal limits: {others}.")
+    else:
+        actions.append("Monitor the next 2–3 reading cycles before clearing the alert.")
+    return actions[:3]
+
+
+def apply_data_driven_fields(
+    suggestion: Dict[str, Any],
+    anomaly_details: Dict[str, Any],
+    readings: Dict[str, Any],
+    lift_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Always set title, severity, confidence, and baseline narrative from anomaly data."""
+    violations = effective_violations(anomaly_details, readings, lift_type)
+
+    suggestion["alert_title"] = generate_alert_title_from_anomaly(
+        anomaly_details, readings, lift_type
+    )
+    suggestion["severity"] = calculate_severity(
+        anomaly_details, anomaly_details.get("anomaly_score", 0), readings
+    )
+    suggestion["confidence"] = f"{calculate_data_driven_confidence(anomaly_details)}%"
+    suggestion["status"] = suggestion.get("status") or "ACTIVE"
+
+    suggestion["description"] = build_data_driven_description(anomaly_details, readings, lift_type)
+    suggestion["suggested_actions"] = build_data_driven_suggested_actions(violations)
+
+    if not (suggestion.get("explanation") or "").strip():
+        suggestion["explanation"] = suggestion["description"]
+
+    return suggestion
+
+
 def format_violations_for_display(violations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not violations:
         return violations
@@ -70,55 +288,21 @@ def format_violations_for_display(violations: List[Dict[str, Any]]) -> List[Dict
     return formatted
 
 
+def normalize_violations_for_storage(violations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Numeric violations with UI aliases (observed, expected_min, expected_max)."""
+    if not violations:
+        return violations
+    return [normalize_violation_record(v) for v in violations if isinstance(v, dict)]
+
+
 def format_anomaly_details_for_storage(anomaly_details: Dict[str, Any]) -> Dict[str, Any]:
     if not anomaly_details:
         return anomaly_details
     formatted = dict(anomaly_details)
     violations = formatted.get("violations") or []
     if isinstance(violations, list) and violations:
-        formatted["violations"] = format_violations_for_display(violations)
+        formatted["violations"] = normalize_violations_for_storage(violations)
     return formatted
-
-
-def generate_alert_title_from_violations(violations: List[Dict[str, Any]]) -> str:
-    if not violations:
-        return "Sensor Parameter Anomaly"
-    sorted_violations = sorted(
-        violations, key=lambda x: float(x.get("deviation_pct", 0) or 0), reverse=True
-    )
-    top_violation = sorted_violations[0]
-    field = top_violation.get("field", "parameter")
-    value = top_violation.get("value")
-    min_val = top_violation.get("min")
-    max_val = top_violation.get("max")
-    field_name = format_field_name(field)
-
-    issue_type = "Anomaly"
-    try:
-        if value is not None and min_val is not None and max_val is not None:
-            val = float(value)
-            mn = float(min_val)
-            mx = float(max_val)
-            if val > mx:
-                issue_type = "High" if val < mx * 1.5 else "Spike"
-            elif val < mn:
-                issue_type = "Low" if val > mn * 0.5 else "Drop"
-    except (ValueError, TypeError):
-        pass
-    return f"{field_name} {issue_type}"
-
-
-def sanitize_alert_title(title: str, violations: List[Dict[str, Any]]) -> str:
-    forbidden_terms = ["esp", "rod pump", "gas lift", "rod_pump", "gas_lift"]
-    if not title:
-        return generate_alert_title_from_violations(violations)
-    title_lower = title.lower()
-    if any(term in title_lower for term in forbidden_terms):
-        return generate_alert_title_from_violations(violations)
-    generic_titles = ["anomaly detected", "alert detected", "sensor anomaly detected"]
-    if title_lower.strip() in generic_titles:
-        return generate_alert_title_from_violations(violations)
-    return title.strip()
 
 
 def calculate_severity(anomaly_details: Dict[str, Any], anomaly_score: float, readings: Dict[str, Any]) -> str:
@@ -270,7 +454,11 @@ def generate_suggestion(
             )
 
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get("anomaly_score", 0), readings)
-        formatted_violations = format_violations_for_display(anomaly_details.get("violations", []))
+        violations = effective_violations(anomaly_details, readings, lift_type)
+        formatted_violations = format_violations_for_display(violations)
+        data_title = generate_alert_title_from_anomaly(anomaly_details, readings, lift_type)
+        data_description = build_data_driven_description(anomaly_details, readings, lift_type)
+        data_actions = build_data_driven_suggested_actions(violations)
 
         sensor_ranges_str = "{}"
         if lift_type and _SENSOR_CONFIG_AVAILABLE and get_sensor_ranges:
@@ -287,12 +475,29 @@ You are an expert Production Engineer AI assistant. Analyze the new anomaly.
 New Anomaly Details:
 Well ID: {well_id}
 Timestamp: {timestamp_str}
+Lift Type: {lift_type or 'N/A'}
+Anomaly Score: {float(anomaly_details.get("anomaly_score", 0) or 0):.2f}
+Rule Score: {float(anomaly_details.get("rule_score", 0) or 0):.2f}
+ML Score: {float(anomaly_details.get("ml_score", 0) or 0):.2f}
+LSTM Score: {float(anomaly_details.get("lstm_score", 0) or 0):.2f}
+Pre-Classified Severity: {calculated_severity}
+
+Server-Computed Alert Title (authoritative — do not invent a different title):
+{data_title}
+
+Server-Computed Description (authoritative baseline — use these exact values/units):
+{data_description}
+
+Server-Computed Suggested Actions:
+{json.dumps(data_actions, indent=2, cls=CustomJSONEncoder)}
+
 Current Sensor Readings:
 {json.dumps(readings, indent=2, cls=CustomJSONEncoder, default=str)}
-Violations Detected:
+
+Violations / Out-of-Band Sensors:
 {json.dumps(formatted_violations, indent=2, cls=CustomJSONEncoder, default=str)}
 
-Authoritative Sensor Ranges for lift type ({lift_type or 'N/A'}):
+Expected Sensor Bands (Red Bluff reference mean ± deviation%) for lift type ({lift_type or 'N/A'}):
 {sensor_ranges_str}
 ---
 Real Database History for this well (for context):
@@ -301,89 +506,31 @@ Real Database History for this well (for context):
 {history_guidance}
 ---
 
-IMPORTANT: Use the units provided in each violation entry exactly as given. Do NOT convert units (e.g., do not change °F to °C) or invent ranges. Use the 'unit', 'min', and 'max' fields from the Violations Detected objects when describing values and expected ranges.
-Additionally, do not use raw parameter keys as names everywhere. Convert them into clear, human-readable labels (for example, rod_pump → Rod Pump).
+IMPORTANT:
+- alert_title, severity, confidence, description, and suggested_actions are computed from sensor data on the server. Do NOT invent alternate titles or generic labels like "Anomaly Detected".
+- Use only values, units, and bands present in Violations / Out-of-Band Sensors and Current Sensor Readings.
+- Do not convert units. Use comma-delimited numbers in all text you write.
 
-Based on the information above, provide a structured JSON response.
+Provide JSON with ONLY these keys (enrichment fields):
 
-SEVERITY CLASSIFICATION GUIDE (Authoritative - follow code logic):
-- CRITICAL: 3+ violations with strong signal (>=0.85) or avg deviation >60%, or anomaly_score >= 0.98
-- HIGH: 2 violations with moderate signal (>=0.60) or avg deviation >40%, or anomaly_score >= 0.75
-- MEDIUM: 1 violation with modest signal (>=0.35) or avg deviation >12%
-- LOW: otherwise (small deviations or weak ML signal)
+1. "explanation": 2–4 sentences expanding on the server description with likely operational causes and what to verify first. Reference specific sensor names, values, and bands from the data above.
 
-CONFIDENCE CALCULATION:
-Calculate confidence as a SINGLE percentage value directly derived from the anomaly score.
-DO NOT use bucketed ranges. Use this exact rule:
-- Compute `confidence_percent = round(anomaly_score * 100)`.
-- Clamp `confidence_percent` into the inclusive range 1 to 99.
-- Return `confidence` as a string with a percent sign, e.g. "78%".
-The returned confidence MUST match this calculation and be a single number string.
-
-PRE-CLASSIFIED SEVERITY: {calculated_severity}
-ANOMALY SCORE: {float(anomaly_details.get("anomaly_score", 0) or 0):.2f}
-Strictly assign severity level that matches or stays close to this pre-classification.
-
-Important:
-1. If 'Real Database History' above is not an empty list, populate 'similar_incidents' using that data.
-
-Required JSON Structure:
-1. "alert_title": STRICT RULES - Read carefully:
-   A) NEVER include "ESP", "Rod Pump", "Gas Lift", or any lift type name in the title.
-   B) ONLY use the violated parameter name from 'Violations Detected' section.
-   C) Format: "[Parameter Name] [Issue Type]" - nothing else.
-
-   CORRECT Examples (use these exact patterns):
-   - "Torque Overload" (for torque violation)
-   - "Strokes Per Minute Anomaly" (for strokes_per_minute violation)
-   - "Polish Rod Load Spike" (for polish_rod_load violation)
-   - "Pump Fillage Low" (for pump_fillage violation)
-   - "Tubing Pressure High" (for tubing_pressure violation)
-   - "Motor Current Spike" (for motor_current violation)
-   - "Motor Temperature High" (for motor_temp violation)
-   - "Discharge Pressure Drop" (for discharge_pressure violation)
-   - "Injection Rate Anomaly" (for injection_rate violation)
-   - "Bottomhole Pressure Low" (for bottomhole_pressure violation)
-
-   WRONG Examples (NEVER do this):
-   - "ESP Motor Current Spike" ← WRONG (contains ESP)
-   - "Rod Pump Torque Overload" ← WRONG (contains Rod Pump)
-   - "Gas Lift Injection Anomaly" ← WRONG (contains Gas Lift)
-   - "ESP Anomaly Detected" ← WRONG (generic and contains ESP)
-
-   Convert parameter keys to human-readable names (e.g., motor_current → Motor Current, strokes_per_minute → Strokes Per Minute).
-   Use the MOST CRITICAL violation (highest deviation) from 'Violations Detected' to determine the title.
-
-2. "severity": Assign based on severity matrix above (CRITICAL, HIGH, MEDIUM, or LOW).
-3. "status": "ACTIVE".
-4. "confidence": IMPORTANT - Single percentage string (e.g., "78%") calculated from anomaly score. MUST be a single number. DO NOT return a range.
-5. "description": Write a concise, technical paragraph. Within this paragraph, you MUST clearly describe each parameter from 'Violations Detected' that is out of range.
-   For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.
-   Only mention violations detected, not all parameters.
-   For example: "The motor temperature reached 265 °F, exceeding the expected operational range of 100–250 °F." Use the 'unit' field from each violation object.
-6. "suggested_actions": A list of three clear, concise and actionable steps.
-7. "explanation": Detailed explanation of the new anomaly.
-
-CRITICAL FORMATTING REQUIREMENT FOR ALL TEXT FIELDS (description, suggested_actions, explanation):
-Use comma-delimited numbers (e.g., "1,234,567.89" NOT "1234567.89"). This applies to all numeric values.
-Use the exact formatted values provided in the 'Violations Detected' section above - they already have proper comma delimiters.
-
-8. "historical_context": Object containing:
+2. "historical_context": Object containing:
    - "asset_history": Object with keys "commissioned" (string), "operating_hours" (string), "last_inspection" (string). Since this data is not provided, you MUST use the string "Data Not Available" for each value.
    - "similar_incidents": A list of objects based ONLY on the 'Real Database History' provided above. If the history is empty, this MUST be an empty list []. For each incident in the history, create an object with the following keys:
      - "well": Use the "well" value from the history.
      - "date": Use the "date" value from the history, use format "MM/DD/YYYY HH:MM".
-     - "issue": Summarize the technical issue briefly (e.g., "Motor Current High" or "Pressure Violation"). Do NOT copy long "Out of range" error strings.
+     - "issue": Use the "issue" value from history when present; otherwise summarize using field, value, and unit from violations.
      - "severity": Use the "severity" value from the history.
      - "violations": Use the "violations" array from history (containing "field" and "violation", violation must be in simple value example 300 A). Do NOT repeat the parameter name or add words like "value" or "Historical" in value.
    - "key_learnings": String field (NOT inside similar_incidents). ALWAYS REQUIRED.
      * If similar_incidents is empty, write: "No similar historical incidents found."
      * If similar_incidents exist, analyze patterns in frequency, severity, or affected parameters (e.g., "Three pressure-related incidents occurred within 24 hours, suggesting potential equipment degradation").
 
-9. "risk_analysis": Object containing:
-   - "severity_breakdown": Object with keys "safety_risk", "production_impact", "financial_exposure".
+3. "risk_analysis": Object containing:
+   - "severity_breakdown": Object with keys "safety_risk", "production_impact", "financial_exposure" — each grounded in the violated sensors and scores above.
    - "mitigation_strategies": Object with keys "immediate", "short_term", "long_term".
-   - "decision_support": A final string recommendation.
+   - "decision_support": One-sentence recommendation referencing the top violated sensor and value.
 
 Ensure your entire output is a single, valid JSON object.
 """
@@ -410,10 +557,7 @@ Ensure your entire output is a single, valid JSON object.
             content = content.split("```")[1].split("```")[0]
 
         suggestion_data = json.loads(content.strip())
-        if "alert_title" in suggestion_data:
-            suggestion_data["alert_title"] = sanitize_alert_title(
-                suggestion_data.get("alert_title", ""), anomaly_details.get("violations", [])
-            )
+        apply_data_driven_fields(suggestion_data, anomaly_details, readings, lift_type)
 
         if "historical_context" not in suggestion_data:
             suggestion_data["historical_context"] = {}
@@ -438,16 +582,12 @@ Ensure your entire output is a single, valid JSON object.
         return suggestion_data
     except Exception as e:
         logger.error("Error generating suggestion: %s", e)
-        violations = anomaly_details.get("violations", [])
-        fallback_title = generate_alert_title_from_violations(violations)
-        return {
-            "alert_title": fallback_title,
+        violations = effective_violations(anomaly_details, readings, lift_type)
+        fallback = {
             "severity": "UNKNOWN",
             "status": "ACTIVE",
             "confidence": "0%",
-            "description": "Could not generate detailed analysis.",
-            "suggested_actions": ["Investigate manually"],
-            "explanation": f"AI Generation failed: {str(e)}",
+            "explanation": f"LLM enrichment unavailable: {str(e)}",
             "historical_context": {
                 "asset_history": {
                     "commissioned": "Data Not Available",
@@ -455,22 +595,27 @@ Ensure your entire output is a single, valid JSON object.
                     "last_inspection": "Data Not Available",
                 },
                 "similar_incidents": [],
-                "key_learnings": "AI generation failed.",
+                "key_learnings": "LLM enrichment unavailable; see data-driven description.",
             },
             "risk_analysis": {
                 "severity_breakdown": {
-                    "safety_risk": "",
-                    "production_impact": "",
-                    "financial_exposure": "",
+                    "safety_risk": "Assess based on violated sensors listed in the alert.",
+                    "production_impact": "Monitor production if multiple sensors are out of band.",
+                    "financial_exposure": "Data Not Available",
                 },
                 "mitigation_strategies": {
-                    "immediate": "",
-                    "short_term": "",
-                    "long_term": "",
+                    "immediate": build_data_driven_suggested_actions(violations)[0]
+                    if violations
+                    else "Verify sensor readings and field conditions.",
+                    "short_term": "Review recent trends for the affected well.",
+                    "long_term": "Schedule engineering review if anomalies repeat.",
                 },
-                "decision_support": "",
+                "decision_support": generate_alert_title_from_anomaly(
+                    anomaly_details, readings, lift_type
+                ),
             },
         }
+        return apply_data_driven_fields(fallback, anomaly_details, readings, lift_type)
 
 
 def persist_suggestion_to_s3(
@@ -488,10 +633,12 @@ def persist_suggestion_to_s3(
     suggestion_result["asset_id"] = suggestion_result.get("asset_id") or f"ALT-{random.randint(100000, 999999)}"
 
     try:
-        suggestion_result["severity"] = calculate_severity(
-            anomaly_details, anomaly_details.get("anomaly_score", 0), readings or {}
+        apply_data_driven_fields(
+            suggestion_result,
+            anomaly_details,
+            readings or {},
+            lift_type,
         )
-        suggestion_result["confidence"] = f"{calculate_data_driven_confidence(anomaly_details)}%"
     except Exception:
         pass
 

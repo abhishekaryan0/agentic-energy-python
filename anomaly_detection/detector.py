@@ -2,8 +2,8 @@
 Unified Anomaly Detection Module
 ================================
 
-Integrates statistical rules, Isolation Forest, and LSTM for comprehensive anomaly detection.
-Loads sensor configurations from S3 parquet (sensor_ranges) when available.
+Integrates band-based checks (Red Bluff mean ± deviation), Isolation Forest, and LSTM.
+Sensor profiles and column mapping: anomaly_detection/red_buff_sensors.py.
 
 Features:
     - Rule-based detection using sensor thresholds from database
@@ -163,29 +163,31 @@ class AnomalyConfig:
         rule_base_contrib: Base contribution for rule violations
         rule_extra_cap: Maximum extra contribution from deviation
         rule_dev_scale: Scaling factor for deviation contribution
-        rule_deviation_pct: Percentage band around average for rule checks
-        rule_use_client_bounds: Whether to clip average band to client min/max
+        rule_deviation_pct: Percentage band around reference mean for band checks
     """
     # Detection thresholds
     anomaly_threshold: float = 0.75
     ml_only_threshold: float = 0.85
     
-    # Method weights (must sum to ~1.0)
+    # Method weights (must sum to ~1.0): bands + IF + PyOD + MAD + LSTM
     weights: Dict[str, float] = field(default_factory=lambda: {
-        'rules': 0.4,
-        'iso': 0.3,
-        'lstm': 0.3
+        'rules': 0.30,
+        'iso': 0.15,
+        'pyod': 0.20,
+        'stat': 0.10,
+        'lstm': 0.25,
     })
     
-    # LSTM configuration
-    seq_len: int = 10
-    lstm_epochs: int = 20
-    lstm_lr: float = 0.001
-    mse_threshold: float = 0.05
+    # LSTM configuration (seq_len 24–48 hours at hourly data)
+    seq_len: int = int(os.environ.get("ANOMALY_LSTM_SEQ_LEN", "24") or 24)
+    lstm_epochs: int = int(os.environ.get("ANOMALY_LSTM_EPOCHS", "30") or 30)
+    lstm_lr: float = float(os.environ.get("ANOMALY_LSTM_LR", "0.001") or 0.001)
+    lstm_hidden_dim: int = int(os.environ.get("ANOMALY_LSTM_HIDDEN_DIM", "128") or 128)
+    mse_threshold: float = float(os.environ.get("ANOMALY_LSTM_MSE_THRESHOLD", "0.05") or 0.05)
     
     # Isolation Forest configuration
-    iso_contamination: float = 0.05
-    contamination_ratio: float = 0.1
+    iso_contamination: float = float(os.environ.get("ANOMALY_ISO_CONTAMINATION", "0.05") or 0.05)
+    contamination_ratio: float = float(os.environ.get("ANOMALY_CONTAMINATION_RATIO", "0.05") or 0.05)
     
     # Statistical model configuration
     z_score_threshold: float = 3.0
@@ -194,8 +196,7 @@ class AnomalyConfig:
     rule_base_contrib: float = 0.35
     rule_extra_cap: float = 0.7
     rule_dev_scale: float = 0.9
-    rule_deviation_pct: float = 50.0
-    rule_use_client_bounds: bool = True
+    rule_deviation_pct: float = float(os.environ.get("ANOMALY_RULE_DEVIATION_PCT", "30") or 30)
     
     # Models directory: models/anomaly_detection/wells/<safe_id>/, well_types/<type>/
     models_dir: str = 'models'
@@ -204,6 +205,7 @@ class AnomalyConfig:
     well_types_subdir: str = 'well_types'
     # Fixed filenames inside each well (or well_type) folder
     iso_filename: str = 'isolation_forest.joblib'
+    pyod_filename: str = 'pyod_ensemble.joblib'
     stat_filename: str = 'statistical_model.joblib'
     lstm_pt_filename: str = 'lstm_autoencoder.pt'
     lstm_scaler_filename: str = 'lstm_scaler.joblib'
@@ -243,18 +245,15 @@ ROLLING_WINDOWS = [1, 3, 6, 12]
 WELL_TYPES = ['Rod Pump', 'ESP', 'Gas Lift']
 
 # Fallback features when sensor_config unavailable (matches sensor_definitions)
-WELL_TYPE_FEATURES_FALLBACK: Dict[str, List[str]] = {
-    'Rod Pump': ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure'],
-    'ESP': ['motor_temp', 'motor_current', 'discharge_pressure', 'pump_intake_pressure', 'motor_voltage'],
-    'Gas Lift': ['injection_rate', 'injection_temperature', 'bottomhole_pressure', 'injection_pressure', 'cycle_time'],
-}
+def _red_buff_features_fallback() -> Dict[str, List[str]]:
+    from anomaly_detection.red_buff_sensors import features_fallback_dict
+    return features_fallback_dict()
 
-# Critical sensors that require immediate attention when out of range
-CRITICAL_SENSORS: Dict[str, List[str]] = {
-    'Rod Pump': ['tubing_pressure', 'strokes_per_minute'],
-    'ESP': ['motor_current', 'motor_temp'],
-    'Gas Lift': ['injection_rate', 'injection_pressure'],
-}
+
+WELL_TYPE_FEATURES_FALLBACK: Dict[str, List[str]] = _red_buff_features_fallback()
+
+# Full sensor set per lift (legacy export name CRITICAL_SENSORS).
+CRITICAL_SENSORS: Dict[str, List[str]] = _red_buff_features_fallback()
 
 # ============================================================================
 # LOGGING
@@ -310,37 +309,19 @@ def get_safe_value(d: Dict, k: str, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-# Dynamic rules loader function
 def get_well_type_rules(lift_type: str) -> Dict:
     """
-    Get sensor rules for a well type from sensor_config (S3 parquet).
-
-    Returns a dict of client-provided ranges that can be used as hard bounds
-    around the statistically learned average band. When sensor_config is unavailable,
-    returns an empty dict and rule-based checks rely on ML model stats.
+    Red Bluff band profiles for a lift type: reference mean, span, and units
+    per canonical WELL_SENSOR_READINGS column (no sensor_ranges.parquet).
     """
     if os.environ.get("SAGEMAKER_REGION"):
         return {}
-    # When sensor_config is not available, allow pure ML/S3-based detection.
-    if not SENSOR_CONFIG_AVAILABLE:
-        logging.warning(
-            "Dynamic sensor_config not available; get_well_type_rules returning empty rules "
-            "(rules component disabled, ML models + fallback bands only)."
-        )
-        return {}
     try:
-        ranges = get_sensor_ranges(lift_type)
-        rules = {}
-        for field_name, range_info in ranges.items():
-            rules[field_name] = {
-                "min": range_info.get('min'),
-                "max": range_info.get('max'),
-                "unit": range_info.get('unit'),
-            }
-        return rules
+        from anomaly_detection.sensor_config import get_anomaly_rules
+        return get_anomaly_rules(lift_type)
     except Exception as e:
         logger.warning(
-            "Error loading dynamic rules for %s: %s (continuing with ML/LSTM only)",
+            "Error loading Red Buff band profiles for %s: %s (continuing with ML/LSTM only)",
             lift_type,
             e,
         )
@@ -434,10 +415,19 @@ class AnomalyDetector:
                         logger.info(f"✓ Loaded isolation forest model for {well_type}")
                 except Exception as e:
                     logger.error(f"Failed to load {iso_f}: {e}")
+            pyod_f = os.path.join(type_dir, self.config.pyod_filename)
+            if os.path.exists(pyod_f):
+                try:
+                    d = joblib.load(pyod_f)
+                    if isinstance(d, dict) and 'ecod' in d and 'copod' in d:
+                        trained_models[f'pyod_{well_type}'] = d
+                        logger.info(f"✓ Loaded PyOD ensemble for {well_type}")
+                except Exception as e:
+                    logger.error(f"Failed to load {pyod_f}: {e}")
             if os.path.exists(stat_f):
                 try:
                     d = joblib.load(stat_f)
-                    if isinstance(d, dict) and 'mean' in d and 'std' in d:
+                    if isinstance(d, dict) and ('median' in d or 'mean' in d):
                         trained_models[f'stat_{well_type}'] = d
                         logger.info(f"✓ Loaded statistical model for {well_type}")
                 except Exception as e:
@@ -449,10 +439,11 @@ class AnomalyDetector:
                 try:
                     meta = joblib.load(lstm_meta)
                     scaler = joblib.load(lstm_sc)
-                    model = LSTMAutoencoder(input_dim=meta['input_dim'])
-                    model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                    hidden_dim = int(meta.get("hidden_dim") or self.config.lstm_hidden_dim)
+                    model = LSTMAutoencoder(input_dim=meta["input_dim"], hidden_dim=hidden_dim)
+                    model.load_state_dict(torch.load(lstm_pt, map_location="cpu"))
                     model.eval()
-                    trained_models[f'lstm_{well_type}'] = {
+                    trained_models[f"lstm_{well_type}"] = {
                         'model': model, 'scaler': scaler,
                         'seq_len': meta.get('seq_len', SEQ_LEN),
                         'features': meta.get('features', [])
@@ -473,10 +464,19 @@ class AnomalyDetector:
                         logger.info(f"✓ Loaded isolation forest model for well {safe_id}")
                 except Exception as e:
                     logger.error(f"Failed to load {iso_f}: {e}")
+            pyod_f = os.path.join(well_dir, self.config.pyod_filename)
+            if os.path.exists(pyod_f):
+                try:
+                    d = joblib.load(pyod_f)
+                    if isinstance(d, dict) and 'ecod' in d and 'copod' in d:
+                        trained_models[f'pyod_well_{safe_id}'] = d
+                        logger.info(f"✓ Loaded PyOD ensemble for well {safe_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load {pyod_f}: {e}")
             if os.path.exists(stat_f):
                 try:
                     d = joblib.load(stat_f)
-                    if isinstance(d, dict) and 'mean' in d and 'std' in d:
+                    if isinstance(d, dict) and ('median' in d or 'mean' in d):
                         trained_models[f'stat_well_{safe_id}'] = d
                         logger.info(f"✓ Loaded statistical model for well {safe_id}")
                 except Exception as e:
@@ -488,10 +488,11 @@ class AnomalyDetector:
                 try:
                     meta = joblib.load(lstm_meta)
                     scaler = joblib.load(lstm_sc)
-                    model = LSTMAutoencoder(input_dim=meta['input_dim'])
-                    model.load_state_dict(torch.load(lstm_pt, map_location='cpu'))
+                    hidden_dim = int(meta.get("hidden_dim") or self.config.lstm_hidden_dim)
+                    model = LSTMAutoencoder(input_dim=meta["input_dim"], hidden_dim=hidden_dim)
+                    model.load_state_dict(torch.load(lstm_pt, map_location="cpu"))
                     model.eval()
-                    trained_models[f'lstm_well_{safe_id}'] = {
+                    trained_models[f"lstm_well_{safe_id}"] = {
                         'model': model, 'scaler': scaler,
                         'seq_len': meta.get('seq_len', SEQ_LEN),
                         'features': meta.get('features', [])
@@ -533,8 +534,9 @@ class AnomalyDetector:
                     try:
                         meta = joblib.load(lstm_meta_file)
                         scaler = joblib.load(lstm_scaler_file)
-                        model = LSTMAutoencoder(input_dim=meta['input_dim'])
-                        model.load_state_dict(torch.load(lstm_file, map_location='cpu'))
+                        hidden_dim = int(meta.get("hidden_dim") or self.config.lstm_hidden_dim)
+                        model = LSTMAutoencoder(input_dim=meta["input_dim"], hidden_dim=hidden_dim)
+                        model.load_state_dict(torch.load(lstm_file, map_location="cpu"))
                         model.eval()
                         trained_models[f'lstm_{well_type}'] = {
                             'model': model, 'scaler': scaler,
@@ -565,136 +567,146 @@ class AnomalyDetector:
         well_id: Optional[str] = None
     ) -> Tuple[List, float]:
         """
-        Compute rule-based anomaly score and violations using an average-based band.
-        
-        Primary logic:
-            - Use statistical model mean per sensor as the "average" value.
-            - Build a band: mean ± (rule_deviation_pct %).
-            - Optionally clip that band to client-provided min/max (active_rules).
-            - Flag values that fall outside this band.
-        
-        Fallback:
-            - If no statistical model is available for a sensor, fall back to
-              direct client min/max checks (legacy behavior).
+        Band-based score using Red Bluff reference means ± deviation_pct.
+
+        Evaluates every sensor for the lift type (full Red Bluff profile), not a
+        critical subset. Per-well trained means override Red Bluff midpoints.
         """
+        from anomaly_detection.red_buff_sensors import (
+            compute_band,
+            detection_fields_for_lift,
+            profile_by_field,
+        )
+
         violations: List[Dict[str, Any]] = []
         rule_anomaly_score = 0.0
 
-        # Look up statistical model (prefer per-well, then per lift-type)
         well_type_clean = lift_type_model_key(lift_type)
         safe_well = well_id_to_safe(well_id) if well_id else None
         stat_key = None
-        if safe_well and f'stat_well_{safe_well}' in self.trained_models:
-            stat_key = f'stat_well_{safe_well}'
-        elif f'stat_{well_type_clean}' in self.trained_models:
-            stat_key = f'stat_{well_type_clean}'
+        if safe_well and f"stat_well_{safe_well}" in self.trained_models:
+            stat_key = f"stat_well_{safe_well}"
+        elif f"stat_{well_type_clean}" in self.trained_models:
+            stat_key = f"stat_{well_type_clean}"
 
         stat_model = self.trained_models.get(stat_key) if stat_key else None
         feature_means: Dict[str, float] = {}
-        if stat_model is not None and 'mean' in stat_model:
-            means = np.array(stat_model['mean'])
-            stat_features = stat_model.get('features')
-            # Only build mapping when features metadata is available and lengths match
-            if stat_features and len(stat_features) == len(means):
-                feature_means = {
-                    str(f): float(means[idx])
-                    for idx, f in enumerate(stat_features)
-                }
+        feature_stds: Dict[str, float] = {}
+        stat_feature_list: List[str] = []
+        if stat_model is not None:
+            center_key = (
+                "median"
+                if stat_model.get("robust_method") == "mad" and "median" in stat_model
+                else "mean"
+            )
+            if center_key in stat_model:
+                means = np.array(stat_model[center_key])
+                spread = np.array(
+                    stat_model.get("mad") if center_key == "median" else stat_model.get("std") or []
+                )
+                stat_features = stat_model.get("features")
+                if stat_features and len(stat_features) == len(means):
+                    stat_feature_list = [str(f) for f in stat_features]
+                    feature_means = {
+                        str(f): float(means[idx]) for idx, f in enumerate(stat_features)
+                    }
+                    if len(spread) == len(means):
+                        feature_stds = {
+                            str(f): float(spread[idx]) for idx, f in enumerate(stat_features)
+                        }
 
-        deviation_fraction = max(self.config.rule_deviation_pct / 100.0, 0.0)
+        deviation_pct = self.config.rule_deviation_pct
+        profiles = profile_by_field(lift_type)
+        fields_to_check = detection_fields_for_lift(
+            lift_type,
+            readings=readings,
+            trained_features=stat_feature_list,
+        )
 
-        for field, value in readings.items():
+        for field in fields_to_check:
+            value = readings.get(field)
             if value is None:
                 continue
 
-            rule = active_rules.get(field) or {}
-            client_min = rule.get("min")
-            client_max = rule.get("max")
-            sensor_unit = rule.get("unit") or ""
+            rule_profile = active_rules.get(field) if active_rules else None
+            sensor_profile = profiles.get(field)
+            sensor_unit = ""
+            span = 0.0
+            ref_mean = 0.0
 
-            # Decide average to use for this field
-            avg = feature_means.get(field)
+            if rule_profile:
+                sensor_unit = rule_profile.get("unit") or ""
+                span = float(rule_profile.get("span") or 0.0)
+                ref_mean = float(rule_profile.get("mean") or 0.0)
+            elif sensor_profile:
+                sensor_unit = sensor_profile.unit
+                span = sensor_profile.span
+                ref_mean = sensor_profile.mean
 
-            # If we have a valid average, build mean-based band
-            if avg is not None and not np.isnan(avg):
-                # Handle negative means by always taking numeric min/max of the endpoints
-                low_candidate = avg * (1.0 - deviation_fraction)
-                high_candidate = avg * (1.0 + deviation_fraction)
-                band_min = min(low_candidate, high_candidate)
-                band_max = max(low_candidate, high_candidate)
-
-                # Optionally clip band by client min/max
-                if self.config.rule_use_client_bounds:
-                    if client_min is not None:
-                        band_min = max(band_min, client_min)
-                    if client_max is not None:
-                        band_max = min(band_max, client_max)
-
-                # If band collapsed or invalid, fall back to client-only logic
-                if band_max <= band_min:
-                    band_min = client_min
-                    band_max = client_max
+            trained_mean = feature_means.get(field)
+            trained_std = feature_stds.get(field)
+            if trained_mean is not None and not np.isnan(trained_mean):
+                avg = trained_mean
+                if not span and trained_std is not None and not np.isnan(trained_std):
+                    span = max(float(trained_std) * 4.0, abs(avg) * 0.1, 1.0)
+            elif ref_mean:
+                avg = ref_mean
             else:
-                # No statistical average available – rely purely on client bounds
-                band_min = client_min
-                band_max = client_max
-
-            # If we still don't have a usable band, skip this sensor
-            if band_min is None or band_max is None:
                 continue
 
-            # Check if current value is outside the allowed band
+            if not span and sensor_profile:
+                span = sensor_profile.span
+            band_min, band_max = compute_band(avg, deviation_pct=deviation_pct, span=span)
+
+            if band_max <= band_min:
+                continue
+
             if value < band_min or value > band_max:
-                # Deviation as percentage beyond the band width
                 width = band_max - band_min if band_max != band_min else 1e-8
                 if value < band_min:
-                    deviation_pct = abs(band_min - value) / width * 100.0
+                    beyond_pct = abs(band_min - value) / width * 100.0
                 else:
-                    deviation_pct = abs(value - band_max) / width * 100.0
+                    beyond_pct = abs(value - band_max) / width * 100.0
 
+                avg_str = self._format_value(avg)
                 min_str = self._format_value(band_min)
                 max_str = self._format_value(band_max)
                 val_str = self._format_value(value)
                 unit_str = f" {sensor_unit}" if sensor_unit else ""
-                if avg is not None and not np.isnan(avg):
-                    avg_str = self._format_value(avg)
-                    violation_text = (
-                        f"Outside expected band around average. "
-                        f"Avg {avg_str}{unit_str}, allowed {min_str}{unit_str} - {max_str}{unit_str}, "
-                        f"got {val_str}{unit_str} ({deviation_pct:.1f}% beyond band)"
-                    )
-                else:
-                    violation_text = (
-                        f"Out of range. Expected {min_str}{unit_str} - {max_str}{unit_str}, "
-                        f"got {val_str}{unit_str} ({deviation_pct:.1f}% deviation)"
-                    )
+                source = "well baseline" if trained_mean is not None else "Red Bluff reference"
+                violation_text = (
+                    f"Outside expected band ({source}). "
+                    f"Mean {avg_str}{unit_str}, allowed ±{deviation_pct:.0f}% "
+                    f"→ {min_str}{unit_str} - {max_str}{unit_str}, "
+                    f"got {val_str}{unit_str} ({beyond_pct:.1f}% beyond band)"
+                )
 
                 logger.debug(
-                    "[AnomalyDetector] lift_type=%s field=%s avg=%s band=[%s, %s] value=%s unit=%s",
+                    "[AnomalyDetector] lift_type=%s field=%s mean=%s band=[%s, %s] value=%s",
                     lift_type,
                     field,
                     avg,
                     band_min,
                     band_max,
                     value,
-                    sensor_unit,
                 )
 
                 violations.append({
                     "field": field,
                     "value": value,
+                    "mean": avg,
                     "min": band_min,
                     "max": band_max,
                     "unit": sensor_unit,
-                    "deviation_pct": round(deviation_pct, 2),
-                    "violation": violation_text
+                    "deviation_pct": round(beyond_pct, 2),
+                    "band_deviation_pct": deviation_pct,
+                    "violation": violation_text,
                 })
 
-                # Calculate contribution using configured scaling factors
-                dev_factor = deviation_pct / 100.0
+                dev_factor = beyond_pct / 100.0
                 contrib = self.config.rule_base_contrib + min(
                     self.config.rule_extra_cap,
-                    dev_factor * self.config.rule_dev_scale
+                    dev_factor * self.config.rule_dev_scale,
                 )
                 rule_anomaly_score += contrib
 
@@ -722,8 +734,12 @@ class AnomalyDetector:
         """
         weights = self.config.weights
         rules_w = weights.get('rules', 0.4)
-        ml_w = weights.get('iso', 0.3) + weights.get('stat', 0.0)  # Treat as combined ML weight
-        lstm_w = weights.get('lstm', 0.3)
+        ml_w = (
+            weights.get('iso', 0.15)
+            + weights.get('pyod', 0.20)
+            + weights.get('stat', 0.10)
+        )
+        lstm_w = weights.get('lstm', 0.25)
         total_w = rules_w + ml_w + lstm_w
         
         if total_w == 0:
@@ -755,7 +771,7 @@ class AnomalyDetector:
         
         active_rules = get_well_type_rules(lift_type)
         
-        # Rule-based detection (average-based band using statistical model + client ranges)
+        # Band-based detection (Red Bluff reference mean ± deviation_pct; per-well stat override)
         violations, rule_anomaly_score = self._compute_rule_based_score(
             readings,
             active_rules,
@@ -763,10 +779,16 @@ class AnomalyDetector:
             well_id=well_id,
         )
         
-        # ML-based detection (Isolation Forest + stat); prefer per-well models
+        iso_score = 0.0
+        pyod_score = 0.0
+        mad_score = 0.0
         detection_method = "statistical_rules"
         if self.trained_models:
-            ml_anomaly_score = self._detect_anomaly_with_trained_models(readings, lift_type, well_id=well_id)
+            ml_scores = self._detect_anomaly_with_trained_models(readings, lift_type, well_id=well_id)
+            ml_anomaly_score = float(ml_scores.get("ml_score", 0.0) or 0.0)
+            iso_score = float(ml_scores.get("iso_score", 0.0) or 0.0)
+            pyod_score = float(ml_scores.get("pyod_score", 0.0) or 0.0)
+            mad_score = float(ml_scores.get("mad_score", 0.0) or 0.0)
             if ml_anomaly_score > 0.5:
                 detection_method += " + ml_model"
         
@@ -807,74 +829,132 @@ class AnomalyDetector:
         # Combine scores
         combined_score = self._combine_scores(rule_anomaly_score, ml_anomaly_score, lstm_anomaly_score)
 
-        logger.debug(f"[AnomalyDetector] rule_score={rule_anomaly_score:.3f} ml_score={ml_anomaly_score:.3f} lstm_score={lstm_anomaly_score:.3f} combined_score={combined_score:.3f}")
+        logger.debug(
+            "[AnomalyDetector] band=%.3f iso=%.3f pyod=%.3f mad=%.3f ml=%.3f lstm=%.3f combined=%.3f",
+            rule_anomaly_score,
+            iso_score,
+            pyod_score,
+            mad_score,
+            ml_anomaly_score,
+            lstm_anomaly_score,
+            combined_score,
+        )
 
         is_anomaly = len(violations) > 0 or combined_score >= self.config.anomaly_threshold
 
         return {
             "is_anomaly": is_anomaly,
             "anomaly_score": round(combined_score, 3),
+            "band_score": round(rule_anomaly_score, 3),
             "rule_score": round(rule_anomaly_score, 3),
+            "iso_score": round(iso_score, 3),
+            "pyod_score": round(pyod_score, 3),
+            "mad_score": round(mad_score, 3),
             "ml_score": round(ml_anomaly_score, 3),
             "lstm_score": round(lstm_anomaly_score, 3),
             "violations": violations,
             "summary": f"{len(violations)} rule violation(s) detected" if violations else "No violations detected",
-            "detection_method": detection_method
+            "detection_method": detection_method,
         }
     
-    def _detect_anomaly_with_trained_models(self, readings: Dict, lift_type: str, well_id: Optional[str] = None) -> float:
-        """Use trained Isolation Forest and statistical models; prefer per-well models over lift_type."""
+    def _detect_anomaly_with_trained_models(
+        self, readings: Dict, lift_type: str, well_id: Optional[str] = None
+    ) -> Dict[str, float]:
+        """Isolation Forest + PyOD (ECOD/COPOD) + MAD z-score; prefer per-well models."""
+        from anomaly_detection.ml_models import mad_anomaly_score, pyod_anomaly_scores
+
         well_type_clean = lift_type_model_key(lift_type)
         safe_well = well_id_to_safe(well_id) if well_id else None
-        # Prefer per-well models, then fall back to lift_type
-        iso_key = f'iso_well_{safe_well}' if (well_id and f'iso_well_{safe_well}' in self.trained_models) else f'iso_{well_type_clean}'
-        stat_key = f'stat_well_{safe_well}' if (well_id and f'stat_well_{safe_well}' in self.trained_models) else f'stat_{well_type_clean}'
-        
-        if iso_key not in self.trained_models and stat_key not in self.trained_models:
-            return 0.0
-        
+
+        def _pick(prefix: str) -> str:
+            well_key = f"{prefix}_well_{safe_well}"
+            type_key = f"{prefix}_{well_type_clean}"
+            if well_id and well_key in self.trained_models:
+                return well_key
+            return type_key
+
+        iso_key = _pick("iso")
+        pyod_key = _pick("pyod")
+        stat_key = _pick("stat")
+
+        empty = {"ml_score": 0.0, "iso_score": 0.0, "pyod_score": 0.0, "mad_score": 0.0}
+        if (
+            iso_key not in self.trained_models
+            and pyod_key not in self.trained_models
+            and stat_key not in self.trained_models
+        ):
+            return empty
+
         features = None
-        if iso_key in self.trained_models and 'features' in self.trained_models[iso_key]:
-            features = self.trained_models[iso_key]['features']
-        if not features and stat_key in self.trained_models and 'features' in self.trained_models[stat_key]:
-            features = self.trained_models[stat_key]['features']
+        for key in (iso_key, pyod_key, stat_key):
+            bundle = self.trained_models.get(key) or {}
+            if bundle.get("features"):
+                features = bundle["features"]
+                break
         if not features:
-            features = WELL_TYPE_FEATURES_FALLBACK.get(lift_type, [])
+            features = self._get_features_for_well_type(lift_type)
         if not features:
-            return 0.0
-        
-        values = np.array([[get_safe_value(readings, f) for f in features]])
-        
-        anomaly_scores = []
-        
+            return empty
+
+        iso_score = 0.0
+        pyod_score = 0.0
+        mad_score = 0.0
+        weighted_scores: List[Tuple[float, float]] = []
+        weights = self.config.weights
+
         if iso_key in self.trained_models:
             model_data = self.trained_models[iso_key]
-            model = model_data['model']
-            scaler = model_data['scaler']
-            model_features = model_data.get('features', features)
+            model = model_data["model"]
+            scaler = model_data["scaler"]
+            model_features = model_data.get("features", features)
             vals = np.array([[get_safe_value(readings, f) for f in model_features]])
-            if len(model_features) == getattr(scaler, 'n_features_in_', len(model_features)):
+            if len(model_features) == getattr(scaler, "n_features_in_", len(model_features)):
                 values_scaled = scaler.transform(vals)
                 score = model.decision_function(values_scaled)[0]
-                normalized_score = 1 - (score + 1) / 2
-                anomaly_scores.append(normalized_score)
-        
+                iso_score = float(1 - (score + 1) / 2)
+                weighted_scores.append((iso_score, weights.get("iso", 0.15)))
+
+        if pyod_key in self.trained_models:
+            model_data = self.trained_models[pyod_key]
+            scaler = model_data["scaler"]
+            model_features = model_data.get("features", features)
+            vals = np.array([[get_safe_value(readings, f) for f in model_features]])
+            if len(model_features) == getattr(scaler, "n_features_in_", len(model_features)):
+                values_scaled = scaler.transform(vals)
+                pyod_score = float(pyod_anomaly_scores(values_scaled, model_data)[0])
+                weighted_scores.append((pyod_score, weights.get("pyod", 0.20)))
+
         if stat_key in self.trained_models:
             stat_model = self.trained_models[stat_key]
-            mean = np.array(stat_model['mean'])
-            std = np.array(stat_model['std'])
-            stat_features = stat_model.get('features', features)
+            stat_features = stat_model.get("features", features)
             vals = np.array([get_safe_value(readings, f) for f in stat_features])
-            if len(stat_features) == len(mean):
-                z_scores = np.abs((vals - mean) / (std + 1e-8))
-                max_z = np.max(z_scores)
-                stat_anomaly = min(1.0, max_z / self.config.z_score_threshold)
-                anomaly_scores.append(stat_anomaly)
-        
-        return np.mean(anomaly_scores) if anomaly_scores else 0.0
+            center = stat_model.get("median", stat_model.get("mean"))
+            if len(stat_features) == len(np.asarray(center)):
+                mad_score = float(
+                    mad_anomaly_score(
+                        vals,
+                        stat_model,
+                        z_threshold=self.config.z_score_threshold,
+                    )
+                )
+                weighted_scores.append((mad_score, weights.get("stat", 0.10)))
+
+        if not weighted_scores:
+            return empty
+        total_w = sum(w for _, w in weighted_scores)
+        if total_w <= 0:
+            ml_combined = float(np.mean([s for s, _ in weighted_scores]))
+        else:
+            ml_combined = float(sum(s * w for s, w in weighted_scores) / total_w)
+        return {
+            "ml_score": ml_combined,
+            "iso_score": iso_score,
+            "pyod_score": pyod_score,
+            "mad_score": mad_score,
+        }
     
     def _get_features_for_well_type(self, lift_type: str) -> List[str]:
-        """Get feature list from sensor_definitions (DB) or fallback."""
+        """Canonical Red Buff sensor columns for this lift type."""
         if SENSOR_CONFIG_AVAILABLE and get_features_for_lift_type:
             try:
                 features = get_features_for_lift_type(lift_type)
@@ -882,7 +962,8 @@ class AnomalyDetector:
                     return features
             except Exception as e:
                 logger.warning(f"Could not get features from sensor_config for {lift_type}: {e}")
-        return WELL_TYPE_FEATURES_FALLBACK.get(lift_type, [])
+        from anomaly_detection.red_buff_sensors import get_features_for_lift_type as rb_features
+        return rb_features(lift_type)
     
     def train_isolation_forest(self, data: np.ndarray, well_type: str) -> Optional[Dict[str, Any]]:
         """

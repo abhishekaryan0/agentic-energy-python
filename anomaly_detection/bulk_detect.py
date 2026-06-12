@@ -6,11 +6,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from anomaly_detection.detection_filters import should_skip_detection_row
 from anomaly_detection.detector import ML_ONLY_ANOMALY_THRESHOLD, get_detector
 from anomaly_detection.llm_suggestions import generate_suggestion, persist_suggestion_to_s3, calculate_severity
-from anomaly_detection.s3_history import write_anomaly_violations_history_to_s3, write_well_anomalies_history_to_s3
+from anomaly_detection.s3_history import (
+    load_recent_anomaly_suggestions_for_well,
+    write_anomaly_violations_history_to_s3,
+    write_well_anomalies_history_to_s3,
+)
 
 logger = logging.getLogger(__name__)
+
+_historical_suggestions_cache: Dict[str, List[Dict[str, Any]]] = {}
 
 
 def _get_bucket_and_org() -> Tuple[str, str]:
@@ -304,6 +311,21 @@ def _llm_suggestions_enabled() -> bool:
     return bool((os.getenv("OPENAI_API_KEY") or "").strip())
 
 
+def _historical_anomalies_for_well(well_id: str, organization_id: str) -> List[Dict[str, Any]]:
+    cache_key = f"{organization_id}:{well_id}"
+    if cache_key not in _historical_suggestions_cache:
+        try:
+            _historical_suggestions_cache[cache_key] = load_recent_anomaly_suggestions_for_well(
+                well_id=str(well_id),
+                organization_id=organization_id,
+                limit=10,
+            )
+        except Exception as e:
+            logger.warning("Could not load historical suggestions for well=%s: %s", well_id, e)
+            _historical_suggestions_cache[cache_key] = []
+    return _historical_suggestions_cache[cache_key]
+
+
 def _maybe_persist_llm_suggestion(
     *,
     anomaly_details: Dict[str, Any],
@@ -313,16 +335,20 @@ def _maybe_persist_llm_suggestion(
     lift_type: str,
     well_status: Any,
     organization_id: str,
-) -> bool:
+) -> Dict[str, Any]:
+    """Generate and persist LLM suggestion when enabled. Always call on flagged anomalies."""
     if not _llm_suggestions_enabled():
-        return False
+        return {"llm_suggestion": False, "llm_skipped_reason": "disabled"}
+    if not (os.getenv("OPENAI_API_KEY") or "").strip():
+        logger.warning("ANOMALY_ENABLE_LLM_SUGGESTIONS is on but OPENAI_API_KEY is missing")
+        return {"llm_suggestion": False, "llm_skipped_reason": "missing_openai_api_key"}
     try:
         suggestion_result = generate_suggestion(
             anomaly_details=anomaly_details,
             well_id=str(well_id),
             readings=current_readings,
             timestamp_str=timestamp_str,
-            historical_anomalies=None,
+            historical_anomalies=_historical_anomalies_for_well(str(well_id), organization_id),
             lift_type=lift_type,
         )
         persist_suggestion_to_s3(
@@ -335,7 +361,13 @@ def _maybe_persist_llm_suggestion(
             organization_id=organization_id,
             readings=current_readings,
         )
-        return True
+        return {
+            "llm_suggestion": True,
+            "alert_title": suggestion_result.get("alert_title"),
+            "severity": suggestion_result.get("severity"),
+            "confidence": suggestion_result.get("confidence"),
+            "description": suggestion_result.get("description"),
+        }
     except Exception as e:
         logger.warning(
             "Failed to generate/persist LLM suggestion well=%s ts=%s: %s",
@@ -343,7 +375,7 @@ def _maybe_persist_llm_suggestion(
             timestamp_str,
             e,
         )
-        return False
+        return {"llm_suggestion": False, "llm_error": str(e)}
 
 
 def _normalize_sensor_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -356,8 +388,12 @@ def _normalize_sensor_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _history_last_n() -> int:
-    raw = os.getenv("ANOMALY_INCREMENTAL_LAST_N", "15").strip()
-    return max(1, int(raw)) if raw.isdigit() else 15
+    seq_len = max(int(os.getenv("ANOMALY_LSTM_SEQ_LEN", "24") or 24), 24)
+    default_last_n = max(seq_len * 2, 48)
+    raw = os.getenv("ANOMALY_INCREMENTAL_LAST_N", str(default_last_n)).strip()
+    if raw.isdigit():
+        return max(seq_len, int(raw))
+    return default_last_n
 
 
 def _bootstrap_row_limit() -> int:
@@ -384,6 +420,10 @@ def _persist_anomaly_if_detected(
     lift_type = str(current_row.get("lift_type") or "").strip()
     if not lift_type:
         return {"well_id": str(well_id), "skipped": True, "reason": "missing lift_type"}, False, False
+
+    skip_reason = should_skip_detection_row(current_row, lift_type)
+    if skip_reason:
+        return {"well_id": str(well_id), "skipped": True, "reason": skip_reason}, False, False
 
     hist_rows: List[Dict[str, Any]] = []
     if full_df is not None:
@@ -473,7 +513,7 @@ def _persist_anomaly_if_detected(
     if violations_records:
         write_anomaly_violations_history_to_s3(violations_records)
 
-    llm_written = _maybe_persist_llm_suggestion(
+    llm_info = _maybe_persist_llm_suggestion(
         anomaly_details=anomaly_details,
         well_id=str(well_id),
         current_readings=current_readings,
@@ -484,7 +524,8 @@ def _persist_anomaly_if_detected(
     )
 
     detail["severity"] = calculated_severity
-    return detail, True, llm_written
+    detail.update(llm_info)
+    return detail, True, bool(llm_info.get("llm_suggestion"))
 
 
 def _run_rows_detection_loop(
@@ -565,7 +606,7 @@ def _run_well_detection_loop(
     org: str,
     *,
     max_wells: Optional[int] = None,
-    last_n: int = 15,
+    last_n: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Backward-compatible: one latest row per well in df."""
     per_well = []
@@ -610,6 +651,7 @@ def run_recent_rows_anomaly_detection(
         "llm_suggestions_enabled": _llm_suggestions_enabled(),
         "wells_processed": outcome["wells_processed"],
         "anomalies": outcome["anomalies"],
+        "llm_suggestions_written": outcome.get("llm_suggestions_written", 0),
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "last_rows": int(last_rows),
         "slice_rows": len(slice_df),
@@ -834,7 +876,7 @@ def run_incremental_anomaly_detection(
 
 def run_bulk_anomaly_detection(
     *,
-    last_n: int = 15,
+    last_n: Optional[int] = None,
     per_well: bool = True,
     max_wells: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -848,6 +890,8 @@ def run_bulk_anomaly_detection(
         - detections/anomaly_detection/history/anomaly_violations_*.parquet
         - detections/anomaly_detection/anomaly_suggestions_*.parquet (OpenAI)
     """
+    if last_n is None:
+        last_n = _history_last_n()
     if last_n < 1:
         raise ValueError("last_n must be >= 1")
 
@@ -869,6 +913,7 @@ def run_bulk_anomaly_detection(
     detector = get_detector()
 
     anomalies_written = 0
+    llm_suggestions_written = 0
     wells_processed = 0
     details: List[Dict[str, Any]] = []
 
@@ -895,11 +940,24 @@ def run_bulk_anomaly_detection(
         if not lift_type:
             continue
 
+        ts: datetime = current["timestamp"]
+        timestamp_str = pd.to_datetime(ts, utc=True).isoformat()
+
+        skip_reason = should_skip_detection_row(current, lift_type)
+        if skip_reason:
+            details.append(
+                {
+                    "well_id": str(well_id),
+                    "timestamp": timestamp_str,
+                    "lift_type": lift_type,
+                    "skipped": True,
+                    "reason": skip_reason,
+                }
+            )
+            continue
+
         current_readings = _extract_reading_dict(current)
         historical_data = [_extract_reading_dict(r) for r in historical_rows]
-
-        ts: datetime = current["timestamp"]
-        timestamp_str = ts.isoformat()
         well_status = current.get("well_status")
 
         anomaly_details = detector.check_anomaly(
@@ -981,7 +1039,7 @@ def run_bulk_anomaly_detection(
         if violations_records:
             write_anomaly_violations_history_to_s3(violations_records)
 
-        _maybe_persist_llm_suggestion(
+        llm_info = _maybe_persist_llm_suggestion(
             anomaly_details=anomaly_details,
             well_id=str(well_id),
             current_readings=current_readings,
@@ -990,6 +1048,8 @@ def run_bulk_anomaly_detection(
             well_status=well_status,
             organization_id=org,
         )
+        if llm_info.get("llm_suggestion"):
+            llm_suggestions_written += 1
 
         anomalies_written += 1
         details.append(
@@ -1000,6 +1060,7 @@ def run_bulk_anomaly_detection(
                 "anomaly": True,
                 "score": anomaly_details.get("anomaly_score", 0),
                 "severity": calculated_severity,
+                **llm_info,
             }
         )
 
@@ -1009,6 +1070,7 @@ def run_bulk_anomaly_detection(
         "llm_suggestions_enabled": _llm_suggestions_enabled(),
         "wells_processed": wells_processed,
         "anomalies": anomalies_written,
+        "llm_suggestions_written": llm_suggestions_written,
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "last_n": last_n,
         "details": details,

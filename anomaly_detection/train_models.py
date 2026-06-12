@@ -84,12 +84,20 @@ except ImportError:
     WELL_TYPES = ['Rod Pump', 'ESP', 'Gas Lift']
     get_features_for_lift_type = None
 
-WELL_TYPE_FEATURES_FALLBACK = {
-    'Rod Pump': ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure'],
-    'Pumping Unit': ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure'],
-    'ESP': ['motor_temp', 'motor_current', 'discharge_pressure', 'pump_intake_pressure', 'motor_voltage'],
-    'Gas Lift': ['injection_rate', 'injection_temperature', 'bottomhole_pressure', 'injection_pressure', 'cycle_time'],
-}
+from anomaly_detection.red_buff_sensors import features_fallback_dict
+from anomaly_detection.training_data import MIN_TRAINING_ROWS, filter_healthy_training_rows
+from anomaly_detection.ml_models import (
+    ISO_CONTAMINATION,
+    ISO_N_ESTIMATORS,
+    build_robust_stats,
+    fit_pyod_ensemble,
+    mad_z_scores,
+    pyod_anomaly_scores,
+    pyod_available,
+)
+
+WELL_TYPE_FEATURES_FALLBACK = features_fallback_dict()
+LSTM_HIDDEN_DIM = int(os.getenv("ANOMALY_LSTM_HIDDEN_DIM", "128") or 128)
 
 # LSTMAutoencoder imported from anomaly_detector
 
@@ -103,6 +111,7 @@ ANOMALY_DETECTION_MODELS_DIR = os.path.join(MODELS_DIR, ANOMALY_DETECTION_SUBDIR
 WELLS_SUBDIR = 'wells'
 # Fixed filenames inside each well folder (and well_types folder)
 ISO_FILENAME = 'isolation_forest.joblib'
+PYOD_FILENAME = 'pyod_ensemble.joblib'
 STAT_FILENAME = 'statistical_model.joblib'
 LSTM_PT_FILENAME = 'lstm_autoencoder.pt'
 LSTM_SCALER_FILENAME = 'lstm_scaler.joblib'
@@ -193,29 +202,28 @@ def prepare_data_for_training(df, well_type):
     Returns:
         X_train, X_test, y_train, y_test, scaler, available_features or None
     """
-    from anomaly_detection.detector import normalize_lift_type_for_models
+    from anomaly_detection.red_buff_sensors import select_training_features
 
-    feature_lift_type = normalize_lift_type_for_models(well_type)
-    logger.info(f"Preparing data for {well_type} training (features from {feature_lift_type})...")
-
+    logger.info(f"Preparing data for {well_type} (all lift-type sensors with data)...")
     logger.info(f"Records for {well_type}: {len(df)}")
 
-    # Get features from sensor_definitions (DB) or fallback
-    if get_features_for_lift_type:
-        try:
-            features = get_features_for_lift_type(feature_lift_type)
-        except Exception:
-            features = WELL_TYPE_FEATURES_FALLBACK.get(feature_lift_type, [])
-    else:
-        features = WELL_TYPE_FEATURES_FALLBACK.get(
-            feature_lift_type, WELL_TYPE_FEATURES_FALLBACK.get(well_type, [])
-        )
-    available_features = [f for f in features if f in df.columns]
+    available_features = select_training_features(df, well_type)
     if not available_features:
-        logger.warning(f"No matching feature columns in data for {well_type}. DataFrame columns: {list(df.columns)[:15]}...")
+        expected = (
+            get_features_for_lift_type(well_type)
+            if get_features_for_lift_type
+            else WELL_TYPE_FEATURES_FALLBACK.get(well_type, [])
+        )
+        logger.warning(
+            "No usable sensor columns for %s. Expected profile fields: %s. "
+            "DataFrame columns: %s",
+            well_type,
+            expected,
+            list(df.columns)[:20],
+        )
         return None
-    
-    logger.info(f"Using features: {available_features}")
+
+    logger.info(f"Using all lift sensors with data ({len(available_features)}): {available_features}")
     
     df = df[available_features].copy()
     # Handle missing values: ffill/bfill, then fill remaining with column median
@@ -242,8 +250,12 @@ def prepare_data_for_training(df, well_type):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Detect outliers using Isolation Forest (used for synthetic labels)
-    iso_forest = IsolationForest(contamination=CONTAMINATION_RATIO, random_state=42)
+    iso_forest = IsolationForest(
+        contamination=ISO_CONTAMINATION,
+        random_state=42,
+        n_estimators=ISO_N_ESTIMATORS,
+        n_jobs=-1,
+    )
     y_synthetic = iso_forest.fit_predict(X_scaled)
     y_synthetic = (y_synthetic == -1).astype(int)  # Convert to binary (0=normal, 1=anomaly)
     
@@ -305,10 +317,10 @@ def train_isolation_forest(X_train, X_test, y_test, well_type, scaler):
     
     # Train Isolation Forest
     model = IsolationForest(
-        contamination=CONTAMINATION_RATIO,
+        contamination=ISO_CONTAMINATION,
         random_state=42,
-        n_estimators=100,
-        n_jobs=-1
+        n_estimators=ISO_N_ESTIMATORS,
+        n_jobs=-1,
     )
     model.fit(X_train_scaled)
     
@@ -343,19 +355,10 @@ def train_statistical_model(X_train, X_test, y_test, well_type, features):
     Returns:
         Statistical model and metrics
     """
-    logger.info(f"Training Statistical Model for {well_type}...")
-    
-    # Calculate statistics from training data
-    stats = {
-        'mean': np.mean(X_train, axis=0),
-        'std': np.std(X_train, axis=0),
-        'min': np.min(X_train, axis=0),
-        'max': np.max(X_train, axis=0),
-        'features': features
-    }
-    
-    # Detect anomalies: values beyond 3 standard deviations
-    z_scores = np.abs((X_test - stats['mean']) / (stats['std'] + 1e-8))
+    logger.info(f"Training robust statistical model (MAD) for {well_type}...")
+
+    stats = build_robust_stats(X_train, features)
+    z_scores = mad_z_scores(X_test, stats)
     y_pred_test = (z_scores.max(axis=1) > 3).astype(int)
     
     # Calculate metrics
@@ -403,7 +406,7 @@ def train_lstm_autoencoder(X_train, X_test, well_type, features):
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     input_dim = X_train_scaled.shape[1]
-    model = LSTMAutoencoder(input_dim=input_dim, hidden_dim=64)
+    model = LSTMAutoencoder(input_dim=input_dim, hidden_dim=LSTM_HIDDEN_DIM)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LSTM_LR)
 
@@ -436,6 +439,34 @@ def train_lstm_autoencoder(X_train, X_test, well_type, features):
     }
     logger.info(f"LSTM Autoencoder ({well_type}) - Test MSE: {test_loss:.4f}")
     return {"model": model, "scaler": scaler, "seq_len": SEQ_LEN}, metrics
+
+
+def train_pyod_models(X_train, X_test, y_test, well_type, scaler, features):
+    """Train ECOD + COPOD ensemble (PyOD)."""
+    logger.info(f"Training PyOD ensemble (ECOD+COPOD) for {well_type}...")
+    if not pyod_available():
+        return None, {"skipped": True, "reason": "pyod not installed"}
+
+    X_train_scaled = scaler.transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    bundle = fit_pyod_ensemble(X_train_scaled)
+    if bundle is None:
+        return None, {"skipped": True}
+
+    bundle["scaler"] = scaler
+    bundle["features"] = features
+    scores_test = pyod_anomaly_scores(X_test_scaled, bundle)
+    threshold = float(np.quantile(scores_test, 1.0 - ISO_CONTAMINATION))
+    y_pred_test = (scores_test >= threshold).astype(int)
+    metrics = calculate_metrics(y_test, y_pred_test, scores_test)
+    logger.info(
+        "PyOD (%s) - Precision: %.3f, Recall: %.3f, F1: %.3f",
+        well_type,
+        metrics["precision"],
+        metrics["recall"],
+        metrics["f1"],
+    )
+    return bundle, metrics
 
 
 def save_model(model, filepath):
@@ -536,10 +567,33 @@ def train_all_models_from_dataframe(full_df, output_dir, per_well_limit=None):
         safe_id = well_id_to_safe(well_id)
         label = f"well {well_id} ({lift_type})"
 
-        logger.info(f"\n{'='*60}\nTraining models for {label}\n{'='*60}")
+        healthy_df, filter_stats = filter_healthy_training_rows(
+            well_df, lift_type, well_id=str(well_id)
+        )
+        logger.info(
+            "\n%s\nTraining models for %s\nHealthy filter: %s -> %s rows (stats=%s)\n%s",
+            "=" * 60,
+            label,
+            filter_stats.get("input_rows"),
+            filter_stats.get("output_rows"),
+            filter_stats,
+            "=" * 60,
+        )
+        if len(healthy_df) < MIN_TRAINING_ROWS:
+            logger.warning(
+                "Skipping %s: only %s healthy PRODUCING rows (min %s)",
+                label,
+                len(healthy_df),
+                MIN_TRAINING_ROWS,
+            )
+            all_metrics[label] = {
+                "error": f"insufficient healthy rows ({len(healthy_df)} < {MIN_TRAINING_ROWS})",
+                "filter_stats": filter_stats,
+            }
+            continue
 
         try:
-            prepared = prepare_data_for_training(well_df, lift_type)
+            prepared = prepare_data_for_training(healthy_df, lift_type)
             if prepared is None:
                 all_metrics[label] = {"error": "No training data available"}
                 continue
@@ -551,9 +605,22 @@ def train_all_models_from_dataframe(full_df, output_dir, per_well_limit=None):
             stat_model, stat_metrics = train_statistical_model(
                 X_train, X_test, y_test, label, features
             )
-            lstm_model, lstm_metrics = train_lstm_autoencoder(
-                X_train, X_test, label, features
+            pyod_bundle, pyod_metrics = train_pyod_models(
+                X_train, X_test, y_test, label, scaler_iso, features
             )
+
+            lstm_model, lstm_metrics = None, {"skipped": True}
+            if len(X_train) > SEQ_LEN + 5:
+                lstm_model, lstm_metrics = train_lstm_autoencoder(
+                    X_train, X_test, label, features
+                )
+            else:
+                logger.warning(
+                    "%s: skipping LSTM (need >%s rows, got %s)",
+                    label,
+                    SEQ_LEN + 5,
+                    len(X_train),
+                )
 
             well_dir = get_well_model_dir(safe_id, base_dir=output_dir)
             os.makedirs(well_dir, exist_ok=True)
@@ -562,22 +629,29 @@ def train_all_models_from_dataframe(full_df, output_dir, per_well_limit=None):
                 os.path.join(well_dir, ISO_FILENAME),
             )
             save_model(stat_model, os.path.join(well_dir, STAT_FILENAME))
-            torch.save(lstm_model["model"].state_dict(), os.path.join(well_dir, LSTM_PT_FILENAME))
-            joblib.dump(lstm_model["scaler"], os.path.join(well_dir, LSTM_SCALER_FILENAME))
-            meta = {
-                "input_dim": lstm_model["model"].input_dim,
-                "features": features,
-                "seq_len": SEQ_LEN,
-            }
-            joblib.dump(meta, os.path.join(well_dir, LSTM_META_FILENAME))
+            if pyod_bundle is not None:
+                save_model(pyod_bundle, os.path.join(well_dir, PYOD_FILENAME))
+            if lstm_model is not None:
+                torch.save(lstm_model["model"].state_dict(), os.path.join(well_dir, LSTM_PT_FILENAME))
+                joblib.dump(lstm_model["scaler"], os.path.join(well_dir, LSTM_SCALER_FILENAME))
+                meta = {
+                    "input_dim": lstm_model["model"].input_dim,
+                    "features": features,
+                    "seq_len": SEQ_LEN,
+                    "hidden_dim": LSTM_HIDDEN_DIM,
+                }
+                joblib.dump(meta, os.path.join(well_dir, LSTM_META_FILENAME))
 
             all_metrics[label] = {
                 "isolation_forest": iso_metrics,
+                "pyod": pyod_metrics,
                 "statistical": stat_metrics,
                 "lstm": lstm_metrics,
                 "training_samples": len(X_train),
                 "test_samples": len(X_test),
                 "features": features,
+                "filter_stats": filter_stats,
+                "seq_len": SEQ_LEN,
                 "well_id": str(well_id),
                 "lift_type": str(lift_type),
                 "timestamp": datetime.now().isoformat(),
@@ -631,6 +705,8 @@ def _upload_anomaly_models_to_s3(bucket: str) -> bool:
     if not os.path.isfile(script):
         logger.error("Pack script not found: %s", script)
         return False
+    org = (os.environ.get("ORGANIZATION_ID") or "").strip()
+    job = (os.environ.get("TRAINING_JOB_NAME") or os.environ.get("ANOMALY_MODEL_TRAINING_JOB") or "").strip()
     cmd = [
         sys.executable,
         script,
@@ -638,6 +714,10 @@ def _upload_anomaly_models_to_s3(bucket: str) -> bool:
         "--prefix", prefix,
         "--version", version,
     ]
+    if org:
+        cmd.extend(["--org-id", org])
+    if job:
+        cmd.extend(["--job-name", job])
     logger.info("Uploading anomaly detection models to S3: %s (prefix=%s, version=%s)", bucket, prefix, version)
     try:
         r = subprocess.run(cmd, cwd=project_root)

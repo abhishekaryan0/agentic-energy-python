@@ -1,6 +1,10 @@
 # Anomaly detection
 
-Incremental and bulk sensor anomaly scoring (rules + isolation forest + LSTM), with optional LLM suggestions. Writes detection history parquet to S3.
+Incremental and bulk sensor anomaly scoring (Red Bluff bands + Isolation Forest + PyOD ECOD/COPOD + MAD + LSTM), with optional LLM suggestions. Writes detection history parquet to S3.
+
+Training filters **PRODUCING** rows, drops all-zero shut-in sensors, and excludes the latest 15% of history by default (`ANOMALY_TRAIN_EXCLUDE_RECENT_PCT`). LSTM `seq_len` defaults to **24** hours; incremental detection history window defaults to **48** rows (`ANOMALY_INCREMENTAL_LAST_N`).
+
+SHUT-IN / all-zero sensor rows are skipped at detection time. Detector output includes sub-scores: `band_score`, `iso_score`, `pyod_score`, `mad_score`, `lstm_score`.
 
 ## Run locally
 
@@ -8,11 +12,17 @@ Incremental and bulk sensor anomaly scoring (rules + isolation forest + LSTM), w
 # Incremental (default): new rows since checkpoint
 python -m anomaly_detection.run
 
+# Last N sensor rows (runs LLM on each flagged anomaly when OPENAI_API_KEY is set)
+ANOMALY_DETECTION_MODE=recent ANOMALY_LAST_ROWS=100 python -m anomaly_detection.run
+
 # Bulk backfill
 ANOMALY_DETECTION_MODE=bulk python -m anomaly_detection.run
 
 # Train models from local/S3 parquet
 python -m anomaly_detection.train_models
+
+# Red Bluff SHUT-IN lead-time validation (scores in 14–120 days before failure)
+python -m anomaly_detection.validate_red_buff
 ```
 
 ## Deploy (`anomaly_detection/deploy/`)

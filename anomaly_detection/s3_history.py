@@ -114,7 +114,8 @@ def _json_dumps_safe(value: Any) -> Optional[str]:
         return str(value)
 
 
-def _to_float_or_none(value: Any) -> Optional[float]:
+def _parse_numeric_value(value: Any) -> Optional[float]:
+    """Parse a numeric sensor value; accepts comma-formatted strings from legacy storage."""
     if value is None:
         return None
     try:
@@ -122,10 +123,46 @@ def _to_float_or_none(value: Any) -> Optional[float]:
             return None
     except Exception:
         pass
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").strip()
+        if not cleaned:
+            return None
+        value = cleaned
     try:
         return float(value)
     except Exception:
         return None
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    return _parse_numeric_value(value)
+
+
+def normalize_violation_record(v: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Canonical violation shape for storage and UI consumption.
+
+    Keeps numeric value/min/max (no comma strings) and adds observed / expected_min /
+    expected_max aliases matching anomaly_violations columns.
+    """
+    value = _parse_numeric_value(v.get("observed", v.get("value")))
+    min_val = _parse_numeric_value(v.get("expected_min", v.get("min")))
+    max_val = _parse_numeric_value(v.get("expected_max", v.get("max")))
+    deviation = _parse_numeric_value(v.get("deviation_pct", v.get("deviation_percent")))
+
+    return {
+        "field": _to_str_or_none(v.get("field") or v.get("parameter_name")) or "",
+        "value": value,
+        "min": min_val,
+        "max": max_val,
+        "observed": value,
+        "expected_min": min_val,
+        "expected_max": max_val,
+        "unit": _to_str_or_none(v.get("unit")) or "",
+        "deviation_pct": deviation,
+        "deviation_percent": deviation,
+        "violation": _to_str_or_none(v.get("violation")) or "",
+    }
 
 
 def _coerce_string_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
@@ -356,17 +393,7 @@ def _normalize_raw_anomaly_data(value: Any) -> Dict[str, Any]:
         for v in violations:
             if not isinstance(v, dict):
                 continue
-            normalized_violations.append(
-                {
-                    "field": _to_str_or_none(v.get("field")),
-                    "value": v.get("value"),
-                    "min": v.get("min"),
-                    "max": v.get("max"),
-                    "unit": _to_str_or_none(v.get("unit")),
-                    "deviation_pct": v.get("deviation_pct"),
-                    "violation": _to_str_or_none(v.get("violation")),
-                }
-            )
+            normalized_violations.append(normalize_violation_record(v))
         out["violations"] = normalized_violations
     return out
 
@@ -574,6 +601,76 @@ def append_well_sensor_reading_to_s3(record: Dict[str, Any]) -> Optional[str]:
     except Exception as e:
         logger.warning("Failed to append reading to well_sensor_readings.parquet in S3: %s", e)
         return None
+
+
+def load_recent_anomaly_suggestions_for_well(
+    well_id: str,
+    *,
+    limit: int = 10,
+    organization_id: Optional[str] = None,
+    bucket: Optional[str] = None,
+    max_files: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    Load recent LLM anomaly suggestions for a well from S3 parquet history.
+
+    Scans detections/anomaly_detection/anomaly_suggestions_run_ts=*.parquet (newest files first).
+    """
+    if limit < 1:
+        return []
+
+    bucket_org = _get_bucket_and_org()
+    if bucket and organization_id:
+        bucket_name, org = bucket, organization_id
+    elif bucket_org:
+        bucket_name, org = bucket_org
+    else:
+        return []
+
+    import boto3
+
+    prefix = f"{org}/detections/anomaly_detection/anomaly_suggestions_run_ts="
+    s3 = boto3.client("s3")
+    keys: List[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents") or []:
+            key = obj.get("Key")
+            if key and key.endswith(".parquet"):
+                keys.append(key)
+
+    if not keys:
+        return []
+
+    keys.sort(reverse=True)
+    keys = keys[: max(1, int(max_files))]
+
+    well_id_str = str(well_id)
+    matches: List[Dict[str, Any]] = []
+    for key in keys:
+        try:
+            obj = s3.get_object(Bucket=bucket_name, Key=key)
+            part = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        except Exception as e:
+            logger.warning("Could not read suggestion parquet s3://%s/%s: %s", bucket_name, key, e)
+            continue
+
+        if part.empty or "well_id" not in part.columns:
+            continue
+
+        subset = part[part["well_id"].astype(str) == well_id_str]
+        for rec in subset.to_dict(orient="records"):
+            matches.append(rec)
+            if len(matches) >= limit:
+                break
+        if len(matches) >= limit:
+            break
+
+    def _ts_key(rec: Dict[str, Any]) -> str:
+        return str(rec.get("timestamp") or rec.get("created_at") or "")
+
+    matches.sort(key=_ts_key, reverse=True)
+    return matches[:limit]
 
 
 def write_anomaly_suggestions_history_to_s3(records: List[Dict[str, Any]]) -> Optional[str]:

@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 
 from anomaly_detection.bulk_detect import run_bulk_anomaly_detection
 from anomaly_detection.bulk_detect import run_incremental_anomaly_detection
+from anomaly_detection.bulk_detect import run_recent_rows_anomaly_detection
 
 
 def main() -> None:
@@ -23,8 +24,12 @@ def main() -> None:
     max_wells_int = int(max_wells) if max_wells else None
 
     if mode == "bulk":
-        last_n = int(os.getenv("ANOMALY_BULK_LAST_N", "15"))
+        bulk_default = str(max(int(os.getenv("ANOMALY_LSTM_SEQ_LEN", "24") or 24) * 2, 48))
+        last_n = int(os.getenv("ANOMALY_BULK_LAST_N", bulk_default))
         result = run_bulk_anomaly_detection(last_n=last_n, per_well=True, max_wells=max_wells_int)
+    elif mode == "recent":
+        last_rows = int(os.getenv("ANOMALY_LAST_ROWS", "100"))
+        result = run_recent_rows_anomaly_detection(last_rows=last_rows, max_wells=max_wells_int)
     else:
         window_minutes = int(os.getenv("ANOMALY_WINDOW_MINUTES", "15"))
         safety_lag = int(os.getenv("ANOMALY_SAFETY_LAG_SECONDS", "90"))

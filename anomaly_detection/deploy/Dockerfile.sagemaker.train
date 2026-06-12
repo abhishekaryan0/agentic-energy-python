@@ -9,7 +9,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir \
     pandas pyarrow boto3 \
-    scikit-learn joblib numpy torch
+    scikit-learn joblib numpy pyod torch
 
 COPY anomaly_detection ./anomaly_detection
 
