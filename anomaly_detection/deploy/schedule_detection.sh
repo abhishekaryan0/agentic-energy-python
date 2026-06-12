@@ -19,7 +19,7 @@ EXECUTION_ROLE_NAME="ecs-anomaly-detection-execution-role"
 TASK_ROLE_NAME="ecs-anomaly-detection-task-role"
 ECR_REPO_NAME="${ECR_REPO_ANOMALY_DETECTION:-anomaly-detection-fargate}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
-SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 1 * * ? *)}"
+SCHEDULE_CRON="${SCHEDULE_CRON:-cron(30 0 * * ? *)}"
 ANOMALY_DETECTION_FORCE_WINDOW="${ANOMALY_DETECTION_FORCE_WINDOW:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -156,8 +156,14 @@ aws events put-rule --name "$RULE_NAME" --schedule-expression "$SCHEDULE_CRON" -
 
 for LEGACY_RULE in anomaly-detection-every-15min; do
   if aws events describe-rule --name "$LEGACY_RULE" --region "$REGION" &>/dev/null; then
-    aws events disable-rule --name "$LEGACY_RULE" --region "$REGION"
-    echo "Disabled legacy rule: $LEGACY_RULE"
+    LEGACY_IDS=$(aws events list-targets-by-rule --rule "$LEGACY_RULE" --region "$REGION" \
+      --query 'Targets[*].Id' --output text 2>/dev/null | tr '\t' ' ')
+    if [[ -n "$LEGACY_IDS" ]]; then
+      # shellcheck disable=SC2086
+      aws events remove-targets --rule "$LEGACY_RULE" --ids $LEGACY_IDS --region "$REGION" >/dev/null
+    fi
+    aws events delete-rule --name "$LEGACY_RULE" --region "$REGION"
+    echo "Deleted legacy rule: $LEGACY_RULE"
   fi
 done
 

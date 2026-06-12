@@ -27,7 +27,7 @@ python -m s3_to_postgres.run --sync-mode incremental --table all
 ## Deploy (Lambda + EventBridge)
 
 ```bash
-# Deploy Lambda + daily schedule (02:00 UTC)
+# Deploy Lambda + daily schedule (01:00 UTC)
 ./s3_to_postgres/deploy/schedule.sh
 
 # Lambda only

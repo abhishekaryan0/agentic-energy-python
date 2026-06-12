@@ -44,13 +44,17 @@ def snowflake_config() -> Dict[str, Any]:
     }
 
 
+def _clean_connect_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in kwargs.items() if v is not None and v != ""}
+
+
 def build_connect_kwargs(
     cfg: Optional[Dict[str, Any]] = None,
     *,
     mode: str = "auto",
 ) -> Dict[str, Any]:
     """
-    Build Snowflake connector kwargs.
+    Build Snowflake connector kwargs (same PAT/password rules as transformations).
 
     mode:
       auto — SNOWFLAKE_TOKEN (PAT) if set, else password (+ optional passcode)
@@ -70,35 +74,39 @@ def build_connect_kwargs(
         "schema": cfg.get("schema"),
         "role": cfg["role"],
     }
+    network_policy = (os.getenv("SNOWFLAKE_NETWORK_POLICY") or "").strip()
+    if network_policy:
+        kwargs["network_policy"] = network_policy
 
     token = (cfg.get("token") or "").strip()
     authenticator = (cfg.get("authenticator") or "").strip()
     passcode = (cfg.get("passcode") or "").strip()
-    password = cfg.get("password")
+    password = (cfg.get("password") or "").strip() or None
     use_password = mode == "password" or (
-        mode == "auto" and os.getenv("SNOWFLAKE_USE_PASSWORD", "").strip() in ("1", "true", "yes")
+        mode == "auto"
+        and os.getenv("SNOWFLAKE_USE_PASSWORD", "").strip().lower() in ("1", "true", "yes")
     )
 
-    if token and mode == "token" or (token and mode == "auto" and not use_password):
-        kwargs["authenticator"] = authenticator or "PROGRAMMATIC_ACCESS_TOKEN"
-        kwargs["token"] = token
-        return kwargs
+    if token and mode in ("auto", "token") and not use_password:
+        # Snowflake PAT: pass token as password (default authenticator).
+        kwargs["password"] = token
+        return _clean_connect_kwargs(kwargs)
 
-    if authenticator and mode != "password":
+    if authenticator and not use_password and mode != "password":
         kwargs["authenticator"] = authenticator
         if password:
             kwargs["password"] = password
-        return kwargs
+        return _clean_connect_kwargs(kwargs)
 
     if not password:
         raise ValueError(
-            "Set SNOWFLAKE_PASSWORD, or a valid SNOWFLAKE_TOKEN (PAT), "
-            "or SNOWFLAKE_AUTHENTICATOR=externalbrowser"
+            "Snowflake auth: set SNOWFLAKE_TOKEN (PAT), or SNOWFLAKE_PASSWORD "
+            "(use SNOWFLAKE_USE_PASSWORD=1 to force password when a token is also set)."
         )
     kwargs["password"] = password
     if passcode:
         kwargs["passcode"] = passcode
-    return kwargs
+    return _clean_connect_kwargs(kwargs)
 
 
 def connect():
@@ -120,8 +128,14 @@ def connect():
         )
 
     cfg = snowflake_config()
+    kwargs = dict(build_connect_kwargs(cfg, mode="auto"))
+    raw = (os.getenv("SNOWFLAKE_SOCKET_TIMEOUT") or "600").strip()
     try:
-        return snowflake_connect(**build_connect_kwargs(cfg, mode="auto"))
+        kwargs["socket_timeout"] = int(raw)
+    except ValueError:
+        kwargs["socket_timeout"] = 600
+    try:
+        return snowflake_connect(**kwargs)
     except DatabaseError as exc:
         err = str(exc).lower()
         if "mfa" in err or "totp" in err:

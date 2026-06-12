@@ -70,4 +70,4 @@ aws events put-targets --rule "$RULE_NAME" --targets "$TARGET_JSON" --region "$L
 echo "Schedule: $SCHEDULE_CRON (rule: $RULE_NAME) -> Lambda $LAMBDA_FUNCTION_NAME"
 echo "Logs: /aws/lambda/$LAMBDA_FUNCTION_NAME"
 echo ""
-echo "Tip: run transformations export after this (e.g. cron(0 1 * * ? *)) so S3 gets new Snowflake rows."
+echo "Tip: run transformations export after this (e.g. cron(15 0 * * ? *)) so S3 gets new Snowflake rows."

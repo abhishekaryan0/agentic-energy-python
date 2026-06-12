@@ -113,7 +113,7 @@ python -m transformations.run --mode full
 ./transformations/deploy/schedule.sh
 ```
 
-- EventBridge rule: `transformations-daily` (`cron(0 0 * * ? *)` — daily at 00:00 UTC)
+- EventBridge rule: `transformations-daily` (`cron(15 0 * * ? *)` — daily at 00:15 UTC)
 - Lambda: `transformations`
 - Logs: `/aws/lambda/transformations`
 - Writes new data only under `date=YYYY-MM-DD/` folders (no root snapshot files); updates checkpoint

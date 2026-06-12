@@ -86,6 +86,7 @@ ENV_JSON_FILE="$(mktemp)"
 export ENV_JSON_FILE ORGANIZATION_ID LAMBDA_REGION LOG_LEVEL
 export SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_TOKEN SNOWFLAKE_ACCOUNT
 export SNOWFLAKE_WAREHOUSE SNOWFLAKE_DATABASE SNOWFLAKE_SCHEMA SNOWFLAKE_ROLE
+export SNOWFLAKE_NETWORK_POLICY="${SNOWFLAKE_NETWORK_POLICY:-}"
 python3 - <<'PY'
 import json
 import os
@@ -93,6 +94,7 @@ import os
 variables = {
     "ORGANIZATION_ID": os.environ["ORGANIZATION_ID"],
     "LOG_LEVEL": os.environ["LOG_LEVEL"],
+    "SNOWFLAKE_SOCKET_TIMEOUT": os.environ.get("SNOWFLAKE_SOCKET_TIMEOUT", "600"),
     "SNOWFLAKE_USER": os.environ["SNOWFLAKE_USER"],
     "SNOWFLAKE_ACCOUNT": os.environ["SNOWFLAKE_ACCOUNT"],
     "SNOWFLAKE_WAREHOUSE": os.environ["SNOWFLAKE_WAREHOUSE"],
@@ -111,6 +113,10 @@ elif password:
     variables["SNOWFLAKE_PASSWORD"] = password
 elif token:
     variables["SNOWFLAKE_TOKEN"] = token
+for key in ("SNOWFLAKE_NETWORK_POLICY",):
+    val = os.environ.get(key, "").strip()
+    if val:
+        variables[key] = val
 
 with open(os.environ["ENV_JSON_FILE"], "w", encoding="utf-8") as fh:
     json.dump({"Variables": variables}, fh)

@@ -2,7 +2,7 @@
 #
 # Schedule S3 -> PostgreSQL sync via EventBridge -> Lambda.
 #
-# Default: every 24 hours at 02:00 UTC (after anomaly detection at 01:00 UTC).
+# Default: every 24 hours at 01:00 UTC (after anomaly detection at 00:30 UTC).
 # SCHEDULE_CRON="rate(24 hours)"  # alternative: every 24h from rule creation
 #
 # Usage (from repo root):
@@ -14,7 +14,7 @@
 #   ./s3_to_postgres/deploy/schedule.sh
 #
 # Optional:
-#   SCHEDULE_CRON="cron(0 2 * * ? *)"
+#   SCHEDULE_CRON="cron(0 1 * * ? *)"
 #   LAMBDA_REGION=us-east-1
 #   LAMBDA_FUNCTION_NAME=s3-to-postgres-sync
 #   RULE_NAME=s3-to-postgres-anomaly-suggestions-daily
@@ -45,7 +45,7 @@ fi
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-s3-to-postgres-sync}"
 RULE_NAME="${RULE_NAME:-s3-to-postgres-sync-daily}"
-SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 2 * * ? *)}"
+SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 1 * * ? *)}"
 ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
 

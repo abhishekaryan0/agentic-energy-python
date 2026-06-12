@@ -23,7 +23,10 @@ def main() -> int:
     print(f"  passcode set: {bool((cfg.get('passcode') or '').strip())}")
 
     kw = build_connect_kwargs(cfg, mode="auto")
-    print(f"\nAuth mode: {kw.get('authenticator', 'password')}")
+    if (cfg.get("token") or "").strip() and not (cfg.get("password") or "").strip():
+        print("\nAuth mode: SNOWFLAKE_TOKEN (PAT as password)")
+    else:
+        print(f"\nAuth mode: {kw.get('authenticator', 'password')}")
 
     try:
         conn = connect()
