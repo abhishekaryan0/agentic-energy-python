@@ -8,6 +8,8 @@ Incremental sync of detection parquet from S3 into PostgreSQL (schema = `ORGANIZ
 - `anomaly_violations` — from `detections/anomaly_detection/`
 - `anomaly_reviews` — from `detections/anomaly_review/`
 - `operation_recommendations` — from `detections/operations/`
+- `daily_production` — from `sensor_data/daily_production/date=YYYY-MM-DD/` (upsert; keeps last 2 years only)
+- `monthly_production` — monthly totals from `daily_production` (same 2-year retention)
 
 ## Required env
 
@@ -22,6 +24,7 @@ AWS_REGION=us-east-1
 
 ```bash
 python -m s3_to_postgres.run --sync-mode incremental --table all
+python -m s3_to_postgres.run --sync-mode backfill --table daily_production --backfill-years 2
 ```
 
 ## Deploy (Lambda + EventBridge)

@@ -149,6 +149,64 @@ REVIEW_TIMESTAMP_COLUMNS = frozenset(
 )
 OPS_TIMESTAMP_COLUMNS = frozenset({"created_at", "updated_at", "mute_till", "open_up"})
 
+POSTGRES_DAILY_PRODUCTION_COLUMNS: Sequence[str] = (
+    "organization_id",
+    "well_id",
+    "date",
+    "oil_volume",
+    "gas_volume",
+    "water_volume",
+    "boe",
+    "lift_type",
+    "status",
+    "notes",
+    "test_oil",
+    "test_water",
+    "test_gas",
+    "facility_id",
+)
+
+POSTGRES_DAILY_PRODUCTION_CONFLICT_COLUMNS: Sequence[str] = ("well_id", "date")
+
+POSTGRES_MONTHLY_PRODUCTION_COLUMNS: Sequence[str] = (
+    "organization_id",
+    "well_id",
+    "month",
+    "oil_volume",
+    "gas_volume",
+    "water_volume",
+    "boe",
+    "production_days",
+    "oil_rate",
+    "gas_rate",
+    "water_rate",
+    "boe_rate",
+    "lift_type",
+    "status",
+    "facility_id",
+)
+
+POSTGRES_MONTHLY_PRODUCTION_CONFLICT_COLUMNS: Sequence[str] = ("well_id", "month")
+
+PRODUCTION_FLOAT_COLUMNS = frozenset(
+    {
+        "oil_volume",
+        "gas_volume",
+        "water_volume",
+        "boe",
+        "test_oil",
+        "test_water",
+        "test_gas",
+        "oil_rate",
+        "gas_rate",
+        "water_rate",
+        "boe_rate",
+    }
+)
+PRODUCTION_DATE_COLUMNS = frozenset({"date", "month"})
+
+DEFAULT_RETENTION_YEARS = 2
+
 _SCHEMA_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
@@ -221,6 +279,46 @@ def _to_float(value: Any) -> Any:
         return None
 
 
+def _to_display_float(value: Any) -> Any:
+    """Sensor/violation floats stored with 2 decimal places for UI."""
+    parsed = _to_float(value)
+    if parsed is None:
+        return None
+    return round(parsed, 2)
+
+
+def _normalize_raw_anomaly_data_for_ui(value: Any) -> Any:
+    data = _parse_json_value(value)
+    if not isinstance(data, dict):
+        return data
+    violations = data.get("violations")
+    if not isinstance(violations, list):
+        return data
+    normalized: List[Dict[str, Any]] = []
+    for item in violations:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        for key in (
+            "value",
+            "min",
+            "max",
+            "observed",
+            "expected_min",
+            "expected_max",
+            "deviation_pct",
+            "deviation_percent",
+        ):
+            if key in row:
+                rounded = _to_display_float(row[key])
+                if rounded is not None:
+                    row[key] = rounded
+        normalized.append(row)
+    out = dict(data)
+    out["violations"] = normalized
+    return out
+
+
 def dataframe_to_anomaly_suggestion_rows(df: pd.DataFrame, organization_id: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for record in df.to_dict(orient="records"):
@@ -231,6 +329,8 @@ def dataframe_to_anomaly_suggestion_rows(df: pd.DataFrame, organization_id: str)
                 value = organization_id
             if column in JSONB_COLUMNS:
                 value = _parse_json_value(value)
+                if column == "raw_anomaly_data":
+                    value = _normalize_raw_anomaly_data_for_ui(value)
             elif column in {"timestamp", "created_at"}:
                 value = _to_timestamp(value)
             else:
@@ -256,7 +356,7 @@ def dataframe_to_anomaly_violation_rows(df: pd.DataFrame, organization_id: str) 
             if column == "organization_id" and (value is None or (isinstance(value, float) and pd.isna(value))):
                 value = organization_id
             elif column in FLOAT_COLUMNS:
-                value = _to_float(value)
+                value = _to_display_float(value)
             elif column == "timestamp":
                 value = _to_timestamp(value)
             else:
@@ -449,3 +549,203 @@ def upsert_operation_recommendations(conn, rows: Iterable[Dict[str, Any]]) -> in
         rows,
         OPS_JSONB_COLUMNS,
     )
+
+
+def _table_columns(conn, table: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            """,
+            (table,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def ensure_production_tables(conn) -> None:
+    """Create production tables matching S3 parquet when they do not exist yet."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_production (
+                organization_id VARCHAR(36),
+                well_id VARCHAR(100) NOT NULL,
+                date DATE NOT NULL,
+                oil_volume DOUBLE PRECISION,
+                gas_volume DOUBLE PRECISION,
+                water_volume DOUBLE PRECISION,
+                boe DOUBLE PRECISION,
+                lift_type VARCHAR(50),
+                status VARCHAR(50),
+                notes VARCHAR(500),
+                test_oil DOUBLE PRECISION,
+                test_water DOUBLE PRECISION,
+                test_gas DOUBLE PRECISION,
+                facility_id VARCHAR(100),
+                PRIMARY KEY (well_id, date)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_production (
+                organization_id VARCHAR(36),
+                well_id VARCHAR(100) NOT NULL,
+                month DATE NOT NULL,
+                oil_volume DOUBLE PRECISION,
+                gas_volume DOUBLE PRECISION,
+                water_volume DOUBLE PRECISION,
+                boe DOUBLE PRECISION,
+                production_days INTEGER,
+                oil_rate DOUBLE PRECISION,
+                gas_rate DOUBLE PRECISION,
+                water_rate DOUBLE PRECISION,
+                boe_rate DOUBLE PRECISION,
+                lift_type VARCHAR(50),
+                status VARCHAR(50),
+                facility_id VARCHAR(100),
+                PRIMARY KEY (well_id, month)
+            )
+            """
+        )
+        daily_cols = _table_columns(conn, "daily_production")
+        if "well_id" in daily_cols and "date" in daily_cols:
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS daily_production_well_id_date_uidx
+                ON daily_production (well_id, date)
+                """
+            )
+
+
+def dataframe_to_daily_production_rows(df: pd.DataFrame, organization_id: str) -> List[Dict[str, Any]]:
+    rows = _build_rows(
+        df,
+        organization_id,
+        POSTGRES_DAILY_PRODUCTION_COLUMNS,
+        json_columns=frozenset(),
+        float_columns=PRODUCTION_FLOAT_COLUMNS,
+        timestamp_columns=PRODUCTION_DATE_COLUMNS,
+        required_fields=("well_id", "date"),
+    )
+    for row in rows:
+        for column in PRODUCTION_FLOAT_COLUMNS:
+            if column in row and row[column] is not None:
+                row[column] = _to_display_float(row[column])
+    return rows
+
+
+def upsert_daily_production(conn, rows: Iterable[Dict[str, Any]]) -> int:
+    rows = list(rows)
+    if not rows:
+        return 0
+
+    columns = list(POSTGRES_DAILY_PRODUCTION_COLUMNS)
+    conflict_cols = list(POSTGRES_DAILY_PRODUCTION_CONFLICT_COLUMNS)
+    update_columns = [c for c in columns if c not in conflict_cols]
+    placeholders = ", ".join(["%s"] * len(columns))
+    conflict_clause = ", ".join(conflict_cols)
+    update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_columns)
+    query = f"""
+        INSERT INTO daily_production ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause}
+    """
+    params_list = [[row.get(column) for column in columns] for row in rows]
+    with conn.cursor() as cur:
+        execute_batch(cur, query, params_list, page_size=200)
+    return len(params_list)
+
+
+def refresh_monthly_production(
+    conn,
+    organization_id: str,
+    month_starts: Iterable[Any],
+) -> int:
+    """Aggregate daily_production into monthly_production for each month start date."""
+    from datetime import date, timedelta
+
+    total = 0
+    columns = list(POSTGRES_MONTHLY_PRODUCTION_COLUMNS)
+    conflict_cols = list(POSTGRES_MONTHLY_PRODUCTION_CONFLICT_COLUMNS)
+    update_columns = [c for c in columns if c not in conflict_cols]
+    update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_columns)
+    conflict_clause = ", ".join(conflict_cols)
+
+    with conn.cursor() as cur:
+        for raw_month in month_starts:
+            if isinstance(raw_month, pd.Timestamp):
+                month_start = raw_month.date()
+            elif isinstance(raw_month, date):
+                month_start = raw_month.replace(day=1)
+            else:
+                month_start = pd.to_datetime(raw_month).date().replace(day=1)
+            if month_start.day != 1:
+                month_start = month_start.replace(day=1)
+            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+            cur.execute(
+                f"""
+                INSERT INTO monthly_production ({", ".join(columns)})
+                SELECT
+                    organization_id,
+                    well_id,
+                    date_trunc('month', date)::date AS month,
+                    ROUND(SUM(COALESCE(oil_volume, 0))::numeric, 2) AS oil_volume,
+                    ROUND(SUM(COALESCE(gas_volume, 0))::numeric, 2) AS gas_volume,
+                    ROUND(SUM(COALESCE(water_volume, 0))::numeric, 2) AS water_volume,
+                    ROUND(SUM(COALESCE(boe, 0))::numeric, 2) AS boe,
+                    COUNT(*)::int AS production_days,
+                    ROUND(AVG(oil_volume)::numeric, 2) AS oil_rate,
+                    ROUND(AVG(gas_volume)::numeric, 2) AS gas_rate,
+                    ROUND(AVG(water_volume)::numeric, 2) AS water_rate,
+                    ROUND(AVG(boe)::numeric, 2) AS boe_rate,
+                    MAX(lift_type) AS lift_type,
+                    MAX(status) AS status,
+                    MAX(facility_id) AS facility_id
+                FROM daily_production
+                WHERE organization_id = %s
+                  AND date >= %s
+                  AND date < %s
+                GROUP BY organization_id, well_id, date_trunc('month', date)::date
+                ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause}
+                """,
+                (organization_id, month_start, month_end),
+            )
+            total += cur.rowcount
+    return total
+
+
+def retention_min_date(years: int = DEFAULT_RETENTION_YEARS) -> "date":
+    from datetime import date, timedelta
+
+    return date.today() - timedelta(days=365 * years)
+
+
+def prune_production_outside_retention(
+    conn,
+    organization_id: str,
+    min_date: "date",
+) -> Dict[str, int]:
+    """Keep only rows inside the retention window (default: last 2 years)."""
+    min_month = min_date.replace(day=1)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM daily_production WHERE organization_id = %s AND date < %s",
+            (organization_id, min_date),
+        )
+        daily_deleted = cur.rowcount
+        cur.execute(
+            "DELETE FROM monthly_production WHERE organization_id = %s AND month < %s",
+            (organization_id, min_month),
+        )
+        monthly_deleted = cur.rowcount
+    logger.info(
+        "Pruned production outside retention (from %s): %s daily rows, %s monthly rows",
+        min_date.isoformat(),
+        daily_deleted,
+        monthly_deleted,
+    )
+    return {"daily_deleted": daily_deleted, "monthly_deleted": monthly_deleted}

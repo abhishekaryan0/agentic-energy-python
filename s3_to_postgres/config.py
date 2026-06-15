@@ -62,6 +62,8 @@ def _s3_subpath_for_table(sync_table: str) -> str:
         "anomaly_violations": "detections/anomaly_detection",
         "anomaly_reviews": "detections/anomaly_review",
         "operation_recommendations": "detections/operations",
+        "daily_production": "sensor_data/daily_production",
+        "monthly_production": "sensor_data/daily_production",
     }
     subpath = mapping.get(sync_table)
     if not subpath:

@@ -62,7 +62,7 @@ aws events put-rule \
   --schedule-expression "$SCHEDULE_CRON" \
   --state ENABLED \
   --region "$LAMBDA_REGION" \
-  --description "Every 24h: sync detection parquet (suggestions, violations, reviews, operations) to PostgreSQL"
+  --description "Every 24h: sync detection parquet and daily production to PostgreSQL"
 
 STATEMENT_ID="AllowEventBridgeInvoke-${RULE_NAME}"
 aws lambda remove-permission \

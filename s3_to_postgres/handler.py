@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List
 from s3_to_postgres.sync_anomaly_reviews import sync_anomaly_reviews
 from s3_to_postgres.sync_anomaly_suggestions import sync_anomaly_suggestions
 from s3_to_postgres.sync_anomaly_violations import sync_anomaly_violations
+from s3_to_postgres.sync_daily_production import sync_daily_production
+from s3_to_postgres.sync_monthly_production import sync_monthly_production
 from s3_to_postgres.sync_operation_recommendations import sync_operation_recommendations
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,8 @@ SYNC_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "anomaly_violations": sync_anomaly_violations,
     "anomaly_reviews": sync_anomaly_reviews,
     "operation_recommendations": sync_operation_recommendations,
+    "daily_production": sync_daily_production,
+    "monthly_production": sync_monthly_production,
 }
 
 

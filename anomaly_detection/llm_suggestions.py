@@ -127,9 +127,9 @@ def pseudo_violations_from_readings(
         pseudo.append(
             {
                 "field": field,
-                "value": val,
-                "min": lo,
-                "max": hi,
+                "value": round(val, 2),
+                "min": round(lo, 2),
+                "max": round(hi, 2),
                 "unit": unit,
                 "deviation_pct": round(deviation_pct, 2),
                 "violation": (

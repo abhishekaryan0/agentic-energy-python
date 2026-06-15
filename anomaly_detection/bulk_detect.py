@@ -11,6 +11,8 @@ from anomaly_detection.detector import ML_ONLY_ANOMALY_THRESHOLD, get_detector
 from anomaly_detection.llm_suggestions import generate_suggestion, persist_suggestion_to_s3, calculate_severity
 from anomaly_detection.s3_history import (
     load_recent_anomaly_suggestions_for_well,
+    normalize_violation_record,
+    round_readings_for_storage,
     write_anomaly_violations_history_to_s3,
     write_well_anomalies_history_to_s3,
 )
@@ -299,7 +301,7 @@ def _extract_reading_dict(row: Dict[str, Any]) -> Dict[str, Any]:
             readings[k] = float(v) if v is not None else None
         except Exception:
             readings[k] = None
-    return readings
+    return round_readings_for_storage(readings)
 
 
 def _llm_suggestions_enabled() -> bool:
@@ -492,17 +494,18 @@ def _persist_anomaly_if_detected(
 
     violations_records: List[Dict[str, Any]] = []
     for v in anomaly_details.get("violations", []) or []:
+        norm = normalize_violation_record(v)
         violations_records.append(
             {
                 "anomaly_id": anomaly_id,
                 "well_id": str(well_id),
                 "timestamp": timestamp_str,
-                "parameter_name": v.get("field"),
-                "actual_value": v.get("value"),
-                "expected_min": v.get("min") if v.get("min") is not None else 0.0,
-                "expected_max": v.get("max") if v.get("max") is not None else 0.0,
-                "unit": v.get("unit", ""),
-                "deviation_percent": v.get("deviation_pct", 0.0),
+                "parameter_name": norm["field"],
+                "actual_value": norm["observed"] if norm["observed"] is not None else 0.0,
+                "expected_min": norm["expected_min"] if norm["expected_min"] is not None else 0.0,
+                "expected_max": norm["expected_max"] if norm["expected_max"] is not None else 0.0,
+                "unit": norm["unit"],
+                "deviation_percent": norm["deviation_percent"] if norm["deviation_percent"] is not None else 0.0,
                 "user_id": None,
                 "user_name": None,
                 "updated_at": None,
@@ -1015,20 +1018,18 @@ def run_bulk_anomaly_detection(
 
         violations_records: List[Dict[str, Any]] = []
         for v in anomaly_details.get("violations", []) or []:
-            dev_pct = v.get("deviation_pct", 0.0)
-            e_min = v.get("min") if v.get("min") is not None else 0.0
-            e_max = v.get("max") if v.get("max") is not None else 0.0
+            norm = normalize_violation_record(v)
             violations_records.append(
                 {
                     "anomaly_id": anomaly_id,
                     "well_id": str(well_id),
                     "timestamp": timestamp_str,
-                    "parameter_name": v.get("field"),
-                    "actual_value": v.get("value"),
-                    "expected_min": e_min,
-                    "expected_max": e_max,
-                    "unit": v.get("unit", ""),
-                    "deviation_percent": dev_pct,
+                    "parameter_name": norm["field"],
+                    "actual_value": norm["observed"] if norm["observed"] is not None else 0.0,
+                    "expected_min": norm["expected_min"] if norm["expected_min"] is not None else 0.0,
+                    "expected_max": norm["expected_max"] if norm["expected_max"] is not None else 0.0,
+                    "unit": norm["unit"],
+                    "deviation_percent": norm["deviation_percent"] if norm["deviation_percent"] is not None else 0.0,
                     "user_id": None,
                     "user_name": None,
                     "updated_at": None,

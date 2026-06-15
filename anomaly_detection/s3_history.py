@@ -138,6 +138,28 @@ def _to_float_or_none(value: Any) -> Optional[float]:
     return _parse_numeric_value(value)
 
 
+def _round_display_number(value: Any, *, decimals: int = 2) -> Optional[float]:
+    """Round sensor readings for UI display (2 decimal places)."""
+    parsed = _parse_numeric_value(value)
+    if parsed is None:
+        return None
+    return round(parsed, decimals)
+
+
+def round_readings_for_storage(readings: Any) -> Dict[str, Any]:
+    """Round numeric sensor fields in a readings dict for UI/storage."""
+    if not isinstance(readings, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, val in readings.items():
+        if val is None:
+            out[key] = None
+            continue
+        rounded = _round_display_number(val)
+        out[key] = rounded if rounded is not None else val
+    return out
+
+
 def normalize_violation_record(v: Dict[str, Any]) -> Dict[str, Any]:
     """
     Canonical violation shape for storage and UI consumption.
@@ -145,10 +167,10 @@ def normalize_violation_record(v: Dict[str, Any]) -> Dict[str, Any]:
     Keeps numeric value/min/max (no comma strings) and adds observed / expected_min /
     expected_max aliases matching anomaly_violations columns.
     """
-    value = _parse_numeric_value(v.get("observed", v.get("value")))
-    min_val = _parse_numeric_value(v.get("expected_min", v.get("min")))
-    max_val = _parse_numeric_value(v.get("expected_max", v.get("max")))
-    deviation = _parse_numeric_value(v.get("deviation_pct", v.get("deviation_percent")))
+    value = _round_display_number(v.get("observed", v.get("value")))
+    min_val = _round_display_number(v.get("expected_min", v.get("min")))
+    max_val = _round_display_number(v.get("expected_max", v.get("max")))
+    deviation = _round_display_number(v.get("deviation_pct", v.get("deviation_percent")))
 
     return {
         "field": _to_str_or_none(v.get("field") or v.get("parameter_name")) or "",
@@ -176,8 +198,16 @@ def _normalize_well_anomalies_records(records: List[Dict[str, Any]]) -> pd.DataF
     rows: List[Dict[str, Any]] = []
     for r in records:
         row = {k: r.get(k) for k in WELL_ANOMALIES_COLUMNS}
-        row["anomaly_score"] = _to_float_or_none(row.get("anomaly_score"))
-        row["raw_values"] = _json_dumps_safe(row.get("raw_values"))
+        row["anomaly_score"] = _round_display_number(row.get("anomaly_score"))
+        raw_values = r.get("raw_values")
+        if isinstance(raw_values, str):
+            try:
+                raw_values = json.loads(raw_values)
+            except Exception:
+                pass
+        if isinstance(raw_values, dict):
+            raw_values = round_readings_for_storage(raw_values)
+        row["raw_values"] = _json_dumps_safe(raw_values)
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=WELL_ANOMALIES_COLUMNS)
@@ -208,10 +238,10 @@ def _normalize_anomaly_violations_records(records: List[Dict[str, Any]]) -> pd.D
     rows: List[Dict[str, Any]] = []
     for r in records:
         row = {k: r.get(k) for k in ANOMALY_VIOLATIONS_COLUMNS}
-        row["actual_value"] = _to_float_or_none(row.get("actual_value"))
-        row["expected_min"] = _to_float_or_none(row.get("expected_min"))
-        row["expected_max"] = _to_float_or_none(row.get("expected_max"))
-        row["deviation_percent"] = _to_float_or_none(row.get("deviation_percent"))
+        row["actual_value"] = _round_display_number(row.get("actual_value"))
+        row["expected_min"] = _round_display_number(row.get("expected_min"))
+        row["expected_max"] = _round_display_number(row.get("expected_max"))
+        row["deviation_percent"] = _round_display_number(row.get("deviation_percent"))
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=ANOMALY_VIOLATIONS_COLUMNS)

@@ -693,10 +693,10 @@ class AnomalyDetector:
 
                 violations.append({
                     "field": field,
-                    "value": value,
-                    "mean": avg,
-                    "min": band_min,
-                    "max": band_max,
+                    "value": round(float(value), 2),
+                    "mean": round(float(avg), 2),
+                    "min": round(float(band_min), 2),
+                    "max": round(float(band_max), 2),
                     "unit": sensor_unit,
                     "deviation_pct": round(beyond_pct, 2),
                     "band_deviation_pct": deviation_pct,

@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import boto3
 
-from s3_to_postgres.checkpoint import load_checkpoint, save_checkpoint
+from s3_to_postgres.checkpoint import SyncCheckpoint, load_checkpoint, save_checkpoint
 from s3_to_postgres.config import Settings, load_settings
 from s3_to_postgres.db import postgres_connection
 from s3_to_postgres.s3_io import event_detail_s3_key, read_parquet_from_s3

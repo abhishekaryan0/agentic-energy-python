@@ -7,6 +7,7 @@ Usage:
   export DATABASE_URL=...
   python -m s3_to_postgres.run --table anomaly_suggestions
   python -m s3_to_postgres.run --table anomaly_violations --sync-mode backfill
+  python -m s3_to_postgres.run --table daily_production --sync-mode backfill --backfill-years 2
   python -m s3_to_postgres.run --table all --sync-mode backfill
 """
 
@@ -33,6 +34,12 @@ def main() -> int:
     )
     parser.add_argument("--s3-key", help="Sync a single S3 object key")
     parser.add_argument(
+        "--backfill-years",
+        type=int,
+        default=2,
+        help="For production backfill: only sync partitions from the last N years (default: 2)",
+    )
+    parser.add_argument(
         "--table",
         default="anomaly_suggestions",
         choices=[
@@ -40,12 +47,14 @@ def main() -> int:
             "anomaly_violations",
             "anomaly_reviews",
             "operation_recommendations",
+            "daily_production",
+            "monthly_production",
             "all",
         ],
     )
     args = parser.parse_args()
 
-    event = {"sync_mode": args.sync_mode, "table": args.table}
+    event = {"sync_mode": args.sync_mode, "table": args.table, "backfill_years": args.backfill_years}
     if args.s3_key:
         event["s3_key"] = args.s3_key
 

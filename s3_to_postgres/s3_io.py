@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+from datetime import date, datetime
 from typing import List, Optional
 
 import pandas as pd
@@ -14,8 +16,11 @@ ANOMALY_SUGGESTIONS_KEY_FRAGMENT = "anomaly_suggestions_run_ts="
 ANOMALY_VIOLATIONS_KEY_FRAGMENT = "anomaly_violations_run_ts="
 ANOMALY_REVIEWS_KEY_FRAGMENT = "anomaly_reviews.parquet"
 OPERATIONS_RECOMMENDATIONS_KEY_FRAGMENT = "operations_recommendations.parquet"
+DAILY_PRODUCTION_KEY_FRAGMENT = "daily_production"
+MONTHLY_PRODUCTION_KEY_FRAGMENT = "daily_production"
 HISTORY_PREFIX = "history/"
 RUN_TS_PREFIX = "run_ts="
+PARTITION_DATE_RE = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 
 
 def list_anomaly_suggestion_keys(
@@ -87,6 +92,57 @@ def list_operation_recommendation_keys(s3_client, bucket: str, detection_prefix:
         detection_prefix,
         key_fragment=OPERATIONS_RECOMMENDATIONS_KEY_FRAGMENT,
     )
+
+
+def parse_partition_date(key: str) -> Optional[date]:
+    match = PARTITION_DATE_RE.search(key)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+
+
+def list_daily_production_keys(
+    s3_client,
+    bucket: str,
+    sensor_prefix: str,
+    *,
+    min_partition_date: Optional[date] = None,
+) -> List[str]:
+    """List date-partitioned daily production parquet keys under sensor_data/daily_production/."""
+    prefix = f"{sensor_prefix.rstrip('/')}/date="
+    keys: List[str] = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for item in page.get("Contents") or []:
+            key = item["Key"]
+            if not key.endswith(".parquet"):
+                continue
+            if min_partition_date is not None:
+                partition_date = parse_partition_date(key)
+                if partition_date is None or partition_date < min_partition_date:
+                    continue
+            keys.append(key)
+    keys.sort()
+    return keys
+
+
+def list_legacy_daily_production_key(
+    s3_client,
+    bucket: str,
+    sensor_prefix: str,
+) -> Optional[str]:
+    """Return legacy single-file daily_production.parquet key when present."""
+    legacy_key = f"{sensor_prefix.rstrip('/')}.parquet"
+    try:
+        s3_client.head_object(Bucket=bucket, Key=legacy_key)
+    except Exception:
+        parent = sensor_prefix.rsplit("/", 1)[0]
+        legacy_key = f"{parent}/daily_production.parquet"
+        try:
+            s3_client.head_object(Bucket=bucket, Key=legacy_key)
+        except Exception:
+            return None
+    return legacy_key
 
 
 def read_parquet_from_s3(s3_client, bucket: str, key: str) -> pd.DataFrame:
