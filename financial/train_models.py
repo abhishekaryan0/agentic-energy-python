@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train financial models from S3/local parquet (invoice + production schemas aligned with scripts/generate_*).
+Train financial models from S3/local parquet (invoice + production schemas aligned with APEX_PERMIAN/generate_*).
 
 Inputs:
 - sensor parquet: well_sensor_readings.parquet (optional; not required for first version)
@@ -136,6 +136,18 @@ def build_financial_training_frame(
 
     inv_all = inv_all.rename(columns={"asset_id": "well_id"})
     inv_all["well_id"] = inv_all["well_id"].astype(str)
+
+    production_well_ids = set(prod["well_id"].astype(str).dropna())
+    try:
+        from operation_recommendations.well_id_utils import remap_invoice_rows_to_production_wells
+
+        inv_remap = remap_invoice_rows_to_production_wells(
+            inv_all["well_id"].unique(),
+            production_well_ids,
+        )
+        inv_all["well_id"] = inv_all["well_id"].map(lambda w: inv_remap.get(str(w), str(w)))
+    except Exception:
+        pass
 
     # Aggregate invoices per (well_id, invoice_date)
     inv_all["is_workover_like"] = inv_all["category"].map(_is_workover_like)

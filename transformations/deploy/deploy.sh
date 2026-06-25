@@ -4,7 +4,7 @@
 #
 # Usage (from repo root):
 #   export S3_BUCKET=...
-#   export ORGANIZATION_ID=...
+#   export ORGANIZATION_IDS=...   # or RED_BUFF_/APEX_PERMIAN_ORGANIZATION_ID in .env
 #   # Snowflake vars in .env (SNOWFLAKE_USER, SNOWFLAKE_TOKEN or PASSWORD, etc.)
 #   ./transformations/deploy/deploy.sh
 #
@@ -32,7 +32,22 @@ fi
 
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET}"
-ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
+
+if [[ -z "${ORGANIZATION_IDS:-}" ]]; then
+  _org_ids=()
+  [[ -n "${RED_BUFF_ORGANIZATION_ID:-}" ]] && _org_ids+=("${RED_BUFF_ORGANIZATION_ID}")
+  [[ -n "${APEX_PERMIAN_ORGANIZATION_ID:-}" ]] && _org_ids+=("${APEX_PERMIAN_ORGANIZATION_ID}")
+  if [[ ${#_org_ids[@]} -gt 0 ]]; then
+    ORGANIZATION_IDS="$(IFS=,; echo "${_org_ids[*]}")"
+  elif [[ -n "${ORGANIZATION_ID:-}" ]]; then
+    ORGANIZATION_IDS="${ORGANIZATION_ID}"
+  else
+    echo "ERROR: Set ORGANIZATION_IDS, ORGANIZATION_ID, or RED_BUFF_/APEX_PERMIAN_ORGANIZATION_ID"
+    exit 1
+  fi
+fi
+export ORGANIZATION_IDS
+
 SNOWFLAKE_USER="${SNOWFLAKE_USER:?Set SNOWFLAKE_USER}"
 SNOWFLAKE_ACCOUNT="${SNOWFLAKE_ACCOUNT:?Set SNOWFLAKE_ACCOUNT}"
 SNOWFLAKE_WAREHOUSE="${SNOWFLAKE_WAREHOUSE:?Set SNOWFLAKE_WAREHOUSE}"
@@ -92,21 +107,31 @@ fi
 aws iam attach-role-policy --role-name "$LAMBDA_ROLE_NAME" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 2>/dev/null || true
 
-POLICY_DOC="$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"],
-      "Resource": [
-        "arn:aws:s3:::${S3_BUCKET}",
-        "arn:aws:s3:::${S3_BUCKET}/${ORGANIZATION_ID}/*"
-      ]
-    }
-  ]
-}
-EOF
+POLICY_DOC="$(python3 - <<'PY'
+import json
+import os
+
+bucket = os.environ["S3_BUCKET"]
+org_ids = [p.strip() for p in os.environ["ORGANIZATION_IDS"].split(",") if p.strip()]
+resources = [f"arn:aws:s3:::{bucket}"]
+for org in org_ids:
+    resources.append(f"arn:aws:s3:::{bucket}/{org}/*")
+
+print(
+    json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"],
+                    "Resource": resources,
+                }
+            ],
+        }
+    )
+)
+PY
 )"
 aws iam put-role-policy --role-name "$LAMBDA_ROLE_NAME" \
   --policy-name "TransformationsS3Access" --policy-document "$POLICY_DOC"
@@ -114,7 +139,7 @@ aws iam put-role-policy --role-name "$LAMBDA_ROLE_NAME" \
 echo ""
 echo "=== 3) Lambda function ==="
 ENV_JSON_FILE="$(mktemp)"
-export ENV_JSON_FILE S3_BUCKET ORGANIZATION_ID LAMBDA_REGION LOG_LEVEL
+export ENV_JSON_FILE S3_BUCKET ORGANIZATION_IDS LAMBDA_REGION LOG_LEVEL
 export SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_TOKEN SNOWFLAKE_ACCOUNT
 export SNOWFLAKE_WAREHOUSE SNOWFLAKE_DATABASE SNOWFLAKE_SCHEMA SNOWFLAKE_ROLE
 export SNOWFLAKE_NETWORK_POLICY="${SNOWFLAKE_NETWORK_POLICY:-}"
@@ -124,7 +149,7 @@ import os
 
 variables = {
     "S3_BUCKET": os.environ["S3_BUCKET"],
-    "ORGANIZATION_ID": os.environ["ORGANIZATION_ID"],
+    "ORGANIZATION_IDS": os.environ["ORGANIZATION_IDS"],
     "LOG_LEVEL": os.environ["LOG_LEVEL"],
     "TRANSFORM_MODE": "incremental",
     "TRANSFORM_SKIP_WHEN_NO_NEW_DATA": "1",
@@ -196,7 +221,8 @@ echo ""
 echo "Done."
 echo "Function : $LAMBDA_FUNCTION_NAME ($LAMBDA_REGION)"
 echo "Image    : $ECR_URI"
-echo "Target   : s3://${S3_BUCKET}/${ORGANIZATION_ID}/sensor_data/"
+echo "Orgs     : $ORGANIZATION_IDS"
+echo "Target   : s3://${S3_BUCKET}/{ORGANIZATION_ID}/sensor_data/ (per tenant)"
 echo ""
 echo "Test invoke:"
 echo "  aws lambda invoke --function-name $LAMBDA_FUNCTION_NAME --region $LAMBDA_REGION \\"

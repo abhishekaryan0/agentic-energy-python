@@ -55,7 +55,7 @@ from operation_recommendations.recommendations.persistence import (
 from operation_recommendations.s3_inputs import download_s3_uri_to_temp, get_latest_invoices_parquet_uris
 from operation_recommendations.train_models import build_metrics_from_parquet
 from operation_recommendations.s3_models import resolve_operations_model_tarball_s3_uri
-from operation_recommendations.eia_prices import get_brent_spot_usd_per_bbl
+from operation_recommendations.oil_price import resolve_oil_price_usd_per_bbl
 
 load_dotenv()
 
@@ -310,15 +310,16 @@ def main() -> None:
         )
 
     try:
-        eia_price, eia_src, eia_period = get_brent_spot_usd_per_bbl()
+        oil_price, oil_src, oil_period, oil_price_type = resolve_oil_price_usd_per_bbl(cfg.org)
         logger.info(
-            "EIA Brent prefetch: $%.2f/bbl source=%s period=%s",
-            eia_price,
-            eia_src,
-            eia_period,
+            "Oil price prefetch: $%.2f/bbl type=%s source=%s period=%s",
+            oil_price,
+            oil_price_type,
+            oil_src,
+            oil_period,
         )
     except Exception as exc:
-        logger.warning("EIA Brent prefetch failed: %s", exc)
+        logger.warning("Oil price prefetch failed: %s", exc)
 
     sensor_path = _tmp_parquet(sensor_df, "sensor")
     prod_path = _tmp_parquet(prod_df, "production")

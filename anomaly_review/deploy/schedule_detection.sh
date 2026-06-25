@@ -16,8 +16,8 @@ export AWS_PAGER=""
 
 REGION="${AWS_REGION:-us-east-1}"
 CLUSTER="${ECS_CLUSTER:-anomaly-review-detection-cluster}"
-TASK_FAMILY="anomaly-review-detection-batch"
-LOG_GROUP="/ecs/anomaly-review-detection"
+TASK_FAMILY="${TASK_FAMILY:-anomaly-review-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-review-detection}"
 RULE_NAME="${RULE_NAME:-anomaly-review-detection-weekly}"
 SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 3 ? * MON *)}"
 
@@ -32,12 +32,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_TASK_FAMILY="${TASK_FAMILY:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
+_SAVED_LOG_GROUP="${LOG_GROUP:-}"
+_SAVED_EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-}"
+_SAVED_FORCE_WINDOW="${ANOMALY_REVIEW_FORCE_WINDOW:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
 fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_TASK_FAMILY" ]]; then
+  export TASK_FAMILY="$_SAVED_TASK_FAMILY"
+fi
+if [[ -n "$_SAVED_RULE_NAME" ]]; then
+  export RULE_NAME="$_SAVED_RULE_NAME"
+fi
+if [[ -n "$_SAVED_LOG_GROUP" ]]; then
+  export LOG_GROUP="$_SAVED_LOG_GROUP"
+fi
+if [[ -n "$_SAVED_EVENTBRIDGE_ROLE_NAME" ]]; then
+  export EVENTBRIDGE_ROLE_NAME="$_SAVED_EVENTBRIDGE_ROLE_NAME"
+fi
+if [[ -n "$_SAVED_FORCE_WINDOW" ]]; then
+  export ANOMALY_REVIEW_FORCE_WINDOW="$_SAVED_FORCE_WINDOW"
+fi
+
+TASK_FAMILY="${TASK_FAMILY:-anomaly-review-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-review-detection}"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-review-detection-events-role}"
 
 : "${S3_BUCKET:?Set S3_BUCKET}"
 : "${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
@@ -110,6 +138,7 @@ import json, os, sys
 path, ecr, exec_arn, task_arn = sys.argv[1:5]
 text = open(path).read()
 repl = {
+  "TASK_FAMILY_VALUE": os.environ.get("TASK_FAMILY", "anomaly-review-detection-batch"),
   "EXECUTION_ROLE_ARN": exec_arn,
   "TASK_ROLE_ARN": task_arn,
   "IMAGE_URI": ecr,

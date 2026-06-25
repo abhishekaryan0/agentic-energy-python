@@ -6,7 +6,10 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from anomaly_detection.red_buff_sensors import get_features_for_lift_type
+from anomaly_detection.tenant_sensors import get_features_for_lift_type
+
+# Red Buff parquet uses PRODUCING; Apex Permian uses OK; well_status service uses RUNNING.
+_ACTIVE_WELL_STATUSES = frozenset({"PRODUCING", "OK", "RUNNING"})
 
 
 def should_skip_detection_row(row: Dict[str, Any], lift_type: str) -> Optional[str]:
@@ -14,7 +17,7 @@ def should_skip_detection_row(row: Dict[str, Any], lift_type: str) -> Optional[s
     Return a skip reason when the row should not be scored (SHUT-IN / all-zero sensors).
     """
     status = str(row.get("well_status") or "").upper().strip()
-    if status and status != "PRODUCING":
+    if status and status not in _ACTIVE_WELL_STATUSES:
         return f"well_status={status}"
 
     fields = [f for f in get_features_for_lift_type(lift_type) if f in row]

@@ -1,5 +1,5 @@
 {
-  "family": "anomaly-detection-batch",
+  "family": "TASK_FAMILY_VALUE",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
@@ -30,6 +30,12 @@
         { "name": "ANOMALY_SAFETY_LAG_SECONDS", "value": "90" },
         { "name": "ANOMALY_ENABLE_LLM_SUGGESTIONS", "value": "1" },
         { "name": "ANOMALY_MODEL_TRAINING_JOB", "value": "ANOMALY_MODEL_TRAINING_JOB_VALUE" },
+
+        { "name": "ANOMALY_THRESHOLD", "value": "ANOMALY_THRESHOLD_VALUE" },
+        { "name": "ANOMALY_ML_ONLY_THRESHOLD", "value": "ANOMALY_ML_ONLY_THRESHOLD_VALUE" },
+        { "name": "ANOMALY_RULE_DEVIATION_PCT", "value": "ANOMALY_RULE_DEVIATION_PCT_VALUE" },
+        { "name": "ANOMALY_VIOLATION_MIN_BEYOND_PCT", "value": "ANOMALY_VIOLATION_MIN_BEYOND_PCT_VALUE" },
+        { "name": "ANOMALY_MIN_SCORE_WITH_VIOLATIONS", "value": "ANOMALY_MIN_SCORE_WITH_VIOLATIONS_VALUE" },
 
         { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
         { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" },

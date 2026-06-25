@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Sensor configuration for anomaly detection — backed by Red Bluff sensor profiles.
+Sensor configuration for anomaly detection — tenant-aware band profiles.
 
-Replaces the legacy sensor_ranges.parquet min/max rules with canonical column
-mapping and healthy reference means from RED_BUFF (see red_buff_sensors.py).
+Red Buff: full sensor set (red_buff_sensors).
+Apex Permian: Apex parquet columns and bands (apex_permian_sensors).
 """
 
 import logging
@@ -12,14 +12,16 @@ from typing import Dict, List
 
 from dotenv import load_dotenv
 
-from anomaly_detection.red_buff_sensors import (
+from anomaly_detection.tenant_sensors import (
     compute_band,
-    get_all_sensor_columns as _rb_all_columns,
-    get_features_for_lift_type as _rb_features,
-    get_lift_types as _rb_lift_types,
+    get_all_sensor_columns as _tenant_all_columns,
+    get_features_for_lift_type as _tenant_features,
+    get_lift_types as _tenant_lift_types,
     get_sensor_bands,
     get_sensor_profiles,
     normalize_lift_type,
+    resolve_tenant_profile,
+    select_training_features as _tenant_select_training_features,
 )
 
 load_dotenv()
@@ -39,20 +41,18 @@ def default_deviation_pct() -> float:
 
 def get_db_connection():
     """Legacy stub — Snowflake rules are not used."""
-    raise RuntimeError("Snowflake sensor rules are disabled; using Red Bluff band profiles.")
+    raise RuntimeError("Snowflake sensor rules are disabled; using tenant band profiles.")
 
 
 def get_lift_types() -> Dict[str, int]:
-    """Red Bluff lift types: Pumping Unit, ESP, Gas Lift (+ Rod Pump alias)."""
+    """Lift types for the active tenant profile."""
     if "lift_types" not in _config_cache:
-        types = _rb_lift_types()
-        types["Rod Pump"] = types["Pumping Unit"]
-        _config_cache["lift_types"] = types
+        _config_cache["lift_types"] = _tenant_lift_types()
     return _config_cache["lift_types"]
 
 
 def get_sensors_for_lift_type(lift_type_name: str) -> List[Dict]:
-    """Sensor definitions derived from Red Bluff profiles."""
+    """Sensor definitions derived from the active tenant profile."""
     cache_key = f"sensors_{lift_type_name}"
     if cache_key in _config_cache:
         return _config_cache[cache_key]
@@ -68,7 +68,8 @@ def get_sensors_for_lift_type(lift_type_name: str) -> List[Dict]:
                 "id": idx,
                 "name": profile.canonical_field,
                 "field_name": profile.canonical_field,
-                "red_buff_field": profile.red_buff_field,
+                "twin_field": profile.twin_field,
+                "red_buff_field": profile.twin_field,
                 "unit": profile.unit,
                 "mean": profile.mean,
                 "min": band_min,
@@ -104,7 +105,8 @@ def get_sensor_ranges(lift_type_name: str) -> Dict[str, Dict]:
             "max": info["max"],
             "unit": info.get("unit") or "",
             "deviation_pct": deviation,
-            "red_buff_field": info.get("red_buff_field"),
+            "twin_field": info.get("twin_field") or info.get("red_buff_field"),
+            "red_buff_field": info.get("twin_field") or info.get("red_buff_field"),
             "healthy_lo": info.get("healthy_lo"),
             "healthy_hi": info.get("healthy_hi"),
         }
@@ -117,19 +119,17 @@ def get_form_fields(lift_type_name: str) -> List[str]:
 
 
 def get_features_for_lift_type(lift_type_name: str) -> List[str]:
-    """All canonical WELL_SENSOR_READINGS sensor columns for this lift type."""
-    return _rb_features(lift_type_name)
+    """All sensor columns for this lift type (tenant profile)."""
+    return _tenant_features(lift_type_name)
 
 
 def select_training_features(df, lift_type_name: str, *, min_non_null: int = 2) -> List[str]:
     """All lift-type sensors in df with enough non-null values for training."""
-    from anomaly_detection.red_buff_sensors import select_training_features as _select
-
-    return _select(df, lift_type_name, min_non_null=min_non_null)
+    return _tenant_select_training_features(df, lift_type_name, min_non_null=min_non_null)
 
 
 def get_all_sensor_columns() -> List[str]:
-    return _rb_all_columns()
+    return _tenant_all_columns()
 
 
 def get_anomaly_rules(lift_type_name: str) -> Dict:
@@ -151,7 +151,8 @@ def get_anomaly_rules(lift_type_name: str) -> Dict:
             "unit": profile.unit,
             "span": profile.span,
             "deviation_pct": deviation,
-            "red_buff_field": profile.red_buff_field,
+            "twin_field": profile.twin_field,
+            "red_buff_field": profile.twin_field,
             "healthy_lo": profile.lo,
             "healthy_hi": profile.hi,
         }
@@ -179,11 +180,14 @@ def get_all_sensor_info() -> Dict:
 
 
 if __name__ == "__main__":
-    print("=== Lift Types (Red Bluff) ===")
+    print(f"=== Tenant profile: {resolve_tenant_profile()} ===")
+    print("=== Lift Types ===")
     print(get_lift_types())
 
-    for lift in ("Pumping Unit", "ESP", "Gas Lift"):
-        print(f"\n=== {lift} — canonical columns & bands (±{default_deviation_pct()}%) ===")
+    for lift in get_lift_types():
+        if lift == "Rod Pump" and resolve_tenant_profile() == "red_buff":
+            continue
+        print(f"\n=== {lift} — columns & bands (±{default_deviation_pct()}%) ===")
         for field, band in get_sensor_ranges(lift).items():
             print(
                 f"  {field}: mean={band['mean']:.2f} "

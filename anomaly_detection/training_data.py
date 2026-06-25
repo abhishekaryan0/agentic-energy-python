@@ -11,7 +11,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from anomaly_detection.red_buff_sensors import get_features_for_lift_type
+from anomaly_detection.detection_filters import _ACTIVE_WELL_STATUSES
+from anomaly_detection.tenant_sensors import get_features_for_lift_type
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def filter_healthy_training_rows(
 
     if "well_status" in out.columns:
         status = out["well_status"].astype(str).str.upper().str.strip()
-        out = out[status == "PRODUCING"]
+        out = out[status.isin(_ACTIVE_WELL_STATUSES)]
     stats["producing_rows"] = len(out)
 
     profile_fields = [

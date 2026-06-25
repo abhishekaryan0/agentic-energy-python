@@ -84,7 +84,7 @@ except ImportError:
     WELL_TYPES = ['Rod Pump', 'ESP', 'Gas Lift']
     get_features_for_lift_type = None
 
-from anomaly_detection.red_buff_sensors import features_fallback_dict
+from anomaly_detection.tenant_sensors import features_fallback_dict
 from anomaly_detection.training_data import MIN_TRAINING_ROWS, filter_healthy_training_rows
 from anomaly_detection.ml_models import (
     ISO_CONTAMINATION,
@@ -202,7 +202,7 @@ def prepare_data_for_training(df, well_type):
     Returns:
         X_train, X_test, y_train, y_test, scaler, available_features or None
     """
-    from anomaly_detection.red_buff_sensors import select_training_features
+    from anomaly_detection.tenant_sensors import select_training_features
 
     logger.info(f"Preparing data for {well_type} (all lift-type sensors with data)...")
     logger.info(f"Records for {well_type}: {len(df)}")
@@ -701,7 +701,7 @@ def _upload_anomaly_models_to_s3(bucket: str) -> bool:
     prefix = os.environ.get("S3_PREFIX", "models/anomaly").rstrip("/")
     version = os.environ.get("MODEL_VERSION", "v1")
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    script = os.path.join(project_root, "scripts", "pack_and_upload_sagemaker_model.py")
+    script = os.path.join(project_root, "anomaly_detection", "deploy", "pack_and_upload_sagemaker_model.py")
     if not os.path.isfile(script):
         logger.error("Pack script not found: %s", script)
         return False

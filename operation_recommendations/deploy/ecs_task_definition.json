@@ -1,5 +1,5 @@
 {
-  "family": "operations-detection-batch",
+  "family": "TASK_FAMILY_VALUE",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
@@ -16,9 +16,11 @@
         { "name": "ORGANIZATION_ID", "value": "ORGANIZATION_ID_VALUE" },
         { "name": "OPERATIONS_MODEL_TARBALL_S3_URI", "value": "OPERATIONS_MODEL_TARBALL_S3_URI_VALUE" },
         { "name": "OPERATIONS_CONFIDENCE_THRESHOLD", "value": "0.3" },
-        { "name": "OPS_DETECTION_DAYS", "value": "30" },
-        { "name": "OPS_DETECTION_FORCE_WINDOW", "value": "1" },
+        { "name": "OPS_DETECTION_DAYS", "value": "OPS_DETECTION_DAYS_VALUE" },
+        { "name": "OPS_DETECTION_FORCE_WINDOW", "value": "OPS_DETECTION_FORCE_WINDOW_VALUE" },
         { "name": "AWS_REGION", "value": "AWS_REGION_VALUE" },
+        { "name": "DATABASE_URL", "value": "DATABASE_URL_VALUE" },
+        { "name": "DATABASE_URL_SECRET_ARN", "value": "DATABASE_URL_SECRET_ARN_VALUE" },
         { "name": "EIA_API_KEY", "value": "EIA_API_KEY_VALUE" },
         { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
         { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" }

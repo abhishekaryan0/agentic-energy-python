@@ -11,8 +11,9 @@ Production-related environment variables (non-exhaustive):
 - **OPERATIONS_MODEL_TARBALL_S3_URI** — SageMaker ``operations-train-.../output/model.tar.gz`` (auto-detected if unset).
 - **FINANCIAL_MODEL_TARBALL_S3_URI** — optional financial model tarball (auto-detected if unset).
 - **OPERATIONS_MODELS_DIR** — optional local joblib directory (dev fallback when S3 URI not set).
-- **EIA_API_KEY** — U.S. EIA Open Data API key for Brent spot; if unset, **OPERATIONS_OIL_PRICE_USD**
-  (default 70) is used for revenue-side pricing.
+- **DATABASE_URL** or **DATABASE_URL_SECRET_ARN** — PostgreSQL for per-org ``org_settings`` (oil price type).
+- **EIA_API_KEY** — U.S. EIA Open Data API key when ``org_settings.oil_price_type`` is Brent; if unset,
+  **OPERATIONS_OIL_PRICE_USD** (default 70) is used for revenue-side pricing.
 - **EIA_CACHE_TTL_SEC**, **EIA_HTTP_TIMEOUT_SEC**, **EIA_HTTP_RETRIES** — tune EIA HTTP client.
 - **FINANCIAL_MODEL_PATH** — optional file or directory for ``financial_implementation_cost.joblib``.
 - **IMPLEMENTATION_LUMP_DAYS**, **IMPLEMENTATION_AMORTIZATION_DAYS** — convert financial model daily rate to one-time lump and amortize for net daily benefit in ``recommendations.persistence``.
@@ -216,15 +217,11 @@ VALID_PRIORITIES = {'HIGH', 'MEDIUM', 'LOW'}
 
 def get_sensors_for_lift_type(lift_type: str) -> List[str]:
     """
-    Get the list of sensor field names for a specific lift type.
-    
-    Args:
-        lift_type: Lift type name (Rod Pump, ESP, Gas Lift)
-        
-    Returns:
-        List of sensor field names
+    Get the list of sensor field names for a specific lift type (tenant-aware).
     """
-    return LIFT_TYPE_SENSORS.get(lift_type, COMMON_SENSORS)
+    from operation_recommendations.tenant_config import get_tenant_sensors_for_lift_type
+
+    return get_tenant_sensors_for_lift_type(lift_type)
 
 
 def get_features_for_lift_type(lift_type: str, include_production: bool = True) -> List[str]:

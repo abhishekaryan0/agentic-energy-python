@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
-# Parquet outputs (scripts/generate_master.py)
+# Parquet outputs (APEX_PERMIAN/generate_master.py)
 MASTER_ASSETS_COLUMNS: Tuple[str, ...] = (
     "organization_id",
     "asset_id",

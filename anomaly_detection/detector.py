@@ -2,8 +2,8 @@
 Unified Anomaly Detection Module
 ================================
 
-Integrates band-based checks (Red Bluff mean ± deviation), Isolation Forest, and LSTM.
-Sensor profiles and column mapping: anomaly_detection/red_buff_sensors.py.
+Integrates band-based checks (tenant reference mean ± deviation), Isolation Forest, and LSTM.
+Sensor profiles route via anomaly_detection/tenant_sensors.py (Red Buff or Apex Permian).
 
 Features:
     - Rule-based detection using sensor thresholds from database
@@ -165,9 +165,13 @@ class AnomalyConfig:
         rule_dev_scale: Scaling factor for deviation contribution
         rule_deviation_pct: Percentage band around reference mean for band checks
     """
-    # Detection thresholds
+    # Detection thresholds (override via ANOMALY_THRESHOLD / ANOMALY_ML_ONLY_THRESHOLD)
     anomaly_threshold: float = 0.75
     ml_only_threshold: float = 0.85
+    # When rule violations exist, still require this combined score (0 = any violation counts).
+    min_score_with_violations: float = 0.0
+    # Ignore band violations smaller than this % beyond the allowed band.
+    violation_min_beyond_pct: float = 0.0
     
     # Method weights (must sum to ~1.0): bands + IF + PyOD + MAD + LSTM
     weights: Dict[str, float] = field(default_factory=lambda: {
@@ -222,8 +226,33 @@ class AnomalyConfig:
             raise ValueError(f"weights must sum to ~1.0, got {weight_sum}")
 
 
-# Default configuration instance
-DEFAULT_CONFIG = AnomalyConfig()
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_anomaly_config() -> AnomalyConfig:
+    """Build detection config from environment (used by ECS task env vars)."""
+    return AnomalyConfig(
+        anomaly_threshold=_env_float("ANOMALY_THRESHOLD", 0.75),
+        ml_only_threshold=_env_float("ANOMALY_ML_ONLY_THRESHOLD", 0.85),
+        min_score_with_violations=_env_float("ANOMALY_MIN_SCORE_WITH_VIOLATIONS", 0.0),
+        violation_min_beyond_pct=_env_float("ANOMALY_VIOLATION_MIN_BEYOND_PCT", 0.0),
+        rule_deviation_pct=_env_float("ANOMALY_RULE_DEVIATION_PCT", 30.0),
+        mse_threshold=_env_float("ANOMALY_LSTM_MSE_THRESHOLD", 0.05),
+        iso_contamination=_env_float("ANOMALY_ISO_CONTAMINATION", 0.05),
+        contamination_ratio=_env_float("ANOMALY_CONTAMINATION_RATIO", 0.05),
+        seq_len=int(os.environ.get("ANOMALY_LSTM_SEQ_LEN", "24") or 24),
+        lstm_epochs=int(os.environ.get("ANOMALY_LSTM_EPOCHS", "30") or 30),
+        lstm_lr=_env_float("ANOMALY_LSTM_LR", 0.001),
+        lstm_hidden_dim=int(os.environ.get("ANOMALY_LSTM_HIDDEN_DIM", "128") or 128),
+    )
+
+
+# Default configuration instance (env-aware at process start)
+DEFAULT_CONFIG = load_anomaly_config()
 
 # Export constants for backward compatibility
 ANOMALY_THRESHOLD = DEFAULT_CONFIG.anomaly_threshold
@@ -245,15 +274,15 @@ ROLLING_WINDOWS = [1, 3, 6, 12]
 WELL_TYPES = ['Rod Pump', 'ESP', 'Gas Lift']
 
 # Fallback features when sensor_config unavailable (matches sensor_definitions)
-def _red_buff_features_fallback() -> Dict[str, List[str]]:
-    from anomaly_detection.red_buff_sensors import features_fallback_dict
+def _tenant_features_fallback() -> Dict[str, List[str]]:
+    from anomaly_detection.tenant_sensors import features_fallback_dict
     return features_fallback_dict()
 
 
-WELL_TYPE_FEATURES_FALLBACK: Dict[str, List[str]] = _red_buff_features_fallback()
+WELL_TYPE_FEATURES_FALLBACK: Dict[str, List[str]] = _tenant_features_fallback()
 
 # Full sensor set per lift (legacy export name CRITICAL_SENSORS).
-CRITICAL_SENSORS: Dict[str, List[str]] = _red_buff_features_fallback()
+CRITICAL_SENSORS: Dict[str, List[str]] = _tenant_features_fallback()
 
 # ============================================================================
 # LOGGING
@@ -311,7 +340,7 @@ def get_safe_value(d: Dict, k: str, default: float = 0.0) -> float:
 
 def get_well_type_rules(lift_type: str) -> Dict:
     """
-    Red Bluff band profiles for a lift type: reference mean, span, and units
+    Tenant band profiles for a lift type: reference mean, span, and units
     per canonical WELL_SENSOR_READINGS column (no sensor_ranges.parquet).
     """
     if os.environ.get("SAGEMAKER_REGION"):
@@ -567,12 +596,12 @@ class AnomalyDetector:
         well_id: Optional[str] = None
     ) -> Tuple[List, float]:
         """
-        Band-based score using Red Bluff reference means ± deviation_pct.
+        Band-based score using tenant reference means ± deviation_pct.
 
-        Evaluates every sensor for the lift type (full Red Bluff profile), not a
-        critical subset. Per-well trained means override Red Bluff midpoints.
+        Evaluates every sensor for the lift type (full tenant profile), not a
+        critical subset. Per-well trained means override reference midpoints.
         """
-        from anomaly_detection.red_buff_sensors import (
+        from anomaly_detection.tenant_sensors import (
             compute_band,
             detection_fields_for_lift,
             profile_by_field,
@@ -668,12 +697,15 @@ class AnomalyDetector:
                 else:
                     beyond_pct = abs(value - band_max) / width * 100.0
 
+                if beyond_pct < self.config.violation_min_beyond_pct:
+                    continue
+
                 avg_str = self._format_value(avg)
                 min_str = self._format_value(band_min)
                 max_str = self._format_value(band_max)
                 val_str = self._format_value(value)
                 unit_str = f" {sensor_unit}" if sensor_unit else ""
-                source = "well baseline" if trained_mean is not None else "Red Bluff reference"
+                source = "well baseline" if trained_mean is not None else "reference baseline"
                 violation_text = (
                     f"Outside expected band ({source}). "
                     f"Mean {avg_str}{unit_str}, allowed ±{deviation_pct:.0f}% "
@@ -771,7 +803,7 @@ class AnomalyDetector:
         
         active_rules = get_well_type_rules(lift_type)
         
-        # Band-based detection (Red Bluff reference mean ± deviation_pct; per-well stat override)
+        # Band-based detection (tenant reference mean ± deviation_pct; per-well stat override)
         violations, rule_anomaly_score = self._compute_rule_based_score(
             readings,
             active_rules,
@@ -840,7 +872,9 @@ class AnomalyDetector:
             combined_score,
         )
 
-        is_anomaly = len(violations) > 0 or combined_score >= self.config.anomaly_threshold
+        min_viol_score = self.config.min_score_with_violations
+        rule_trigger = len(violations) > 0 and combined_score >= min_viol_score
+        is_anomaly = rule_trigger or combined_score >= self.config.anomaly_threshold
 
         return {
             "is_anomaly": is_anomaly,
@@ -962,8 +996,8 @@ class AnomalyDetector:
                     return features
             except Exception as e:
                 logger.warning(f"Could not get features from sensor_config for {lift_type}: {e}")
-        from anomaly_detection.red_buff_sensors import get_features_for_lift_type as rb_features
-        return rb_features(lift_type)
+        from anomaly_detection.tenant_sensors import get_features_for_lift_type as tenant_features
+        return tenant_features(lift_type)
     
     def train_isolation_forest(self, data: np.ndarray, well_type: str) -> Optional[Dict[str, Any]]:
         """
@@ -1135,8 +1169,9 @@ def get_detector(config: Optional[AnomalyConfig] = None) -> AnomalyDetector:
         _detector_config = config
     
     if _detector is None:
-        _detector = AnomalyDetector(config=config or DEFAULT_CONFIG)
-        _detector_config = config or DEFAULT_CONFIG
+        resolved = config or load_anomaly_config()
+        _detector = AnomalyDetector(config=resolved)
+        _detector_config = resolved
         
     return _detector
 

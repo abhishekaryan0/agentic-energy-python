@@ -235,13 +235,19 @@ class TrendAnalyzer:
         if 'motor_current' in self.df.columns and 'motor_temp' in self.df.columns:
             corr = self.df['motor_current'].corr(self.df['motor_temp'])
             metrics['motor_current_motor_temp_corr'] = float(corr) if pd.notna(corr) else None
-        
-        if 'motor_current' in self.df.columns and 'vibration_x' in self.df.columns:
-            corr = self.df['motor_current'].corr(self.df['vibration_x'])
+
+        vib_col = 'vibration_x' if 'vibration_x' in self.df.columns else None
+        if vib_col and 'motor_current' in self.df.columns:
+            corr = self.df['motor_current'].corr(self.df[vib_col])
             metrics['motor_current_vibration_corr'] = float(corr) if pd.notna(corr) else None
-        
-        if 'motor_load' in self.df.columns and 'drive_frequency' in self.df.columns:
-            corr = self.df['motor_load'].corr(self.df['drive_frequency'])
+
+        freq_col = 'freq_hz' if 'freq_hz' in self.df.columns else 'drive_frequency'
+        if 'motor_current' in self.df.columns and freq_col in self.df.columns:
+            corr = self.df['motor_current'].corr(self.df[freq_col])
+            metrics['motor_current_freq_corr'] = float(corr) if pd.notna(corr) else None
+
+        if 'motor_load' in self.df.columns and freq_col in self.df.columns:
+            corr = self.df['motor_load'].corr(self.df[freq_col])
             metrics['load_frequency_corr'] = float(corr) if pd.notna(corr) else None
 
     def _add_rod_pump_correlations(self, metrics: Dict[str, Any]) -> None:
@@ -249,25 +255,36 @@ class TrendAnalyzer:
         if 'strokes_per_minute' in self.df.columns and 'polish_rod_load' in self.df.columns:
             corr = self.df['strokes_per_minute'].corr(self.df['polish_rod_load'])
             metrics['spm_load_corr'] = float(corr) if pd.notna(corr) else None
-        
+        elif 'strokes_per_minute' in self.df.columns and 'motor_current' in self.df.columns:
+            corr = self.df['strokes_per_minute'].corr(self.df['motor_current'])
+            metrics['spm_load_corr'] = float(corr) if pd.notna(corr) else None
+
         if 'pump_fillage' in self.df.columns and 'inferred_production' in self.df.columns:
             corr = self.df['pump_fillage'].corr(self.df['inferred_production'])
             metrics['fillage_production_corr'] = float(corr) if pd.notna(corr) else None
-        
+        elif 'pump_fillage' in self.df.columns and 'tubing_pressure' in self.df.columns:
+            corr = self.df['pump_fillage'].corr(self.df['tubing_pressure'])
+            metrics['fillage_production_corr'] = float(corr) if pd.notna(corr) else None
+
         if 'strokes_per_minute' in self.df.columns and 'torque' in self.df.columns:
             corr = self.df['strokes_per_minute'].corr(self.df['torque'])
             metrics['spm_torque_corr'] = float(corr) if pd.notna(corr) else None
 
     def _add_gas_lift_correlations(self, metrics: Dict[str, Any]) -> None:
         """Add Gas Lift-specific correlations."""
-        if 'injection_rate' in self.df.columns and 'bottomhole_pressure' in self.df.columns:
-            corr = self.df['injection_rate'].corr(self.df['bottomhole_pressure'])
+        pressure_col = (
+            'bottomhole_pressure'
+            if 'bottomhole_pressure' in self.df.columns
+            else 'casing_pressure'
+        )
+        if 'injection_rate' in self.df.columns and pressure_col in self.df.columns:
+            corr = self.df['injection_rate'].corr(self.df[pressure_col])
             metrics['injection_production_corr'] = float(corr) if pd.notna(corr) else None
-        
+
         if 'injection_pressure' in self.df.columns and 'injection_rate' in self.df.columns:
             corr = self.df['injection_pressure'].corr(self.df['injection_rate'])
             metrics['pressure_rate_corr'] = float(corr) if pd.notna(corr) else None
-        
+
         if 'plunger_velocity' in self.df.columns and 'arrival_count' in self.df.columns:
             corr = self.df['plunger_velocity'].corr(self.df['arrival_count'])
             metrics['velocity_arrival_corr'] = float(corr) if pd.notna(corr) else None

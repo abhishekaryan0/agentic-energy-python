@@ -14,7 +14,9 @@ from s3_to_postgres.db import (
     postgres_connection,
     prune_production_outside_retention,
     refresh_monthly_production,
+    release_production_sync_lock,
     retention_min_date,
+    try_acquire_production_sync_lock,
 )
 from s3_to_postgres.sync_daily_production import DEFAULT_BACKFILL_YEARS, resolve_retention_years
 
@@ -58,8 +60,24 @@ def sync_monthly_production(
 
     with postgres_connection(settings.database_url, settings.postgres_schema) as conn:
         ensure_production_tables(conn)
-        monthly_rows = refresh_monthly_production(conn, settings.organization_id, months)
-        pruned = prune_production_outside_retention(conn, settings.organization_id, retention_start)
+        if not try_acquire_production_sync_lock(conn, settings.organization_id):
+            conn.commit()
+            return {
+                "table": settings.sync_table,
+                "schema": settings.postgres_schema,
+                "sync_mode": sync_mode,
+                "retention_years": retention_years,
+                "retention_min_date": retention_start.isoformat(),
+                "status": "skipped",
+                "skip_reason": "production_sync_in_progress",
+            }
+        try:
+            monthly_rows = refresh_monthly_production(conn, settings.organization_id, months)
+            pruned = prune_production_outside_retention(conn, settings.organization_id, retention_start)
+            conn.commit()
+        finally:
+            release_production_sync_lock(conn, settings.organization_id)
+            conn.commit()
 
     result: Dict[str, Any] = {
         "table": settings.sync_table,

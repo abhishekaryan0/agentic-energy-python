@@ -12,8 +12,8 @@ export AWS_PAGER=""
 
 REGION="${AWS_REGION:-us-east-1}"
 CLUSTER="${ECS_CLUSTER:-operations-detection-cluster}"
-TASK_FAMILY="operations-detection-batch"
-LOG_GROUP="/ecs/operations-detection"
+TASK_FAMILY="${TASK_FAMILY:-operations-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/operations-detection}"
 RULE_NAME="${RULE_NAME:-operations-detection-weekly}"
 SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 2 ? * MON *)}"
 
@@ -28,12 +28,50 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_TASK_FAMILY="${TASK_FAMILY:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
+_SAVED_LOG_GROUP="${LOG_GROUP:-}"
+_SAVED_EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-}"
+_SAVED_OPERATIONS_MODEL_TARBALL_S3_URI="${OPERATIONS_MODEL_TARBALL_S3_URI:-}"
+_SAVED_OPS_DETECTION_DAYS="${OPS_DETECTION_DAYS:-}"
+_SAVED_OPS_DETECTION_FORCE_WINDOW="${OPS_DETECTION_FORCE_WINDOW:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
 fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_TASK_FAMILY" ]]; then
+  export TASK_FAMILY="$_SAVED_TASK_FAMILY"
+fi
+if [[ -n "$_SAVED_RULE_NAME" ]]; then
+  export RULE_NAME="$_SAVED_RULE_NAME"
+fi
+if [[ -n "$_SAVED_LOG_GROUP" ]]; then
+  export LOG_GROUP="$_SAVED_LOG_GROUP"
+fi
+if [[ -n "$_SAVED_EVENTBRIDGE_ROLE_NAME" ]]; then
+  export EVENTBRIDGE_ROLE_NAME="$_SAVED_EVENTBRIDGE_ROLE_NAME"
+fi
+if [[ -n "$_SAVED_OPERATIONS_MODEL_TARBALL_S3_URI" ]]; then
+  export OPERATIONS_MODEL_TARBALL_S3_URI="$_SAVED_OPERATIONS_MODEL_TARBALL_S3_URI"
+fi
+if [[ -n "$_SAVED_OPS_DETECTION_DAYS" ]]; then
+  export OPS_DETECTION_DAYS="$_SAVED_OPS_DETECTION_DAYS"
+fi
+if [[ -n "$_SAVED_OPS_DETECTION_FORCE_WINDOW" ]]; then
+  export OPS_DETECTION_FORCE_WINDOW="$_SAVED_OPS_DETECTION_FORCE_WINDOW"
+fi
+
+TASK_FAMILY="${TASK_FAMILY:-operations-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/operations-detection}"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-operations-detection-events-role}"
+OPS_DETECTION_DAYS="${OPS_DETECTION_DAYS:-7}"
+OPS_DETECTION_FORCE_WINDOW="${OPS_DETECTION_FORCE_WINDOW:-0}"
 
 : "${S3_BUCKET:?Set S3_BUCKET}"
 : "${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
@@ -90,6 +128,18 @@ if ! aws iam get-role --role-name "$TASK_ROLE_NAME" &>/dev/null; then
   sleep 10
 fi
 
+if [[ -n "${DATABASE_URL_SECRET_ARN:-}" ]]; then
+  aws iam put-role-policy --role-name "$TASK_ROLE_NAME" --policy-name "OperationsDetectionSecrets" \
+    --policy-document "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [{
+        \"Effect\": \"Allow\",
+        \"Action\": [\"secretsmanager:GetSecretValue\"],
+        \"Resource\": [\"${DATABASE_URL_SECRET_ARN}\"]
+      }]
+    }" 2>/dev/null || true
+fi
+
 EVENTS_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EVENTBRIDGE_ROLE_NAME}"
 if ! aws iam get-role --role-name "$EVENTBRIDGE_ROLE_NAME" &>/dev/null; then
   aws iam create-role --role-name "$EVENTBRIDGE_ROLE_NAME" \
@@ -108,12 +158,13 @@ fi
 echo ""
 echo "=== 4) Register ECS task definition ==="
 TASK_DEF_PATH="$SCRIPT_DIR/ecs_task_definition.json"
-export LOG_GROUP REGION
+export LOG_GROUP REGION TASK_FAMILY OPS_DETECTION_DAYS OPS_DETECTION_FORCE_WINDOW
 TASK_JSON="$(python3 - "$TASK_DEF_PATH" "$ECR_URI" "$EXECUTION_ROLE_ARN" "$TASK_ROLE_ARN" <<'PY'
 import json, os, sys
 path, ecr, exec_arn, task_arn = sys.argv[1:5]
 text = open(path).read()
 repl = {
+  "TASK_FAMILY_VALUE": os.environ.get("TASK_FAMILY", "operations-detection-batch"),
   "EXECUTION_ROLE_ARN": exec_arn,
   "TASK_ROLE_ARN": task_arn,
   "IMAGE_URI": ecr,
@@ -122,7 +173,11 @@ repl = {
   "S3_BUCKET_VALUE": os.environ["S3_BUCKET"],
   "ORGANIZATION_ID_VALUE": os.environ["ORGANIZATION_ID"],
   "OPERATIONS_MODEL_TARBALL_S3_URI_VALUE": os.environ["OPERATIONS_MODEL_TARBALL_S3_URI"],
+  "OPS_DETECTION_DAYS_VALUE": os.environ.get("OPS_DETECTION_DAYS", "7"),
+  "OPS_DETECTION_FORCE_WINDOW_VALUE": os.environ.get("OPS_DETECTION_FORCE_WINDOW", "0"),
   "EIA_API_KEY_VALUE": os.environ.get("EIA_API_KEY", ""),
+  "DATABASE_URL_VALUE": os.environ.get("DATABASE_URL", ""),
+  "DATABASE_URL_SECRET_ARN_VALUE": os.environ.get("DATABASE_URL_SECRET_ARN", ""),
   "OPENAI_API_KEY_VALUE": os.environ.get("OPENAI_API_KEY", ""),
   "OPENAI_API_BASE_VALUE": os.environ.get("OPENAI_API_BASE", ""),
 }
@@ -183,4 +238,5 @@ echo "  Cron:     $SCHEDULE_CRON"
 echo "  Cluster:  $CLUSTER"
 echo "  Task:     $TASK_FAMILY"
 echo "  Model:    $OPERATIONS_MODEL_TARBALL_S3_URI"
+echo "  Window:   OPS_DETECTION_DAYS=$OPS_DETECTION_DAYS FORCE_WINDOW=$OPS_DETECTION_FORCE_WINDOW"
 echo "  Logs:     aws logs tail $LOG_GROUP --follow --region $REGION"

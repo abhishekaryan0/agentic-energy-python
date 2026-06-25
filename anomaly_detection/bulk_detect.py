@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from anomaly_detection.detection_filters import should_skip_detection_row
-from anomaly_detection.detector import ML_ONLY_ANOMALY_THRESHOLD, get_detector
+from anomaly_detection.detector import get_detector
 from anomaly_detection.llm_suggestions import generate_suggestion, persist_suggestion_to_s3, calculate_severity
 from anomaly_detection.s3_history import (
     load_recent_anomaly_suggestions_for_well,
@@ -30,12 +30,17 @@ def _get_bucket_and_org() -> Tuple[str, str]:
     return bucket, org
 
 
-def _load_sensor_dataframe(bucket: str, org: str) -> pd.DataFrame:
+def _load_sensor_dataframe(
+    bucket: str, org: str, *, max_partition_days: Optional[int] = None
+) -> pd.DataFrame:
     """Load sensor readings (bulk / legacy path): recent N partition days."""
     from anomaly_detection.sensor_data import load_well_sensor_readings_from_s3
 
-    raw = os.getenv("ANOMALY_SENSOR_PARTITION_DAYS", "30").strip()
-    max_days = int(raw) if raw.isdigit() else 30
+    if max_partition_days is None:
+        raw = os.getenv("ANOMALY_SENSOR_PARTITION_DAYS", "30").strip()
+        max_days = int(raw) if raw.isdigit() else 30
+    else:
+        max_days = max(1, int(max_partition_days))
     return load_well_sensor_readings_from_s3(
         bucket, org, max_partition_days=max_days, prefer_partitions=True
     )
@@ -352,6 +357,7 @@ def _maybe_persist_llm_suggestion(
             timestamp_str=timestamp_str,
             historical_anomalies=_historical_anomalies_for_well(str(well_id), organization_id),
             lift_type=lift_type,
+            organization_id=organization_id,
         )
         persist_suggestion_to_s3(
             anomaly_details=anomaly_details,
@@ -447,9 +453,8 @@ def _persist_anomaly_if_detected(
     )
 
     try:
-        if (not anomaly_details.get("violations")) and float(anomaly_details.get("anomaly_score", 0)) < float(
-            ML_ONLY_ANOMALY_THRESHOLD
-        ):
+        ml_only_threshold = float(detector.config.ml_only_threshold)
+        if (not anomaly_details.get("violations")) and float(anomaly_details.get("anomaly_score", 0)) < ml_only_threshold:
             anomaly_details["is_anomaly"] = False
     except Exception:
         pass
@@ -629,19 +634,23 @@ def run_recent_rows_anomaly_detection(
     last_rows: int = 1000,
     max_wells: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Detect on the newest row per well in the last `last_rows` readings (no checkpoint)."""
+    """Score the last `last_rows` sensor readings org-wide (no checkpoint)."""
     if last_rows < 1:
         raise ValueError("last_rows must be >= 1")
 
     bucket, org = _get_bucket_and_org()
+    recent_days_raw = (os.getenv("ANOMALY_RECENT_PARTITION_DAYS") or "7").strip()
+    recent_days = max(1, int(recent_days_raw)) if recent_days_raw.isdigit() else 7
 
     logger.info(
-        "Loading sensor data for org %s (last %s rows, partition days=%s)",
+        "Loading sensor data for org %s (recent mode: last %s rows, partition days=%s)",
         org,
         last_rows,
-        os.getenv("ANOMALY_SENSOR_PARTITION_DAYS", "30"),
+        recent_days,
     )
-    full_df = _normalize_sensor_dataframe(_load_sensor_dataframe(bucket, org))
+    full_df = _normalize_sensor_dataframe(
+        _load_sensor_dataframe(bucket, org, max_partition_days=recent_days)
+    )
     if full_df.empty:
         return {"success": True, "message": "No sensor readings found", "wells_processed": 0, "anomalies": 0}
 
@@ -972,9 +981,8 @@ def run_bulk_anomaly_detection(
 
         # Guard: ML-only score should be high enough when there are no rule violations
         try:
-            if (not anomaly_details.get("violations")) and float(anomaly_details.get("anomaly_score", 0)) < float(
-                ML_ONLY_ANOMALY_THRESHOLD
-            ):
+            ml_only_threshold = float(detector.config.ml_only_threshold)
+            if (not anomaly_details.get("violations")) and float(anomaly_details.get("anomaly_score", 0)) < ml_only_threshold:
                 anomaly_details["is_anomaly"] = False
         except Exception:
             pass

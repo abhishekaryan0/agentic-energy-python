@@ -1,0 +1,13 @@
+# Container image for AWS Lambda: Apex Permian synthetic data → Snowflake.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY APEX_PERMIAN/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY APEX_PERMIAN ${LAMBDA_TASK_ROOT}/APEX_PERMIAN
+COPY transformations/__init__.py ${LAMBDA_TASK_ROOT}/transformations/__init__.py
+COPY transformations/columns.py ${LAMBDA_TASK_ROOT}/transformations/columns.py
+
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+CMD ["APEX_PERMIAN.handler.handler"]

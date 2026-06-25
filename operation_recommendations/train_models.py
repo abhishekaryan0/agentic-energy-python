@@ -136,6 +136,78 @@ def _fit_random_forest_classifier(X: np.ndarray, y: np.ndarray, lift_label: str)
     return rf
 
 
+def _invoice_roll_features_from_history(
+    inv_well: pd.DataFrame,
+    *,
+    as_of,
+    windows: List[int],
+) -> Dict[str, float]:
+    """
+    Sum invoice aggregates over calendar lookback windows ending at ``as_of``.
+
+    Uses the latest production/checkpoint date as ``as_of``. When invoice parquet
+    is current (``max invoice date >= as_of``), rolls are the trailing N-day sums
+    ending on that date — same behavior as when financial data is live.
+
+    When uploads lag (e.g. invoices only through 2024 while detection runs in 2026),
+    the window end is clamped to ``max invoice date`` so LOE history still feeds
+    implementation-cost features until fresher financial_data is uploaded.
+    """
+    from datetime import date, datetime, timedelta
+
+    def _inv_keys(w: int):
+        return (
+            f"invoice_total_usd_roll{w}d",
+            f"invoice_count_roll{w}d",
+            f"workover_total_usd_roll{w}d",
+            f"workover_count_roll{w}d",
+        )
+
+    out: Dict[str, float] = {}
+    for w in windows:
+        for key in _inv_keys(w):
+            out[key] = 0.0
+
+    if inv_well is None or inv_well.empty:
+        return out
+
+    idx = pd.to_datetime(inv_well.index, errors="coerce")
+    inv_hist = inv_well.copy()
+    inv_hist.index = idx
+    inv_hist = inv_hist[~inv_hist.index.isna()].sort_index()
+    if inv_hist.empty:
+        return out
+
+    if isinstance(as_of, datetime):
+        as_of_date = as_of.date()
+    elif isinstance(as_of, date):
+        as_of_date = as_of
+    else:
+        as_of_date = pd.to_datetime(as_of).date()
+
+    max_inv = inv_hist.index.max().date()
+    effective_as_of = min(as_of_date, max_inv)
+    if effective_as_of < as_of_date:
+        logger.debug(
+            "Invoice history ends %s before as_of %s; using trailing rolls through last invoice date",
+            max_inv.isoformat(),
+            as_of_date.isoformat(),
+        )
+
+    for w in windows:
+        invoice_total_key, invoice_count_key, workover_total_key, workover_count_key = _inv_keys(w)
+        start = effective_as_of - timedelta(days=max(0, w - 1))
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(effective_as_of)
+        sl = inv_hist.loc[(inv_hist.index >= start_ts) & (inv_hist.index <= end_ts)]
+        out[invoice_total_key] = float(pd.to_numeric(sl.get("invoice_total_usd"), errors="coerce").fillna(0.0).sum())
+        out[invoice_count_key] = float(pd.to_numeric(sl.get("invoice_count"), errors="coerce").fillna(0.0).sum())
+        out[workover_total_key] = float(pd.to_numeric(sl.get("workover_total_usd"), errors="coerce").fillna(0.0).sum())
+        out[workover_count_key] = float(pd.to_numeric(sl.get("workover_count"), errors="coerce").fillna(0.0).sum())
+
+    return out
+
+
 def build_metrics_from_parquet(
     sensor_parquet_path: str,
     production_parquet_path: str,
@@ -152,7 +224,9 @@ def build_metrics_from_parquet(
     - workover_total_usd_roll{window}d
     - workover_count_roll{window}d
     """
-    from datetime import timedelta
+    from datetime import date, datetime, timedelta
+
+    from operation_recommendations.well_id_utils import remap_invoice_rows_to_production_wells
 
     sensor_df = _load_parquet(sensor_parquet_path)
     prod_df = _load_parquet(production_parquet_path)
@@ -222,6 +296,14 @@ def build_metrics_from_parquet(
             # Invoice count: in our synthetic invoices, `invoice_id` is present and non-null,
             # so row-count equals invoice-count. This mirrors financial/train_models.py default behavior.
             inv_all["invoice_row_count"] = 1
+
+            production_well_ids = set(sensor_df[well_col].dropna().astype(str))
+            inv_remap = remap_invoice_rows_to_production_wells(
+                inv_all["well_id"].astype(str).unique(),
+                production_well_ids,
+            )
+            inv_all["well_id"] = inv_all["well_id"].astype(str).map(lambda w: inv_remap.get(w, w))
+
             inv_day = (
                 inv_all.groupby(["well_id", "invoice_date"], as_index=False)
                 .agg(
@@ -276,26 +358,21 @@ def build_metrics_from_parquet(
                 metrics[workover_total_key] = 0.0
                 metrics[workover_count_key] = 0.0
 
-            if inv_day is not None and len(well_prod) > 0:
-                # Mirror financial/train_models.py:
-                # 1) join invoice aggregates onto *daily production dates* for the well
-                # 2) fill missing invoice values with 0.0
-                # 3) compute rolling(window=window_days).sum() and take the latest value
-                dates = pd.Index([d.date() if hasattr(d, "date") else d for d in well_prod.index])
+            if inv_day is not None:
+                as_of = date.today()
+                if len(well_prod) > 0:
+                    try:
+                        as_of = pd.to_datetime(well_prod.index.max()).date()
+                    except Exception:
+                        pass
                 inv_well = inv_day[inv_day["well_id"].astype(str) == str(well)].set_index("invoice_date")
                 if len(inv_well) > 0:
-                    for w in windows_to_compute:
-                        invoice_total_key, invoice_count_key, workover_total_key, workover_count_key = _inv_keys(w)
-                        for src_col, dst_key in [
-                            ("invoice_total_usd", invoice_total_key),
-                            ("invoice_count", invoice_count_key),
-                            ("workover_total_usd", workover_total_key),
-                            ("workover_count", workover_count_key),
-                        ]:
-                            s = inv_well[src_col].reindex(dates, fill_value=0.0)
-                            s = pd.to_numeric(s, errors="coerce").fillna(0.0)
-                            rolled = s.rolling(window=w, min_periods=1).sum()
-                            metrics[dst_key] = float(rolled.iloc[-1]) if len(rolled) else 0.0
+                    roll_feats = _invoice_roll_features_from_history(
+                        inv_well,
+                        as_of=as_of,
+                        windows=windows_to_compute,
+                    )
+                    metrics.update(roll_feats)
 
         # Production-derived signals for operational trends (slopes + short roll mean).
         if len(well_prod) >= 3 and len(well_prod.columns) > 0:

@@ -33,11 +33,17 @@ Deploy / run:
 # Weekly detection (ECS + EventBridge, Mondays 02:00 UTC)
 ./operation_recommendations/deploy/schedule_detection.sh
 
+# Apex Permian (separate ECS task + schedule)
+./operation_recommendations/deploy/schedule_detection_apex.sh
+
 # SageMaker training (one-off)
 ./operation_recommendations/deploy/run_sagemaker_training.sh
 
 # Weekly SageMaker training schedule (operations only, Mon 02:20 UTC)
 ./operation_recommendations/deploy/schedule_sagemaker_training.sh
+
+# Apex Permian weekly training (Mon 02:40 UTC)
+./operation_recommendations/deploy/schedule_sagemaker_training_apex.sh
 ```
 
 ## S3 layout

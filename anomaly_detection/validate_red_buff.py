@@ -1,5 +1,5 @@
 """
-Red Bluff validation: measure whether anomaly scores rise before SHUT-IN events.
+Red Buff validation: measure whether anomaly scores rise before SHUT-IN events.
 
 Usage (from repo root):
   export S3_BUCKET=... ORGANIZATION_ID=...
@@ -222,7 +222,7 @@ def run_validation(*, max_wells: Optional[int] = None) -> Dict[str, Any]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate anomaly scores before Red Bluff SHUT-IN events")
+    parser = argparse.ArgumentParser(description="Validate anomaly scores before Red Buff SHUT-IN events")
     parser.add_argument("--max-wells", type=int, default=None, help="Limit wells (default: env or all)")
     args = parser.parse_args(argv)
     try:

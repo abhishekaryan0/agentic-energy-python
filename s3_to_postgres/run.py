@@ -3,10 +3,10 @@ Local / manual entry point.
 
 Usage:
   export S3_BUCKET=...
-  export ORGANIZATION_ID=...
+  export ORGANIZATION_ID=...                        # single tenant
+  export ORGANIZATION_IDS=org-a,org-b               # or multiple tenants
   export DATABASE_URL=...
   python -m s3_to_postgres.run --table anomaly_suggestions
-  python -m s3_to_postgres.run --table anomaly_violations --sync-mode backfill
   python -m s3_to_postgres.run --table daily_production --sync-mode backfill --backfill-years 2
   python -m s3_to_postgres.run --table all --sync-mode backfill
 """
@@ -17,14 +17,28 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 
-from s3_to_postgres.handler import SYNC_HANDLERS
+from s3_to_postgres.handler import run_sync
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.is_file():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(env_path)
+    except ImportError:
+        pass
+
+
 def main() -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(description="Sync detection parquet from S3 to PostgreSQL")
     parser.add_argument(
         "--sync-mode",
@@ -44,7 +58,6 @@ def main() -> int:
         default="anomaly_suggestions",
         choices=[
             "anomaly_suggestions",
-            "anomaly_violations",
             "anomaly_reviews",
             "operation_recommendations",
             "daily_production",
@@ -52,25 +65,38 @@ def main() -> int:
             "all",
         ],
     )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        help="Limit daily_production files per run (resume via checkpoint on next invoke)",
+    )
+    parser.add_argument(
+        "--organization-id",
+        help="Sync a single organization (overrides ORGANIZATION_IDS env)",
+    )
     args = parser.parse_args()
 
-    event = {"sync_mode": args.sync_mode, "table": args.table, "backfill_years": args.backfill_years}
+    event: dict = {
+        "sync_mode": args.sync_mode,
+        "table": args.table,
+        "backfill_years": args.backfill_years,
+    }
     if args.s3_key:
         event["s3_key"] = args.s3_key
+    if args.max_files is not None:
+        event["max_files"] = args.max_files
+    if args.organization_id:
+        event["organization_id"] = args.organization_id
 
-    tables = list(SYNC_HANDLERS.keys()) if args.table == "all" else [args.table]
-    results = []
-    for table in tables:
-        payload = {k: v for k, v in event.items() if k != "table"}
-        payload["settings_overrides"] = {"sync_table": table}
-        results.append(SYNC_HANDLERS[table](payload))
+    results = run_sync(event)
 
     if len(results) == 1:
         print(json.dumps(results[0], indent=2, default=str))
         return 0 if results[0].get("status") != "error" else 1
 
     print(json.dumps({"status": "ok", "results": results}, indent=2, default=str))
-    return 0
+    failed = any(item.get("status") == "error" for item in results)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

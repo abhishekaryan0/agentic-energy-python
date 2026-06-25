@@ -21,11 +21,17 @@ From repo root (with `.env` or `S3_BUCKET`, `ORGANIZATION_ID`):
 # First run: ANOMALY_REVIEW_FORCE_WINDOW=1 for 180-day backfill
 ./anomaly_review/deploy/schedule_detection.sh
 
+# Apex Permian (separate ECS task + schedule)
+./anomaly_review/deploy/schedule_detection_apex.sh
+
 # SageMaker training (one-off)
 ./anomaly_review/deploy/run_sagemaker_training.sh
 
 # Weekly SageMaker training schedule (review only, Mon 02:10 UTC)
 ./anomaly_review/deploy/schedule_sagemaker_training.sh
+
+# Apex Permian weekly training (Mon 02:15 UTC)
+./anomaly_review/deploy/schedule_sagemaker_training_apex.sh
 ```
 
 ## S3 layout

@@ -47,8 +47,14 @@ python -m financial.run --upload
 # One-off (build training image + start job)
 ./financial/deploy/run_sagemaker_training.sh
 
+# Apex Permian one-off
+./financial/deploy/run_sagemaker_training_apex.sh
+
 # Weekly schedule (Mon 02:30 UTC) — own EventBridge rule, starts financial-train-* only
 ./financial/deploy/schedule_sagemaker_training.sh
+
+# Apex Permian weekly training (Mon 02:50 UTC)
+./financial/deploy/schedule_sagemaker_training_apex.sh
 ```
 
 Run `run_sagemaker_training.sh` once first so the training image exists in ECR (`financial-sagemaker-train:latest`).

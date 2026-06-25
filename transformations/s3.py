@@ -146,14 +146,18 @@ def write_dataframe_to_s3(
     region_name: Optional[str] = None,
     compression: str = "snappy",
     write_empty: bool = True,
+    organization_id: Optional[str] = None,
 ) -> Tuple[Optional[str], int]:
     """Write a single dataframe to S3 as parquet."""
     if df is None or df.empty:
         if not write_empty:
             return None, 0
-        df = pd.DataFrame(columns=list(spec.columns))
+        from transformations.field_mappings import resolve_parquet_columns
 
-    df = normalize_batch(df, spec)
+        cols = resolve_parquet_columns(organization_id, spec.source_table, spec.columns)
+        df = pd.DataFrame(columns=list(cols))
+
+    df = normalize_batch(df, spec, organization_id=organization_id)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
     tmp_path = tmp.name
     tmp.close()
@@ -177,6 +181,7 @@ def write_parquet_batches_to_s3(
     region_name: Optional[str] = None,
     compression: str = "snappy",
     write_empty: bool = True,
+    organization_id: Optional[str] = None,
 ) -> Tuple[Optional[str], int]:
     """
     Write DataFrame batches as one parquet object in S3.
@@ -194,7 +199,7 @@ def write_parquet_batches_to_s3(
         for batch in batches:
             if batch is None or batch.empty:
                 continue
-            batch = normalize_batch(batch, spec)
+            batch = normalize_batch(batch, spec, organization_id=organization_id)
             table = pa.Table.from_pandas(batch, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(tmp_path, table.schema, compression=compression)
@@ -205,7 +210,10 @@ def write_parquet_batches_to_s3(
             writer.close()
             writer = None
         elif write_empty:
-            empty = pd.DataFrame(columns=list(spec.columns))
+            from transformations.field_mappings import resolve_parquet_columns
+
+            cols = resolve_parquet_columns(organization_id, spec.source_table, spec.columns)
+            empty = pd.DataFrame(columns=list(cols))
             _write_local_parquet(empty, tmp_path, compression=compression)
         else:
             return None, 0
@@ -229,6 +237,7 @@ def merge_snapshot(
     *,
     region_name: Optional[str] = None,
     write_empty: bool = True,
+    organization_id: Optional[str] = None,
 ) -> Tuple[Optional[str], int]:
     """Merge new rows into the canonical snapshot parquet (dedupe by spec.dedupe_keys)."""
     key = build_s3_key(prefix, spec.output_filename)
@@ -247,10 +256,11 @@ def merge_snapshot(
             spec,
             region_name=region_name,
             write_empty=write_empty,
+            organization_id=organization_id,
         )
 
     keys = list(spec.dedupe_keys)
-    combined = normalize_batch(combined, spec)
+    combined = normalize_batch(combined, spec, organization_id=organization_id)
     combined = combined.drop_duplicates(subset=keys, keep="last")
     if spec.order_by:
         combined = combined.sort_values(list(spec.order_by))
@@ -261,4 +271,5 @@ def merge_snapshot(
         spec,
         region_name=region_name,
         write_empty=write_empty,
+        organization_id=organization_id,
     )

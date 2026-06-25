@@ -1,16 +1,68 @@
 """Runtime configuration for Snowflake-to-S3 parquet transformations."""
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+_ORG_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 DEFAULT_TABLES = ("well_sensor_readings", "well_daily_production")
 TRANSFORM_MODES = ("full", "incremental")
 
 
+def _strip(value: Optional[str]) -> str:
+    return (value or "").strip()
+
+
 def _split_csv(value: str) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_organization_id_list(raw: Any) -> List[str]:
+    if isinstance(raw, (list, tuple)):
+        return [_strip(str(item)) for item in raw if _strip(str(item))]
+    return [_strip(part) for part in str(raw).split(",") if _strip(part)]
+
+
+def load_organization_ids(overrides: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return tenant UUIDs from ORGANIZATION_IDS (comma-separated) or ORGANIZATION_ID."""
+    overrides = overrides or {}
+    raw_list = overrides.get("organization_ids")
+    if raw_list is None:
+        raw_list = os.getenv("ORGANIZATION_IDS")
+    if raw_list:
+        ids = _parse_organization_id_list(raw_list)
+        if not ids:
+            raise ValueError("ORGANIZATION_IDS is empty")
+        return ids
+
+    single = _strip(overrides.get("organization_id") or os.getenv("ORGANIZATION_ID"))
+    if single:
+        return [single]
+    raise ValueError("ORGANIZATION_ID or ORGANIZATION_IDS is required")
+
+
+def resolve_organization_ids(event: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Resolve which organizations to export for a handler/CLI/Lambda event.
+
+    Priority: event organization_id -> event organization_ids -> env ORGANIZATION_IDS -> ORGANIZATION_ID.
+    """
+    event = event or {}
+
+    single = _strip(event.get("organization_id"))
+    if single:
+        return [single]
+
+    raw_list = event.get("organization_ids")
+    if raw_list:
+        ids = _parse_organization_id_list(raw_list)
+        if not ids:
+            raise ValueError("organization_ids is empty")
+        return ids
+
+    return load_organization_ids()
 
 
 def _env_bool(name: str, default: bool) -> bool:

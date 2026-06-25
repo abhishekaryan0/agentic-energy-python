@@ -97,19 +97,62 @@ def dataframe_to_well_status_rows(
     return rows
 
 
+def _table_columns(conn) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'well_status'
+            """
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def _well_status_conflict_columns(conn) -> List[str]:
+    """Use the live primary key (well_id or organization_id, well_id)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.attname
+            FROM pg_index i
+            JOIN pg_class t ON t.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+            WHERE n.nspname = current_schema()
+              AND t.relname = 'well_status'
+              AND i.indisprimary
+            ORDER BY array_position(i.indkey::smallint[], a.attnum)
+            """
+        )
+        cols = [row[0] for row in cur.fetchall()]
+    if cols:
+        return cols
+    return ["well_id"]
+
+
 def upsert_well_statuses(conn, rows: Iterable[Dict[str, Any]]) -> int:
     rows = list(rows)
     if not rows:
         return 0
 
-    columns = list(POSTGRES_WELL_STATUS_COLUMNS)
-    update_columns = [c for c in columns if c != "well_id"]
+    pg_cols = _table_columns(conn)
+    columns = [column for column in POSTGRES_WELL_STATUS_COLUMNS if column in pg_cols]
+    if not columns:
+        raise ValueError("well_status table has no matching columns")
+
+    conflict_cols = [column for column in _well_status_conflict_columns(conn) if column in columns]
+    if not conflict_cols:
+        conflict_cols = ["well_id"] if "well_id" in columns else [columns[0]]
+
+    update_columns = [column for column in columns if column not in conflict_cols]
     placeholders = ", ".join(["%s"] * len(columns))
+    conflict_clause = ", ".join(conflict_cols)
     update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_columns)
     query = f"""
         INSERT INTO well_status ({", ".join(columns)})
         VALUES ({placeholders})
-        ON CONFLICT (well_id) DO UPDATE SET {update_clause}
+        ON CONFLICT ({conflict_clause}) DO UPDATE SET {update_clause}
     """
     params_list = [[row.get(column) for column in columns] for row in rows]
     with conn.cursor() as cur:

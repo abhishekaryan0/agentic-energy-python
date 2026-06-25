@@ -10,7 +10,7 @@ def _sensor_parquet_columns() -> Tuple[str, ...]:
     """
     Canonical sensor columns plus script-compatible alias.
 
-    scripts/generate_digital_twin2.py writes `freq_hz`; Snowflake stores the same
+    APEX_PERMIAN/generate_digital_twin.py writes `freq_hz`; Snowflake stores the same
     signal as DRIVE_FREQUENCY (see RED_BUFF/column_maps). We select both so
     parquet matches twin script field names without breaking consumers of
     `drive_frequency`.

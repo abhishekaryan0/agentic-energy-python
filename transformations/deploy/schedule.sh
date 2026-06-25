@@ -5,7 +5,7 @@
 #
 # Usage (from repo root):
 #   export S3_BUCKET=...
-#   export ORGANIZATION_ID=...
+#   export ORGANIZATION_IDS=...   # or RED_BUFF_/APEX_PERMIAN_ORGANIZATION_ID in .env
 #   # Snowflake vars in .env
 #   ./transformations/deploy/schedule.sh
 #

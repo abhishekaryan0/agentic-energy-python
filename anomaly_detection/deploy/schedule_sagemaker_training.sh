@@ -5,15 +5,18 @@
 #
 # Prerequisite: training image in ECR (run ./anomaly_detection/deploy/run_sagemaker_training.sh once).
 #
+# Apex Permian (separate weekly schedule):
+#   ./anomaly_detection/deploy/schedule_sagemaker_training_apex.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 
 REGION="${AWS_REGION:-us-east-1}"
 CLUSTER="${ECS_CLUSTER:-anomaly-detection-sagemaker-train-cluster}"
-TASK_FAMILY="anomaly-detection-sagemaker-train-launch"
-LOG_GROUP="/ecs/anomaly-detection-sagemaker-train"
+TASK_FAMILY="${TASK_FAMILY:-anomaly-detection-sagemaker-train-launch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-detection-sagemaker-train}"
 RULE_NAME="${RULE_NAME:-anomaly-detection-sagemaker-train-weekly}"
-EVENTBRIDGE_ROLE_NAME="ecs-anomaly-detection-sagemaker-train-events-role"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-detection-sagemaker-train-events-role}"
 EXECUTION_ROLE_NAME="ecs-anomaly-detection-sagemaker-train-execution-role"
 TASK_ROLE_NAME="ecs-anomaly-detection-sagemaker-train-task-role"
 ECR_REPO_LAUNCHER="${ECR_REPO_SAGEMAKER_TRAIN_LAUNCHER:-anomaly-detection-sagemaker-train-launcher}"
@@ -29,12 +32,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_TASK_FAMILY="${TASK_FAMILY:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
+_SAVED_LOG_GROUP="${LOG_GROUP:-}"
+_SAVED_EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
 fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_TASK_FAMILY" ]]; then
+  export TASK_FAMILY="$_SAVED_TASK_FAMILY"
+fi
+if [[ -n "$_SAVED_RULE_NAME" ]]; then
+  export RULE_NAME="$_SAVED_RULE_NAME"
+fi
+if [[ -n "$_SAVED_LOG_GROUP" ]]; then
+  export LOG_GROUP="$_SAVED_LOG_GROUP"
+fi
+if [[ -n "$_SAVED_EVENTBRIDGE_ROLE_NAME" ]]; then
+  export EVENTBRIDGE_ROLE_NAME="$_SAVED_EVENTBRIDGE_ROLE_NAME"
+fi
+
+TASK_FAMILY="${TASK_FAMILY:-anomaly-detection-sagemaker-train-launch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-detection-sagemaker-train}"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-detection-sagemaker-train-events-role}"
 
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET or add to .env}"
 ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID or add to .env}"
@@ -116,6 +143,7 @@ TASK_DEF_PATH="$SCRIPT_DIR/ecs_sagemaker_launch_task_definition.json"
 TASK_JSON=$(sed -e "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE_ARN}|g" \
   -e "s|TASK_ROLE_ARN|${TASK_ROLE_ARN}|g" \
   -e "s|IMAGE_URI|${LAUNCHER_ECR_URI}|g" \
+  -e "s|TASK_FAMILY_VALUE|${TASK_FAMILY}|g" \
   -e "s|S3_BUCKET_VALUE|${S3_BUCKET}|g" \
   -e "s|ORGANIZATION_ID_VALUE|${ORGANIZATION_ID}|g" \
   -e "s|AWS_REGION_VALUE|${REGION}|g" \

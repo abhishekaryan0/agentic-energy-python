@@ -31,8 +31,8 @@ from operation_recommendations.config import (
     CANONICAL_FEATURES,
     FEATURES,
     get_features_for_lift_type,
+    get_organization_id,
 )
-
 from operation_recommendations.recommendations.analyzer import TrendAnalyzer
 from operation_recommendations.recommendations.rules import (
     RuleEngine,
@@ -40,8 +40,7 @@ from operation_recommendations.recommendations.rules import (
     ACTION_CATEGORY_MAP,
     ACTION_MAPPING,
 )
-
-from operation_recommendations.eia_prices import get_brent_spot_usd_per_bbl
+from operation_recommendations.oil_price import resolve_oil_price_usd_per_bbl
 
 logger = logging.getLogger(__name__)
 
@@ -238,11 +237,15 @@ def merge_metrics_for_financial_impact(
 def compute_financial_impact_fields(
     metrics: Optional[Dict[str, Any]],
     production_increase_bbl_day: Optional[float],
+    organization_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Revenue and cost fields aligned with EIA Brent spot and the financial ML model.
+    Revenue and cost fields aligned with org oil price settings and the financial ML model.
 
-    - daily_expense_benefit_usd: bbl/day × latest EIA Brent (or OPERATIONS_OIL_PRICE_USD fallback).
+    Oil price: org_settings.manual_value when oil_price_type=Manual, else EIA Brent
+    (or OPERATIONS_OIL_PRICE_USD fallback when EIA is unavailable).
+
+    - daily_expense_benefit_usd: bbl/day × resolved oil spot price.
     - implementation_cost_usd: **financial model only** — one-time USD =
       ``predict_implementation_cost_usd_per_day × IMPLEMENTATION_LUMP_DAYS`` (no revenue heuristic,
       no EIA scaling on implementation; model output is USD).
@@ -261,7 +264,8 @@ def compute_financial_impact_fields(
     except Exception:
         bbl = 0.0
 
-    price_per_bbl, price_src, price_period = get_brent_spot_usd_per_bbl()
+    org_id = organization_id or get_organization_id()
+    price_per_bbl, price_src, price_period, oil_price_type = resolve_oil_price_usd_per_bbl(org_id)
     daily_benefit = bbl * price_per_bbl
 
     lump_days = float(os.getenv("IMPLEMENTATION_LUMP_DAYS", "30") or 30)
@@ -305,17 +309,18 @@ def compute_financial_impact_fields(
     net_daily = round(daily_benefit_r - (impl_one_time / amort), 2)
     asset_val = round(net_daily * 365.0, 2) if net_daily else 0.0
 
-    eia_price = round(price_per_bbl, 4)
+    spot_price = round(price_per_bbl, 4)
     return {
         "daily_expense_benefit_usd": daily_benefit_r,
         "implementation_cost_usd": impl_one_time,
         "net_daily_benefit_usd": net_daily,
         "asset_value_increase_usd": asset_val,
-        "eia_brent_usd_per_bbl": eia_price,
+        "eia_brent_usd_per_bbl": spot_price,
         "eia_brent_source": price_src,
         "eia_brent_period": price_period,
         "_financial_meta": {
-            "oil_spot_usd_per_bbl": eia_price,
+            "oil_price_type": oil_price_type,
+            "oil_spot_usd_per_bbl": spot_price,
             "oil_spot_source": price_src,
             "oil_spot_period": price_period,
             "implementation_cost_basis": impl_basis,

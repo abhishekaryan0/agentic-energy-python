@@ -7,14 +7,17 @@
 #   export ORGANIZATION_ID=...
 #   ./anomaly_detection/deploy/schedule_detection.sh
 #
+# Apex Permian (separate ECS task — does not change Red Buff schedule):
+#   ./anomaly_detection/deploy/schedule_detection_apex.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 
 REGION="${AWS_REGION:-us-east-1}"
 CLUSTER="${ECS_CLUSTER:-anomaly-detection-cluster}"
-TASK_FAMILY="anomaly-detection-batch"
-LOG_GROUP="/ecs/anomaly-detection"
-EVENTBRIDGE_ROLE_NAME="ecs-anomaly-detection-events-role"
+TASK_FAMILY="${TASK_FAMILY:-anomaly-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-detection}"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-detection-events-role}"
 EXECUTION_ROLE_NAME="ecs-anomaly-detection-execution-role"
 TASK_ROLE_NAME="ecs-anomaly-detection-task-role"
 ECR_REPO_NAME="${ECR_REPO_ANOMALY_DETECTION:-anomaly-detection-fargate}"
@@ -26,12 +29,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_TASK_FAMILY="${TASK_FAMILY:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
+_SAVED_LOG_GROUP="${LOG_GROUP:-}"
+_SAVED_EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-}"
+_SAVED_ANOMALY_MODEL_TRAINING_JOB="${ANOMALY_MODEL_TRAINING_JOB:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
 fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_TASK_FAMILY" ]]; then
+  export TASK_FAMILY="$_SAVED_TASK_FAMILY"
+fi
+if [[ -n "$_SAVED_RULE_NAME" ]]; then
+  export RULE_NAME="$_SAVED_RULE_NAME"
+fi
+if [[ -n "$_SAVED_LOG_GROUP" ]]; then
+  export LOG_GROUP="$_SAVED_LOG_GROUP"
+fi
+if [[ -n "$_SAVED_EVENTBRIDGE_ROLE_NAME" ]]; then
+  export EVENTBRIDGE_ROLE_NAME="$_SAVED_EVENTBRIDGE_ROLE_NAME"
+fi
+if [[ -n "$_SAVED_ANOMALY_MODEL_TRAINING_JOB" ]]; then
+  export ANOMALY_MODEL_TRAINING_JOB="$_SAVED_ANOMALY_MODEL_TRAINING_JOB"
+fi
+
+TASK_FAMILY="${TASK_FAMILY:-anomaly-detection-batch}"
+LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-detection}"
+EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-detection-events-role}"
 
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET or add to .env}"
 ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID or add to .env}"
@@ -119,6 +150,7 @@ TASK_DEF_PATH="$SCRIPT_DIR/ecs_task_definition.json"
 TASK_JSON=$(sed -e "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE_ARN}|g" \
   -e "s|TASK_ROLE_ARN|${TASK_ROLE_ARN}|g" \
   -e "s|IMAGE_URI|${ECR_URI}|g" \
+  -e "s|TASK_FAMILY_VALUE|${TASK_FAMILY}|g" \
   -e "s|S3_BUCKET_VALUE|${S3_BUCKET}|g" \
   -e "s|ORGANIZATION_ID_VALUE|${ORGANIZATION_ID}|g" \
   -e "s|AWS_REGION_VALUE|${REGION}|g" \
@@ -128,6 +160,11 @@ TASK_JSON=$(sed -e "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE_ARN}|g" \
   -e "s|OPENAI_MODEL_VALUE|${OPENAI_MODEL:-gpt-5-mini}|g" \
   -e "s|ANOMALY_MODEL_TRAINING_JOB_VALUE|${ANOMALY_MODEL_TRAINING_JOB}|g" \
   -e "s|ANOMALY_DETECTION_FORCE_WINDOW_VALUE|${ANOMALY_DETECTION_FORCE_WINDOW}|g" \
+  -e "s|ANOMALY_THRESHOLD_VALUE|${ANOMALY_THRESHOLD:-0.75}|g" \
+  -e "s|ANOMALY_ML_ONLY_THRESHOLD_VALUE|${ANOMALY_ML_ONLY_THRESHOLD:-0.85}|g" \
+  -e "s|ANOMALY_RULE_DEVIATION_PCT_VALUE|${ANOMALY_RULE_DEVIATION_PCT:-30}|g" \
+  -e "s|ANOMALY_VIOLATION_MIN_BEYOND_PCT_VALUE|${ANOMALY_VIOLATION_MIN_BEYOND_PCT:-0}|g" \
+  -e "s|ANOMALY_MIN_SCORE_WITH_VIOLATIONS_VALUE|${ANOMALY_MIN_SCORE_WITH_VIOLATIONS:-0}|g" \
   "$TASK_DEF_PATH")
 
 aws ecs register-task-definition --region "$REGION" --cli-input-json "$TASK_JSON" >/dev/null

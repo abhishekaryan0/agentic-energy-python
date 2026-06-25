@@ -1,12 +1,12 @@
 """
-Red Bluff well sensor profiles for anomaly detection.
+Red Buff well sensor profiles for anomaly detection.
 
 Canonical WELL_SENSOR_READINGS column names and healthy reference means are
 aligned with RED_BUFF/column_maps.py and RED_BUFF/generate_digital_twin.py
 SENSOR_NORMALS (midpoint of each healthy operating range).
 
 Band checks use: reference_mean ± deviation_pct% (multiplicative when mean is
-non-trivial; otherwise additive using half the Red Bluff range span).
+non-trivial; otherwise additive using half the Red Buff range span).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
-# Lift labels as stored in Red Bluff / Snowflake parquet
+# Lift labels as stored in Red Buff / Snowflake parquet
 LIFT_TYPES = ("Pumping Unit", "ESP", "Gas Lift")
 
 # Metadata columns — never treated as sensor features
@@ -42,7 +42,7 @@ LIFT_TYPE_ALIASES = {
 
 @dataclass(frozen=True)
 class SensorProfile:
-    """One sensor: canonical parquet column + Red Bluff twin field + healthy range."""
+    """One sensor: canonical parquet column + Red Buff twin field + healthy range."""
 
     canonical_field: str
     red_buff_field: str
@@ -57,6 +57,11 @@ class SensorProfile:
     @property
     def span(self) -> float:
         return self.hi - self.lo
+
+    @property
+    def twin_field(self) -> str:
+        """Digital-twin source column name (Red Buff or Apex)."""
+        return self.red_buff_field
 
 
 # (canonical_field, red_buff_field, lo, hi, unit)
@@ -106,7 +111,7 @@ _PROFILES_BY_LIFT: Dict[str, Tuple[SensorProfile, ...]] = {
 
 
 def normalize_lift_type(lift_type: Optional[str]) -> str:
-    """Map lift_type labels to Red Bluff canonical names."""
+    """Map lift_type labels to Red Buff canonical names."""
     if not lift_type:
         return ""
     key = str(lift_type).strip()
@@ -116,13 +121,13 @@ def normalize_lift_type(lift_type: Optional[str]) -> str:
 
 
 def get_sensor_profiles(lift_type: str) -> List[SensorProfile]:
-    """Sensor profiles for a lift type (canonical columns + Red Bluff healthy ranges)."""
+    """Sensor profiles for a lift type (canonical columns + Red Buff healthy ranges)."""
     canonical = normalize_lift_type(lift_type)
     return list(_PROFILES_BY_LIFT.get(canonical, ()))
 
 
 def get_features_for_lift_type(lift_type: str) -> List[str]:
-    """All canonical sensor columns for this lift type (full Red Bluff set)."""
+    """All canonical sensor columns for this lift type (full Red Buff set)."""
     return [p.canonical_field for p in get_sensor_profiles(lift_type)]
 
 
@@ -143,7 +148,7 @@ def select_training_features(
     """
     All lift-type sensors present in df with enough non-null readings.
 
-    Uses the full Red Bluff profile per lift (not a critical subset).
+    Uses the full Red Buff profile per lift (not a critical subset).
     """
     if df is None or df.empty:
         return []
@@ -195,7 +200,7 @@ def detection_fields_for_lift(
 
 
 def get_reference_means(lift_type: str) -> Dict[str, float]:
-    """Red Bluff healthy midpoint per canonical sensor field."""
+    """Red Buff healthy midpoint per canonical sensor field."""
     return {p.canonical_field: p.mean for p in get_sensor_profiles(lift_type)}
 
 
@@ -209,7 +214,7 @@ def compute_band(
     Band around mean using deviation_pct.
 
     Uses multiplicative band when |mean| is meaningful; otherwise additive
-    using half the Red Bluff healthy span.
+    using half the Red Buff healthy span.
     """
     fraction = max(float(deviation_pct), 0.0) / 100.0
     if abs(mean) > 1e-6:
@@ -229,8 +234,8 @@ def get_sensor_bands(
     """
     Expected bands per sensor: mean ± deviation_pct%.
 
-    Returns dict[field] -> {mean, min, max, unit, deviation_pct, red_buff_field}.
-  """
+    Returns dict[field] -> {mean, min, max, unit, deviation_pct, twin_field}.
+    """
     bands: Dict[str, Dict[str, float]] = {}
     for profile in get_sensor_profiles(lift_type):
         band_min, band_max = compute_band(
@@ -244,7 +249,8 @@ def get_sensor_bands(
             "max": band_max,
             "unit": profile.unit,
             "deviation_pct": deviation_pct,
-            "red_buff_field": profile.red_buff_field,
+            "twin_field": profile.twin_field,
+            "red_buff_field": profile.twin_field,
             "healthy_lo": profile.lo,
             "healthy_hi": profile.hi,
         }
@@ -252,12 +258,12 @@ def get_sensor_bands(
 
 
 def get_lift_types() -> Dict[str, int]:
-    """Lift type registry keyed by Red Bluff / parquet lift_type values."""
+    """Lift type registry keyed by Red Buff / parquet lift_type values."""
     return {name: i + 1 for i, name in enumerate(LIFT_TYPES)}
 
 
 def get_all_sensor_columns() -> List[str]:
-    """Union of identity columns and all Red Bluff sensor fields."""
+    """Union of identity columns and all Red Buff sensor fields."""
     seen = set()
     for lift in LIFT_TYPES:
         for field in get_features_for_lift_type(lift):
@@ -276,5 +282,5 @@ def features_fallback_dict() -> Dict[str, List[str]]:
 
 
 def all_sensors_by_lift() -> Dict[str, List[str]]:
-    """Every Red Bluff sensor per lift (alias for CRITICAL_SENSORS replacement)."""
+    """Every Red Buff sensor per lift (alias for CRITICAL_SENSORS replacement)."""
     return features_fallback_dict()

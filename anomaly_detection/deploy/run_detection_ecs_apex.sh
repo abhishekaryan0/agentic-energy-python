@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#
+# One-off Apex Permian detection bootstrap: score last N rows (default 100),
+# write checkpoint, then daily schedule continues incrementally like Red Buff.
+#
+# Usage:
+#   ./anomaly_detection/deploy/run_detection_ecs_apex.sh
+#   ANOMALY_BOOTSTRAP_ROWS=100 ./anomaly_detection/deploy/run_detection_ecs_apex.sh
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export ORGANIZATION_ID="${APEX_PERMIAN_ORGANIZATION_ID:-147a92b9-f90a-473d-b443-e6e668c4fbb7}"
+export ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-anomaly-detection-apex-permian}"
+export LOG_GROUP="${LOG_GROUP:-/ecs/anomaly-detection-apex-permian}"
+export ANOMALY_MODEL_TRAINING_JOB="${APEX_ANOMALY_MODEL_TRAINING_JOB:-anomaly-train-apex-20260618-1224}"
+export ANOMALY_DETECTION_MODE="${ANOMALY_DETECTION_MODE:-incremental}"
+export ANOMALY_THRESHOLD="${ANOMALY_THRESHOLD:-${APEX_ANOMALY_THRESHOLD:-0.85}}"
+export ANOMALY_ML_ONLY_THRESHOLD="${ANOMALY_ML_ONLY_THRESHOLD:-${APEX_ANOMALY_ML_ONLY_THRESHOLD:-0.92}}"
+export ANOMALY_RULE_DEVIATION_PCT="${ANOMALY_RULE_DEVIATION_PCT:-${APEX_ANOMALY_RULE_DEVIATION_PCT:-45}}"
+export ANOMALY_VIOLATION_MIN_BEYOND_PCT="${ANOMALY_VIOLATION_MIN_BEYOND_PCT:-${APEX_ANOMALY_VIOLATION_MIN_BEYOND_PCT:-15}}"
+export ANOMALY_MIN_SCORE_WITH_VIOLATIONS="${ANOMALY_MIN_SCORE_WITH_VIOLATIONS:-${APEX_ANOMALY_MIN_SCORE_WITH_VIOLATIONS:-0.55}}"
+export ANOMALY_BOOTSTRAP_ROWS="${ANOMALY_BOOTSTRAP_ROWS:-${ANOMALY_LAST_ROWS:-100}}"
+export ANOMALY_LAST_ROWS="${ANOMALY_LAST_ROWS:-$ANOMALY_BOOTSTRAP_ROWS}"
+export ANOMALY_ENABLE_LLM_SUGGESTIONS="${ANOMALY_ENABLE_LLM_SUGGESTIONS:-1}"
+export ANOMALY_RESET_CHECKPOINT="${ANOMALY_RESET_CHECKPOINT:-0}"
+
+exec "$SCRIPT_DIR/run_detection_ecs.sh"

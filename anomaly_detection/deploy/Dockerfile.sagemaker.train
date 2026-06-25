@@ -7,9 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    pandas pyarrow boto3 \
-    scikit-learn joblib numpy pyod torch
+# CPU-only torch (SageMaker ml.m5.* has no GPU); avoids ~4GB CUDA layers and slow ECR pushes.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir pandas pyarrow boto3 scikit-learn joblib numpy pyod
 
 COPY anomaly_detection ./anomaly_detection
 

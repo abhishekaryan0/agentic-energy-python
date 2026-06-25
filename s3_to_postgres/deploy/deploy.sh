@@ -48,13 +48,19 @@ fi
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET}"
 S3_BUCKET="${S3_BUCKET// /}"  # trim accidental whitespace
-ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
+ORGANIZATION_IDS="${ORGANIZATION_IDS:-${ORGANIZATION_ID:-}}"
+if [[ -z "$ORGANIZATION_IDS" ]]; then
+  echo "ERROR: Set ORGANIZATION_ID or ORGANIZATION_IDS"
+  exit 1
+fi
+ORGANIZATION_ID="${ORGANIZATION_ID:-${ORGANIZATION_IDS%%,*}}"
+export ORGANIZATION_IDS ORGANIZATION_ID
 LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-s3-to-postgres-sync}"
 ECR_REPO_NAME="${ECR_REPO_NAME:-s3-to-postgres-lambda}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-s3-to-postgres-lambda-role}"
-LAMBDA_MEMORY="${LAMBDA_MEMORY:-1024}"
-LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-600}"
+LAMBDA_MEMORY="${LAMBDA_MEMORY:-2048}"
+LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-900}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 LAMBDA_VPC_ENABLED="${LAMBDA_VPC_ENABLED:-0}"
 
@@ -111,21 +117,23 @@ aws iam attach-role-policy --role-name "$LAMBDA_ROLE_NAME" \
 aws iam attach-role-policy --role-name "$LAMBDA_ROLE_NAME" \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole 2>/dev/null || true
 
-POLICY_DOC="$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::${S3_BUCKET}",
-        "arn:aws:s3:::${S3_BUCKET}/${ORGANIZATION_ID}/*"
-      ]
-    }
-  ]
-}
-EOF
+POLICY_DOC="$(python3 - <<PY
+import json
+import os
+
+bucket = os.environ["S3_BUCKET"]
+org_ids = [part.strip() for part in os.environ["ORGANIZATION_IDS"].split(",") if part.strip()]
+resources = [f"arn:aws:s3:::{bucket}"]
+resources.extend(f"arn:aws:s3:::{bucket}/{org_id}/*" for org_id in org_ids)
+print(json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+        "Resource": resources,
+    }],
+}))
+PY
 )"
 if [[ -n "${DATABASE_URL_SECRET_ARN:-}" ]]; then
   POLICY_DOC="$(python3 - <<PY
@@ -146,18 +154,23 @@ aws iam put-role-policy --role-name "$LAMBDA_ROLE_NAME" \
 echo ""
 echo "=== 3) Lambda function ==="
 ENV_JSON_FILE="$(mktemp)"
-export ENV_JSON_FILE S3_BUCKET ORGANIZATION_ID LAMBDA_REGION LOG_LEVEL
+export ENV_JSON_FILE S3_BUCKET ORGANIZATION_IDS ORGANIZATION_ID LAMBDA_REGION LOG_LEVEL
 export DATABASE_URL_SECRET_ARN="${DATABASE_URL_SECRET_ARN:-}"
 export DATABASE_URL="${DATABASE_URL:-}"
+export SYNC_SKIP_TABLES="${SYNC_SKIP_TABLES:-}"
 python3 - <<'PY'
 import json
 import os
 
 variables = {
     "S3_BUCKET": os.environ["S3_BUCKET"],
+    "ORGANIZATION_IDS": os.environ["ORGANIZATION_IDS"],
     "ORGANIZATION_ID": os.environ["ORGANIZATION_ID"],
     "LOG_LEVEL": os.environ["LOG_LEVEL"],
 }
+skip_tables = os.environ.get("SYNC_SKIP_TABLES", "").strip()
+if skip_tables:
+    variables["SYNC_SKIP_TABLES"] = skip_tables
 secret_arn = os.environ.get("DATABASE_URL_SECRET_ARN", "").strip()
 database_url = os.environ.get("DATABASE_URL", "").strip()
 if secret_arn:
@@ -224,7 +237,7 @@ echo ""
 echo "Done."
 echo "Function : $LAMBDA_FUNCTION_NAME ($LAMBDA_REGION)"
 echo "Image    : $ECR_URI"
-echo "Target   : schema \"${ORGANIZATION_ID}\" (detections + daily/monthly production)"
+echo "Target   : schemas ${ORGANIZATION_IDS} (detections + daily/monthly production)"
 echo ""
 echo "Test backfill (production, 2 years):"
 echo "  aws lambda invoke --function-name $LAMBDA_FUNCTION_NAME --region $LAMBDA_REGION \\"

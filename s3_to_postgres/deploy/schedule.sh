@@ -46,7 +46,11 @@ LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-s3-to-postgres-sync}"
 RULE_NAME="${RULE_NAME:-s3-to-postgres-sync-daily}"
 SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 1 * * ? *)}"
-ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
+ORGANIZATION_IDS="${ORGANIZATION_IDS:-${ORGANIZATION_ID:-}}"
+if [[ -z "$ORGANIZATION_IDS" ]]; then
+  echo "ERROR: Set ORGANIZATION_ID or ORGANIZATION_IDS"
+  exit 1
+fi
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
 
 if [[ "${SKIP_LAMBDA_DEPLOY:-0}" != "1" ]]; then

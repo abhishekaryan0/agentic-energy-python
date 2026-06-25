@@ -76,7 +76,7 @@ def export_table(
     )
 
     for raw in iter_table_batches(conn, config, spec, window=window):
-        batch = normalize_batch(raw, spec)
+        batch = normalize_batch(raw, spec, organization_id=config.organization_id)
         batch, dropped = validate_batch(
             batch,
             spec,
@@ -116,6 +116,7 @@ def export_table(
                 spec,
                 region_name=config.aws_region,
                 write_empty=config.write_empty_files,
+                organization_id=config.organization_id,
             )
             if uri:
                 partition_uris.append(uri)
@@ -136,6 +137,7 @@ def export_table(
                     spec,
                     region_name=config.aws_region,
                     write_empty=config.write_empty_files,
+                    organization_id=config.organization_id,
                 )
         elif config.merge_snapshots and not new_df.empty:
             snapshot_uri, snapshot_rows = merge_snapshot(
@@ -145,6 +147,7 @@ def export_table(
                 spec,
                 region_name=config.aws_region,
                 write_empty=config.write_empty_files,
+                organization_id=config.organization_id,
             )
         elif not new_df.empty:
             key = build_s3_key(prefix, spec.output_filename)
@@ -155,6 +158,7 @@ def export_table(
                 spec,
                 region_name=config.aws_region,
                 write_empty=config.write_empty_files,
+                organization_id=config.organization_id,
             )
 
     return {

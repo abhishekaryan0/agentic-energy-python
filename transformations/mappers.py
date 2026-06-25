@@ -1,6 +1,6 @@
 """Normalize and validate Snowflake batches before writing parquet.
 
-Dtypes and core field names align with scripts/generate_digital_twin2.py for
+Dtypes and core field names align with `APEX_PERMIAN/generate_digital_twin.py` for
 sensor + daily production parquet (date as calendar date, float32 numerics,
 naive timestamps, object strings, and `freq_hz` alongside `drive_frequency`).
 """
@@ -14,6 +14,7 @@ from typing import Optional, Sequence, Tuple
 import pandas as pd
 
 from transformations.columns import WELL_SENSOR_READINGS_COLUMNS
+from transformations.field_mappings import apply_export_field_mapping, resolve_parquet_columns
 from transformations.schemas import TableExportSpec
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ def _to_object_str_series(s: pd.Series) -> pd.Series:
 
 
 def _coerce_production(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    """Match scripts/generate_digital_twin2._uniform_production_df for overlapping fields."""
+    """Match APEX_PERMIAN.generate_digital_twin._uniform_production_df for overlapping fields."""
     out = df.reindex(columns=list(columns)).copy()
     if "date" in out.columns:
         # Script: pd.to_datetime(df["date"]).dt.date
@@ -75,12 +76,14 @@ def _strip_timestamp_tz_to_naive(s: pd.Series) -> pd.Series:
 
 
 def _coerce_sensor(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    """Match scripts/generate_digital_twin2._build_well_sensor_readings_df patterns."""
+    """Match APEX_PERMIAN.generate_digital_twin._build_well_sensor_readings_df patterns."""
     out = df.reindex(columns=list(columns)).copy()
     if "timestamp" in out.columns:
         out["timestamp"] = _strip_timestamp_tz_to_naive(out["timestamp"])
     if "freq_hz" in out.columns and "drive_frequency" in out.columns:
         out["freq_hz"] = out["freq_hz"].fillna(out["drive_frequency"])
+    if "drive_frequency" in out.columns and "freq_hz" in out.columns:
+        out["drive_frequency"] = out["drive_frequency"].fillna(out["freq_hz"])
     for col in ("organization_id", "well_id", "lift_type", "well_status"):
         if col in out.columns:
             out[col] = _to_object_str_series(out[col])
@@ -92,13 +95,20 @@ def _coerce_sensor(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     return out
 
 
-def normalize_batch(batch: pd.DataFrame, spec: TableExportSpec) -> pd.DataFrame:
-    """Apply canonical column order and dtypes for parquet consumers."""
+def normalize_batch(
+    batch: pd.DataFrame,
+    spec: TableExportSpec,
+    organization_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Apply canonical column order, dtypes, and per-org export field mapping."""
     if batch is None or batch.empty:
-        return pd.DataFrame(columns=list(spec.columns))
+        cols = resolve_parquet_columns(organization_id, spec.source_table, spec.columns)
+        return pd.DataFrame(columns=list(cols))
     if spec.source_table == "WELL_DAILY_PRODUCTION":
-        return _coerce_production(batch, spec.columns)
-    return _coerce_sensor(batch, spec.columns)
+        out = _coerce_production(batch, spec.columns)
+    else:
+        out = _coerce_sensor(batch, spec.columns)
+    return apply_export_field_mapping(out, organization_id, spec.source_table)
 
 
 def validate_batch(

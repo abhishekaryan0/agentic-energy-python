@@ -2,9 +2,11 @@
 
 Exports canonical Snowflake tables into S3 parquet files used by the ML packages.
 
-**Tenant isolation (same as RED_BUFF):** With `ORGANIZATION_ID` set (required by default), each export runs `SELECT ... FROM WELL_* WHERE "organization_id" = %s` and writes only to `s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/`. A preflight `COUNT(*)` per table logs how many Snowflake rows exist for that org before streaming; batches are also checked so every row’s `organization_id` matches the target.
+**Tenant isolation:** With `ORGANIZATION_ID` or comma-separated `ORGANIZATION_IDS`, each export runs `SELECT ... FROM WELL_* WHERE "organization_id" = %s` and writes only to `s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/`.
 
-**Parquet shape (sensor + production)** matches `scripts/generate_digital_twin2.py` conventions where they overlap: `date` as calendar dates, `float32` volumes and sensor numerics, naive `timestamp`, object-dtyped string fields, and `freq_hz` duplicated from Snowflake `DRIVE_FREQUENCY` (same as `RED_BUFF/column_maps`). Extra sensor columns beyond the twin script are still included for full canonical ML schemas.
+**Per-org field mapping (export):** `transformations/field_mappings.py` shapes parquet per tenant (mirrors manual ingest mappings in `APEX_PERMIAN/column_maps.py` and `RED_BUFF/column_maps.py`). Apex exports use `freq_hz` and the twin script sensor column set; Red Bluff keeps the full canonical schema with `drive_frequency` + `freq_hz`.
+
+**Parquet shape:** Production columns are shared across tenants. Sensor parquet is profile-specific — Apex matches `generate_digital_twin._build_well_sensor_readings_df` (`freq_hz`, Rod Pump lift labels); Red Bluff keeps the full canonical ML sensor schema.
 
 ## Outputs (default: partition layout only)
 
@@ -33,11 +35,20 @@ SNOWFLAKE_SCHEMA=SENSOR_DATA
 SNOWFLAKE_ROLE=...
 
 S3_BUCKET=...
-ORGANIZATION_ID=...
+ORGANIZATION_ID=...          # single tenant
+ORGANIZATION_IDS=...         # comma-separated (Lambda loops each org)
 AWS_REGION=us-east-1
 ```
 
-`ORGANIZATION_ID` is **required** unless you set `TRANSFORM_ALLOW_CROSS_TENANT_EXPORT=1` (exports all rows, no `WHERE organization_id`; use only for admin backfills).
+`ORGANIZATION_ID` or `ORGANIZATION_IDS` is **required** unless you set `TRANSFORM_ALLOW_CROSS_TENANT_EXPORT=1` (exports all rows, no `WHERE organization_id`; use only for admin backfills).
+
+Multi-tenant Lambda (same S3 layout per org):
+
+```bash
+ORGANIZATION_IDS=3e0b5b18-bec1-488a-82c1-a47881c69058,147a92b9-f90a-473d-b443-e6e668c4fbb7
+```
+
+Each org writes under `s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/` — identical folder structure, isolated by UUID prefix.
 
 Optional:
 
@@ -81,7 +92,7 @@ Exports **only read** Snowflake; they do **not** insert or update Snowflake.
 
 ## SYNTH master + financial export (separate from sensor_data)
 
-Exports Red Bluff synthetic tables from Snowflake to the same S3 layout as `scripts/generate_master.py`:
+Exports Red Bluff synthetic tables from Snowflake to the same S3 layout as `APEX_PERMIAN/generate_master.py`:
 
 | Snowflake table | S3 output |
 |-----------------|-----------|

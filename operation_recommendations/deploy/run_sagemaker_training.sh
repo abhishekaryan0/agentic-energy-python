@@ -9,21 +9,36 @@ export AWS_PAGER=""
 
 REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET}"
-ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
 TRAINING_JOB_NAME="${TRAINING_JOB_NAME:-operations-train-$(date +%Y%m%d-%H%M)}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-ml.m5.xlarge}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_TRAINING_JOB_NAME="${TRAINING_JOB_NAME:-}"
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_TRAINING_JOB_NAME" ]]; then
+  export TRAINING_JOB_NAME="$_SAVED_TRAINING_JOB_NAME"
+fi
+
+ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
 
 ECR_REPO_NAME="${ECR_REPO_TRAIN_OPERATIONS:-operations-sagemaker-train}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null)}"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG}"
-
 SAGEMAKER_ROLE_NAME="${SAGEMAKER_ROLE_NAME:-anomaly-detection-sagemaker-role}"
 SAGEMAKER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_ROLE_NAME}"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$REPO_ROOT"
 
 SENSOR_READINGS_S3="s3://${S3_BUCKET}/${ORGANIZATION_ID}/sensor_data/well_sensor_readings"
 PRODUCTION_S3="s3://${S3_BUCKET}/${ORGANIZATION_ID}/sensor_data/daily_production"

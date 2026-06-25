@@ -8,6 +8,13 @@
 #   export DATABASE_URL=...   # or DATABASE_URL_SECRET_ARN
 #   ./well_status/deploy/deploy.sh
 #
+# Apex Permian (separate Lambda — do not overwrite Red Bluff well-status):
+#   export ORGANIZATION_ID=147a92b9-f90a-473d-b443-e6e668c4fbb7
+#   export LAMBDA_FUNCTION_NAME=well-status-apex-permian
+#   export LAMBDA_ROLE_NAME=well-status-apex-permian-lambda-role
+#   export RULE_NAME=well-status-apex-permian-daily
+#   ./well_status/deploy/schedule.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 
@@ -15,11 +22,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-}"
+_SAVED_LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
+_SAVED_WELL_STATUS_FORCE_FULL="${WELL_STATUS_FORCE_FULL:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
+fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_LAMBDA_FUNCTION_NAME" ]]; then
+  export LAMBDA_FUNCTION_NAME="$_SAVED_LAMBDA_FUNCTION_NAME"
+fi
+if [[ -n "$_SAVED_LAMBDA_ROLE_NAME" ]]; then
+  export LAMBDA_ROLE_NAME="$_SAVED_LAMBDA_ROLE_NAME"
+fi
+if [[ -n "$_SAVED_WELL_STATUS_FORCE_FULL" ]]; then
+  export WELL_STATUS_FORCE_FULL="$_SAVED_WELL_STATUS_FORCE_FULL"
 fi
 
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"

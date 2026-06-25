@@ -1,5 +1,5 @@
 {
-  "family": "anomaly-review-sagemaker-train-launch",
+  "family": "TASK_FAMILY_VALUE",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",

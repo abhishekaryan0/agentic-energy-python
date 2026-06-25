@@ -12,11 +12,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+_SAVED_ORGANIZATION_ID="${ORGANIZATION_ID:-}"
+_SAVED_LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-}"
+_SAVED_RULE_NAME="${RULE_NAME:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
+fi
+if [[ -n "$_SAVED_ORGANIZATION_ID" ]]; then
+  export ORGANIZATION_ID="$_SAVED_ORGANIZATION_ID"
+fi
+if [[ -n "$_SAVED_LAMBDA_FUNCTION_NAME" ]]; then
+  export LAMBDA_FUNCTION_NAME="$_SAVED_LAMBDA_FUNCTION_NAME"
+fi
+if [[ -n "$_SAVED_RULE_NAME" ]]; then
+  export RULE_NAME="$_SAVED_RULE_NAME"
 fi
 
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"

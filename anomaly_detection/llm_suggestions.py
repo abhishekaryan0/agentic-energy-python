@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 
 try:
     from anomaly_detection.sensor_config import get_sensor_ranges
+    from anomaly_detection.tenant_sensors import tenant_profile_label
     _SENSOR_CONFIG_AVAILABLE = True
 except ImportError:
     _SENSOR_CONFIG_AVAILABLE = False
     get_sensor_ranges = None
+    tenant_profile_label = lambda organization_id=None: "tenant"  # type: ignore
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -96,7 +98,7 @@ def pseudo_violations_from_readings(
     readings: Dict[str, Any],
     lift_type: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """Build violation-like records from readings vs expected Red Bluff bands."""
+    """Build violation-like records from readings vs expected tenant sensor bands."""
     if not readings or not lift_type or not get_sensor_ranges:
         return []
 
@@ -415,6 +417,7 @@ def generate_suggestion(
     timestamp_str: str,
     historical_anomalies: Optional[List[Dict[str, Any]]] = None,
     lift_type: Optional[str] = None,
+    organization_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         formatted_history = []
@@ -468,6 +471,7 @@ def generate_suggestion(
             except Exception:
                 sensor_ranges_str = "{}"
 
+        tenant_label = tenant_profile_label(organization_id)
         prompt = f"""
 You are an expert Production Engineer AI assistant. Analyze the new anomaly.
 
@@ -497,7 +501,7 @@ Current Sensor Readings:
 Violations / Out-of-Band Sensors:
 {json.dumps(formatted_violations, indent=2, cls=CustomJSONEncoder, default=str)}
 
-Expected Sensor Bands (Red Bluff reference mean ± deviation%) for lift type ({lift_type or 'N/A'}):
+Expected Sensor Bands ({tenant_label} reference mean ± deviation%) for lift type ({lift_type or 'N/A'}):
 {sensor_ranges_str}
 ---
 Real Database History for this well (for context):

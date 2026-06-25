@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
+
+_ORG_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
 def _strip(value: Optional[str]) -> str:
@@ -80,12 +83,91 @@ def parse_database_url(database_url: str) -> tuple[str, str]:
     return clean_url, sslmode
 
 
+def _parse_organization_id_list(raw: Any) -> List[str]:
+    if isinstance(raw, (list, tuple)):
+        return [_strip(str(item)) for item in raw if _strip(str(item))]
+    return [_strip(part) for part in str(raw).split(",") if _strip(part)]
+
+
+def load_organization_ids(overrides: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return tenant UUIDs from ORGANIZATION_IDS (comma-separated) or ORGANIZATION_ID."""
+    overrides = overrides or {}
+    raw_list = overrides.get("organization_ids")
+    if raw_list is None:
+        raw_list = os.getenv("ORGANIZATION_IDS")
+    if raw_list:
+        ids = _parse_organization_id_list(raw_list)
+        if not ids:
+            raise ValueError("ORGANIZATION_IDS is empty")
+        return ids
+
+    single = _strip(overrides.get("organization_id") or os.getenv("ORGANIZATION_ID"))
+    if single:
+        return [single]
+    raise ValueError("ORGANIZATION_ID or ORGANIZATION_IDS is required")
+
+
+def organization_id_from_s3_key(key: str) -> Optional[str]:
+    """First path segment when it looks like a tenant UUID."""
+    org = _strip(key.split("/", 1)[0])
+    return org if _ORG_ID_RE.match(org) else None
+
+
+def resolve_organization_ids(event: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Resolve which organizations to sync for a handler/CLI/Lambda event.
+
+    Priority: explicit organization_id -> organization_ids list -> infer from s3_key -> env.
+    """
+    event = event or {}
+    overrides = dict(event.get("settings_overrides") or {})
+
+    single = _strip(overrides.get("organization_id") or event.get("organization_id"))
+    if single:
+        return [single]
+
+    raw_list = overrides.get("organization_ids") or event.get("organization_ids")
+    if raw_list:
+        ids = _parse_organization_id_list(raw_list)
+        if not ids:
+            raise ValueError("organization_ids is empty")
+        return ids
+
+    s3_key = _strip(event.get("s3_key"))
+    if not s3_key:
+        from s3_to_postgres.s3_io import event_detail_s3_key
+
+        s3_key = _strip(event_detail_s3_key(event) or "")
+    if s3_key:
+        org = organization_id_from_s3_key(s3_key)
+        if org:
+            return [org]
+
+    return load_organization_ids(overrides)
+
+
+def load_skip_sync_tables(event: Optional[Dict[str, Any]] = None) -> set[str]:
+    """Tables to exclude from table=all runs (code kept; manual single-table sync still works)."""
+    event = event or {}
+    overrides = dict(event.get("settings_overrides") or {})
+    raw = (
+        overrides.get("skip_tables")
+        or event.get("skip_tables")
+        or os.getenv("SYNC_SKIP_TABLES")
+        or ""
+    )
+    if isinstance(raw, (list, tuple, set)):
+        return {item.strip() for item in raw if str(item).strip()}
+    return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+
 def load_settings(overrides: Optional[Dict[str, Any]] = None) -> Settings:
     overrides = overrides or {}
     org = _strip(overrides.get("organization_id") or os.getenv("ORGANIZATION_ID"))
     bucket = _strip(overrides.get("s3_bucket") or os.getenv("S3_BUCKET"))
     if not org:
-        raise ValueError("ORGANIZATION_ID is required")
+        orgs = load_organization_ids(overrides)
+        org = orgs[0]
     if not bucket:
         raise ValueError("S3_BUCKET is required")
 
