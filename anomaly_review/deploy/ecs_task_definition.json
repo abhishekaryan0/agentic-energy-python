@@ -19,9 +19,12 @@
         { "name": "ANOMALY_REVIEW_INITIAL_DAYS", "value": "180" },
         { "name": "ANOMALY_REVIEW_DETECTION_DAYS", "value": "7" },
         { "name": "ANOMALY_REVIEW_FORCE_WINDOW", "value": "ANOMALY_REVIEW_FORCE_WINDOW_VALUE" },
-        { "name": "ANOMALY_REVIEW_MAX_WORKERS", "value": "5" },
+        { "name": "ANOMALY_REVIEW_MAX_WORKERS", "value": "3" },
+        { "name": "ANOMALY_REVIEW_LLM_TIMEOUT", "value": "60" },
+        { "name": "ANOMALY_REVIEW_LLM_MAX_RETRIES", "value": "3" },
         { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
-        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" }
+        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" },
+        { "name": "OPENAI_MODEL", "value": "OPENAI_MODEL_VALUE" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

@@ -230,7 +230,10 @@ def detect_anomalies(well_id: str, df: pd.DataFrame = None, lookback_days: int =
     if 'lift_type' not in full_df.columns:
         full_df['lift_type'] = 'Unknown'
     full_df['lift_type'] = full_df['lift_type'].ffill().bfill().fillna('Unknown')
-    current_lift_type = full_df['lift_type'].iloc[-1]
+    from anomaly_review.config import normalize_lift_type
+
+    full_df['lift_type'] = full_df['lift_type'].map(normalize_lift_type)
+    current_lift_type = normalize_lift_type(full_df['lift_type'].iloc[-1])
 
     # 2. Pre-Processing & Rolling Baselines
     full_df = calculate_rolling_baseline(full_df)

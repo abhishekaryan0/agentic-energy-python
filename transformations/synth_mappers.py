@@ -83,6 +83,7 @@ def build_master_assets_df(
             "type": a.get("asset_type"),
             "lift": a.get("lift_type"),
             "lease": a.get("lease"),
+            "area": a.get("area"),
             "location": {
                 "basin": a.get("basin"),
                 "sub_basin": a.get("sub_basin"),

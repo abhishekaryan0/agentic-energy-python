@@ -46,6 +46,7 @@ from anomaly_review.config import (
     DATA_MISMATCH_AMPS_ACTIVE_MIN,
     DATA_MISMATCH_ZERO_VOL_MAX,
     DATA_MISMATCH_BASELINE_VOL_MIN,
+    normalize_lift_type,
 )
 from anomaly_review.utils import safe_divide
 
@@ -179,14 +180,18 @@ def diagnose_mechanics(ctx: Dict) -> Dict:
 # PHYSICS CHECKERS (Lift Type Specific)
 # =============================================================================
 
+def _lift_type_key(lift_type) -> str:
+    return normalize_lift_type(lift_type).lower().replace(" ", "")
+
+
 def check_fluid_pound(ctx: Dict) -> Optional[Dict]:
     """
     Rod Pump: Detects Fluid Pound (Shock Loading).
     
     Triggers when pump fillage drops significantly below baseline.
     """
-    lift_type = str(ctx.get('lift_type', '')).lower().replace(' ', '')
-    if 'rod' not in lift_type:
+    lift_type = _lift_type_key(ctx.get("lift_type", ""))
+    if "rod" not in lift_type:
         logger.debug(f"[FLUID_POUND] skip: lift_type='{lift_type}' (not rod pump)")
         return None
 
@@ -272,8 +277,8 @@ def check_pump_wear(ctx: Dict) -> Optional[Dict]:
     
     Triggers when discharge pressure is low despite high motor current.
     """
-    lift_type = str(ctx.get('lift_type', '')).lower().replace(' ', '')
-    if 'esp' not in lift_type:
+    lift_type = _lift_type_key(ctx.get("lift_type", ""))
+    if "esp" not in lift_type:
         return None
 
     req = ['discharge_pressure', 'pump_intake_pressure', 'motor_current']
@@ -322,8 +327,8 @@ def check_gas_injection_inefficiency(ctx: Dict) -> Optional[Dict]:
     
     Triggers when injection rate is high but pressure differential is low.
     """
-    lift_type = str(ctx.get('lift_type', '')).lower().replace(' ', '')
-    if 'gas' not in lift_type:
+    lift_type = _lift_type_key(ctx.get("lift_type", ""))
+    if "gas" not in lift_type:
         return None
 
     req = ['injection_rate', 'casing_pressure', 'tubing_pressure']

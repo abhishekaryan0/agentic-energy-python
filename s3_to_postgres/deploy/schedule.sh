@@ -2,7 +2,7 @@
 #
 # Schedule S3 -> PostgreSQL sync via EventBridge -> Lambda.
 #
-# Default: every 24 hours at 01:00 UTC (after anomaly detection at 00:30 UTC).
+# Default: every 24 hours at 03:30 UTC (09:00 IST).
 # SCHEDULE_CRON="rate(24 hours)"  # alternative: every 24h from rule creation
 #
 # Usage (from repo root):
@@ -14,7 +14,7 @@
 #   ./s3_to_postgres/deploy/schedule.sh
 #
 # Optional:
-#   SCHEDULE_CRON="cron(0 1 * * ? *)"
+#   SCHEDULE_CRON="cron(30 3 * * ? *)"
 #   LAMBDA_REGION=us-east-1
 #   LAMBDA_FUNCTION_NAME=s3-to-postgres-sync
 #   RULE_NAME=s3-to-postgres-anomaly-suggestions-daily
@@ -24,7 +24,7 @@ set -euo pipefail
 export AWS_PAGER=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 _SAVED_DATABASE_URL="${DATABASE_URL:-}"
@@ -45,7 +45,7 @@ fi
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-s3-to-postgres-sync}"
 RULE_NAME="${RULE_NAME:-s3-to-postgres-sync-daily}"
-SCHEDULE_CRON="${SCHEDULE_CRON:-cron(0 1 * * ? *)}"
+SCHEDULE_CRON="${SCHEDULE_CRON:-cron(30 3 * * ? *)}"
 ORGANIZATION_IDS="${ORGANIZATION_IDS:-${ORGANIZATION_ID:-}}"
 if [[ -z "$ORGANIZATION_IDS" ]]; then
   echo "ERROR: Set ORGANIZATION_ID or ORGANIZATION_IDS"

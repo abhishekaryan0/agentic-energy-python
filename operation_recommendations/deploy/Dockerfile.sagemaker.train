@@ -6,9 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir pandas pyarrow boto3 scikit-learn joblib numpy
+RUN pip install --no-cache-dir pandas pyarrow boto3 scikit-learn joblib numpy psycopg2-binary python-dotenv
 
 COPY operation_recommendations ./operation_recommendations
+COPY s3_to_postgres ./s3_to_postgres
 
 ENV PYTHONPATH=/app
 

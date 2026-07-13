@@ -55,6 +55,10 @@ python -m financial.run --upload
 
 # Apex Permian weekly training (Mon 02:50 UTC)
 ./financial/deploy/schedule_sagemaker_training_apex.sh
+
+# South Texas Energy Partners
+./financial/deploy/run_sagemaker_training_step.sh
+./financial/deploy/schedule_sagemaker_training_step.sh
 ```
 
 Run `run_sagemaker_training.sh` once first so the training image exists in ECR (`financial-sagemaker-train:latest`).

@@ -3,6 +3,7 @@ Resolve anomaly-detection sensor profiles per organization.
 
 Default (Red Buff and unknown orgs): red_buff_sensors — unchanged behavior.
 Apex Permian org: apex_permian_sensors — Apex parquet columns and bands.
+South Texas Energy Partners: step_sensors — Eagle Ford bands on full canonical parquet.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 RED_BUFF_ORGANIZATION_ID = "3e0b5b18-bec1-488a-82c1-a47881c69058"
 APEX_PERMIAN_ORGANIZATION_ID = "147a92b9-f90a-473d-b443-e6e668c4fbb7"
+STEP_ORGANIZATION_ID = "d270f89a-aada-4ff2-adb0-68b3e8087565"
 
 
 def tenant_profile_label(organization_id: Optional[str] = None) -> str:
@@ -19,6 +21,8 @@ def tenant_profile_label(organization_id: Optional[str] = None) -> str:
     profile = resolve_tenant_profile(organization_id)
     if profile == "apex_permian":
         return "Apex Permian"
+    if profile == "step":
+        return "South Texas Energy Partners"
     return "Red Buff"
 
 
@@ -27,16 +31,26 @@ def resolve_tenant_profile(organization_id: Optional[str] = None) -> str:
     override = (os.getenv("ANOMALY_TENANT_PROFILE") or "").strip().lower()
     if override in ("apex_permian", "apex", "apex-permian"):
         return "apex_permian"
+    if override in ("step", "south_texas", "south-texas", "step_org"):
+        return "step"
     if override in ("red_buff", "red-buff", "redbuff"):
         return "red_buff"
+    step_env = (os.getenv("STEP_ORGANIZATION_ID") or STEP_ORGANIZATION_ID).strip()
     if org == APEX_PERMIAN_ORGANIZATION_ID:
         return "apex_permian"
+    if org == step_env:
+        return "step"
     return "red_buff"
 
 
 def _backend():
-    if resolve_tenant_profile() == "apex_permian":
+    profile = resolve_tenant_profile()
+    if profile == "apex_permian":
         from anomaly_detection import apex_permian_sensors as backend
+
+        return backend
+    if profile == "step":
+        from anomaly_detection import step_sensors as backend
 
         return backend
     from anomaly_detection import red_buff_sensors as backend
@@ -88,7 +102,8 @@ def get_sensor_bands(lift_type: str, deviation_pct: float = 30.0) -> Dict[str, D
 
 def get_lift_types() -> Dict[str, int]:
     types = _backend().get_lift_types()
-    if resolve_tenant_profile() == "red_buff":
+    profile = resolve_tenant_profile()
+    if profile in ("red_buff", "step"):
         types = dict(types)
         if "Pumping Unit" in types:
             types["Rod Pump"] = types["Pumping Unit"]

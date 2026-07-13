@@ -191,6 +191,7 @@ def main() -> None:
     if args.skip_empty_files:
         config.write_empty_files = False
 
+    config = config.with_org_snowflake_schema()
     result = run_transformations(config, dry_run=args.dry_run)
     print(json.dumps(result, indent=2, default=str))
     status = result.get("status")

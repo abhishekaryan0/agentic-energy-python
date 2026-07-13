@@ -101,13 +101,33 @@ def _download_and_extract_model_tarball(
                 pass
 
 
+def _find_latest_anomaly_model_s3_key(bucket: str, org: str) -> Optional[str]:
+    """Newest ``{org}/model/anomaly-train-*/output/model.tar.gz`` on S3."""
+    import boto3
+
+    prefix = f"{org}/model/"
+    paginator = boto3.client("s3").get_paginator("list_objects_v2")
+    candidates: List[Tuple[Any, str]] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj.get("Key") or ""
+            if "anomaly-train" in key and key.endswith("output/model.tar.gz"):
+                candidates.append((obj.get("LastModified"), key))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
 def _ensure_models_from_s3(models_dir_abs: str) -> bool:
     """
     Download trained anomaly_detection models into models_dir_abs.
 
     Priority:
     1. ANOMALY_MODEL_S3_URI (e.g. SageMaker output model.tar.gz under {org}/model/...)
-    2. s3://S3_BUCKET/{S3_PREFIX}/anomaly_detection_{MODEL_VERSION}.tar.gz
+    2. ANOMALY_MODEL_TRAINING_JOB under {org}/model/{job}/output/model.tar.gz
+    3. Latest anomaly-train-* under {org}/model/ (when job name unset)
+    4. s3://S3_BUCKET/{S3_PREFIX}/anomaly_detection_{MODEL_VERSION}.tar.gz
     """
     try:
         import boto3
@@ -130,11 +150,15 @@ def _ensure_models_from_s3(models_dir_abs: str) -> bool:
 
     org = (os.environ.get("ORGANIZATION_ID") or "").strip()
     if org and not model_uri:
-        # Default: latest SageMaker training artifact path pattern (override via ANOMALY_MODEL_S3_URI)
         job = (os.environ.get("ANOMALY_MODEL_TRAINING_JOB") or "").strip()
         if job:
             key = f"{org}/model/{job}/output/model.tar.gz"
             logger.info("Downloading anomaly models from s3://%s/%s", bucket, key)
+            if _download_and_extract_model_tarball(bucket, key, models_dir_abs):
+                return True
+        key = _find_latest_anomaly_model_s3_key(bucket, org)
+        if key:
+            logger.info("Auto-selected latest anomaly model s3://%s/%s", bucket, key)
             if _download_and_extract_model_tarball(bucket, key, models_dir_abs):
                 return True
 

@@ -229,6 +229,52 @@ def write_parquet_batches_to_s3(
             pass
 
 
+def merge_partition(
+    new_df: pd.DataFrame,
+    bucket: str,
+    key: str,
+    spec: TableExportSpec,
+    *,
+    region_name: Optional[str] = None,
+    write_empty: bool = True,
+    organization_id: Optional[str] = None,
+) -> Tuple[Optional[str], int]:
+    """Merge new rows into a date partition parquet (dedupe by spec.dedupe_keys)."""
+    existing = read_parquet_from_s3(bucket, key, region_name=region_name)
+    if existing is not None and not existing.empty:
+        existing.columns = [str(c).lower() for c in existing.columns]
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    if combined.empty:
+        return write_dataframe_to_s3(
+            combined,
+            bucket,
+            key,
+            spec,
+            region_name=region_name,
+            write_empty=write_empty,
+            organization_id=organization_id,
+        )
+
+    keys = list(spec.dedupe_keys)
+    combined = normalize_batch(combined, spec, organization_id=organization_id)
+    if keys:
+        combined = combined.drop_duplicates(subset=keys, keep="last")
+    if spec.order_by:
+        combined = combined.sort_values(list(spec.order_by))
+    return write_dataframe_to_s3(
+        combined,
+        bucket,
+        key,
+        spec,
+        region_name=region_name,
+        write_empty=write_empty,
+        organization_id=organization_id,
+    )
+
+
 def merge_snapshot(
     new_df: pd.DataFrame,
     bucket: str,

@@ -7,6 +7,9 @@
 # Apex Permian:
 #   ./anomaly_detection/deploy/run_sagemaker_training_apex.sh
 #
+# South Texas Energy Partners:
+#   ./anomaly_detection/deploy/run_sagemaker_training_step.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 

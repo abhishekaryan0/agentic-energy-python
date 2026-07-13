@@ -53,6 +53,7 @@ from operation_recommendations.config import (
     CANONICAL_FEATURES,
     LIFT_TYPE_SENSORS,
     PRODUCTION_FIELDS,
+    VALID_CATEGORIES,
     get_features_for_lift_type,
     get_sensors_for_lift_type,
     TrainingConfig,
@@ -134,6 +135,82 @@ def _fit_random_forest_classifier(X: np.ndarray, y: np.ndarray, lift_label: str)
                 )
     rf.fit(X, y)
     return rf
+
+
+def _synthetic_action_and_category(
+    metrics: Dict[str, Any],
+    *,
+    field_means: Dict[str, float],
+    field_stds: Dict[str, float],
+    zscore_threshold: float = 1.2,
+) -> Tuple[str, str]:
+    """Return (action_class, category) from metric z-scores vs ACTION_MAPPING."""
+    candidates: List[Tuple[str, str, float, str]] = []
+    for sensor_field, action_config in ACTION_MAPPING.items():
+        for suffix in ("_slope", "_roll_mean", "_latest"):
+            metric_key = f"{sensor_field}{suffix}"
+            val = metrics.get(metric_key)
+            std = field_stds.get(metric_key, 1.0)
+            mean = field_means.get(metric_key, 0.0)
+            if val is not None and std and abs(std) > 1e-6:
+                z = (val - mean) / (std + 1e-6)
+                if abs(z) > zscore_threshold:
+                    action_class = action_config.get("class", f"Investigate {sensor_field}")
+                    category = action_config.get("category", "Optimization")
+                    candidates.append((action_class, category, abs(z), sensor_field))
+    if candidates:
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        return candidates[0][0], candidates[0][1]
+    return "NoAction", "Optimization"
+
+
+def _train_category_classifier(
+    X: np.ndarray,
+    y_categories: List[str],
+    save_path: str,
+    feature_names: List[str],
+) -> dict:
+    """Train recommendation category model (Production / Optimization / Maintenance)."""
+    if len(X) < 3:
+        raise RuntimeError(
+            f"Need at least 3 wells to train category_classifier.joblib; got {len(X)}"
+        )
+    y = np.array(
+        [c if c in VALID_CATEGORIES else "Optimization" for c in y_categories],
+        dtype=object,
+    )
+    if RandomForestClassifier:
+        clf = _fit_random_forest_classifier(X, y, "category")
+    else:
+        clf = DecisionTreeClassifier(
+            max_depth=5,
+            min_samples_split=3,
+            min_samples_leaf=2,
+            random_state=42,
+            class_weight="balanced",
+        )
+        clf.fit(X, y)
+    tr_acc = float(accuracy_score(y, clf.predict(X)))
+    classes = [str(c) for c in np.unique(y)]
+    logger.info(
+        "Category classifier: train_accuracy=%.3f classes=%s (n=%s)",
+        tr_acc,
+        classes,
+        len(y),
+    )
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": clf,
+            "features": feature_names,
+            "le": None,
+            "classes": classes,
+        },
+        save_path,
+    )
+    if not Path(save_path).is_file():
+        raise RuntimeError(f"Category model write failed: {save_path}")
+    return {"train_accuracy": tr_acc, "trained_on": len(y), "classes": classes}
 
 
 def _invoice_roll_features_from_history(
@@ -548,28 +625,15 @@ def train_with_synthetic_labels(
 
     # Generate labels based on data-driven z-score deviations
     samples_by_lift = {}
+    category_labels: List[str] = []
     for well, lift_type, metrics in all_metrics:
         lt_key = str(lift_type).strip() or 'Unknown'
         feat_names = lift_type_feature_sets[lt_key]
         feats, _ = _features_from_metrics(metrics, feature_list=feat_names)
-        candidates = []
-        for sensor_field, action_config in ACTION_MAPPING.items():
-            for suffix in ['_slope', '_roll_mean', '_latest']:
-                metric_key = f'{sensor_field}{suffix}'
-                val = metrics.get(metric_key)
-                std = field_stds.get(metric_key, 1.0)
-                mean = field_means.get(metric_key, 0.0)
-                if val is not None and std and abs(std) > 1e-6:
-                    z = (val - mean) / (std + 1e-6)
-                    if abs(z) > 1.2:
-                        action_class = action_config.get('class', f'Investigate {sensor_field}')
-                        category = action_config.get('category', 'Optimization')
-                        candidates.append((action_class, category, abs(z), sensor_field))
-        if candidates:
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            label = candidates[0][0]
-        else:
-            label = 'NoAction'
+        label, category = _synthetic_action_and_category(
+            metrics, field_means=field_means, field_stds=field_stds
+        )
+        category_labels.append(category)
         samples_by_lift.setdefault(lt_key, []).append((feats, label, feat_names))
 
     # Common feature set for combined model
@@ -646,6 +710,19 @@ def train_with_synthetic_labels(
         res = _train_and_save(X_all, y_all, model_path, 'combined', feature_names=common_features)
         if res:
             results['_fallback'] = {**res, 'model_path': model_path, 'features': common_features}
+    category_path = str(models_dir / "category_classifier.joblib")
+    logger.info(
+        "Training category classifier (%s samples, categories=%s)",
+        len(X_all),
+        {c: category_labels.count(c) for c in set(category_labels)},
+    )
+    cat_res = _train_category_classifier(
+        X_all,
+        category_labels,
+        category_path,
+        common_features,
+    )
+    results["category_classifier"] = {**cat_res, "model_path": category_path, "features": common_features}
     fallback = results.get('_fallback') or (list(results.values())[0] if results else {})
     if not results:
         raise RuntimeError(
@@ -655,9 +732,12 @@ def train_with_synthetic_labels(
         )
     return {
         'model_path': model_path,
+        'category_model_path': category_path,
         'per_lift_type': results,
         'label_distribution': label_dist,
+        'category_distribution': {c: category_labels.count(c) for c in set(category_labels)},
         'train_accuracy': fallback.get('train_accuracy', 0),
+        'category_train_accuracy': cat_res.get('train_accuracy', 0),
         'trained_on': len(y_all),
     }
 

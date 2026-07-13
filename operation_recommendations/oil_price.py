@@ -4,6 +4,7 @@ Resolve oil spot price ($/BBL) per organization.
 Reads org_settings.oil_price_type from PostgreSQL:
   - Manual  -> org_settings.manual_value
   - Brent   -> latest EIA Brent spot (eia_prices.get_brent_spot_usd_per_bbl)
+  - WTI     -> latest EIA WTI spot (eia_prices.get_wti_spot_usd_per_bbl)
 
 Falls back to EIA when org_settings is missing or Postgres is unavailable.
 """
@@ -14,7 +15,10 @@ import logging
 import os
 from typing import Optional, Tuple
 
-from operation_recommendations.eia_prices import get_brent_spot_usd_per_bbl
+from operation_recommendations.eia_prices import (
+    get_brent_spot_usd_per_bbl,
+    get_wti_spot_usd_per_bbl,
+)
 from operation_recommendations.org_settings import (
     fetch_org_oil_price_settings,
     load_operations_settings,
@@ -29,7 +33,7 @@ def resolve_oil_price_usd_per_bbl(
     """
     Return (price_usd_per_bbl, source, period, oil_price_type).
 
-    source is org_settings_manual, eia_brent, eia_brent_cached, or env_fallback.
+    source is org_settings_manual, eia_brent, eia_brent_cached, eia_wti, eia_wti_cached, or env_fallback.
     period is the EIA observation date when applicable.
     """
     org = (organization_id or os.getenv("ORGANIZATION_ID") or "").strip()
@@ -69,6 +73,9 @@ def resolve_oil_price_usd_per_bbl(
                 elif normalized == "brent" or not normalized:
                     price, src, period = get_brent_spot_usd_per_bbl()
                     return price, src, period, configured_type or "Brent"
+                elif normalized == "wti":
+                    price, src, period = get_wti_spot_usd_per_bbl()
+                    return price, src, period, configured_type or "WTI"
                 else:
                     logger.warning(
                         "Unknown org_settings.oil_price_type=%r for org %s; using EIA Brent",

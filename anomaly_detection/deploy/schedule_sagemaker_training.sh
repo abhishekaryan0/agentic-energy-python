@@ -8,6 +8,9 @@
 # Apex Permian (separate weekly schedule):
 #   ./anomaly_detection/deploy/schedule_sagemaker_training_apex.sh
 #
+# South Texas Energy Partners:
+#   ./anomaly_detection/deploy/schedule_sagemaker_training_step.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 

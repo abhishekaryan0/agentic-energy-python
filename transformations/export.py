@@ -26,6 +26,7 @@ from transformations.mappers import (
 from transformations.schemas import TableExportSpec
 from transformations.s3 import (
     build_s3_key,
+    merge_partition,
     merge_snapshot,
     partition_s3_key,
     write_dataframe_to_s3,
@@ -66,7 +67,8 @@ def export_table(
     mode = config.mode
     window = _window_for_spec(spec, checkpoint, mode)
 
-    partition_frames: Dict[str, List[pd.DataFrame]] = {}
+    partition_uris: List[str] = []
+    partition_uri_set: set[str] = set()
     snapshot_frames: List[pd.DataFrame] = []
     row_count = 0
     dropped_total = 0
@@ -74,6 +76,45 @@ def export_table(
     keep_snapshot_frames = config.write_snapshots or (
         config.merge_snapshots and mode == "incremental"
     )
+    open_partition_date: Optional[str] = None
+    open_partition_frames: List[pd.DataFrame] = []
+
+    def _flush_open_partition() -> None:
+        nonlocal open_partition_date, open_partition_frames
+        if not config.write_partitions or open_partition_date is None:
+            open_partition_frames = []
+            open_partition_date = None
+            return
+        if not open_partition_frames:
+            open_partition_date = None
+            return
+        combined = pd.concat(open_partition_frames, ignore_index=True)
+        key = partition_s3_key(prefix, spec.partition_subdir, open_partition_date)
+        if mode == "incremental":
+            uri, _ = merge_partition(
+                combined,
+                config.s3_bucket,
+                key,
+                spec,
+                region_name=config.aws_region,
+                write_empty=config.write_empty_files,
+                organization_id=config.organization_id,
+            )
+        else:
+            uri, _ = write_dataframe_to_s3(
+                combined,
+                config.s3_bucket,
+                key,
+                spec,
+                region_name=config.aws_region,
+                write_empty=config.write_empty_files,
+                organization_id=config.organization_id,
+            )
+        if uri and uri not in partition_uri_set:
+            partition_uri_set.add(uri)
+            partition_uris.append(uri)
+        open_partition_frames = []
+        open_partition_date = None
 
     for raw in iter_table_batches(conn, config, spec, window=window):
         batch = normalize_batch(raw, spec, organization_id=config.organization_id)
@@ -99,27 +140,16 @@ def export_table(
             partitioned = add_partition_column(batch, spec)
             for part_date, group in partitioned.groupby("_partition_date", sort=True):
                 clean = group.drop(columns=["_partition_date"], errors="ignore")
-                partition_frames.setdefault(str(part_date), []).append(clean)
+                part_key = str(part_date)
+                if open_partition_date is not None and part_key != open_partition_date:
+                    _flush_open_partition()
+                open_partition_date = part_key
+                open_partition_frames.append(clean)
 
         if keep_snapshot_frames:
             snapshot_frames.append(batch)
 
-    partition_uris: List[str] = []
-    if config.write_partitions and partition_frames:
-        for part_date, frames in sorted(partition_frames.items()):
-            combined = pd.concat(frames, ignore_index=True)
-            key = partition_s3_key(prefix, spec.partition_subdir, part_date)
-            uri, _ = write_dataframe_to_s3(
-                combined,
-                config.s3_bucket,
-                key,
-                spec,
-                region_name=config.aws_region,
-                write_empty=config.write_empty_files,
-                organization_id=config.organization_id,
-            )
-            if uri:
-                partition_uris.append(uri)
+    _flush_open_partition()
 
     snapshot_uri: Optional[str] = None
     snapshot_rows = 0

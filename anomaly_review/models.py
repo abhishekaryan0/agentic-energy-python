@@ -27,6 +27,7 @@ from anomaly_review.config import (
     MODEL_CACHE_DAYS,
     LIFT_TYPE_FEATURES,
     AUTOENCODER_THRESHOLD_SIGMA,
+    normalize_lift_type,
     get_anomaly_review_model_s3_base,
     get_organization_id,
 )
@@ -397,7 +398,9 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, force_retrain: bool = Fal
     logger.info(f"Training new models for {well_id}...")
     
     # Determine lift type for feature selection
-    latest_lift_type = df['lift_type'].mode()[0] if 'lift_type' in df.columns and not df['lift_type'].empty else "Rod Pump"
+    latest_lift_type = normalize_lift_type(
+        df['lift_type'].mode()[0] if 'lift_type' in df.columns and not df['lift_type'].empty else "Rod Pump"
+    )
 
     # 1. Physics Feature Engineering
     df = engineer_physics_features(df, lift_type=latest_lift_type)

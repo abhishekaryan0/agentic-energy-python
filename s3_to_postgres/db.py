@@ -100,13 +100,29 @@ POSTGRES_OPERATION_RECOMMENDATIONS_COLUMNS: Sequence[str] = (
     "status",
     "priority",
     "confidence_percent",
+    "confidence",
+    "probability",
+    "confidence_description",
     "production_increase_bbl_day",
     "production_increase_percent",
+    "production_increase_description",
     "daily_expense_benefit_usd",
+    "expense_benefit_description",
     "implementation_cost_usd",
+    "implementation_cost_description",
     "net_daily_benefit_usd",
+    "net_daily_benefit_description",
     "asset_value_increase_usd",
+    "asset_value_increase_description",
+    "eia_brent_usd_per_bbl",
+    "eia_brent_source",
+    "eia_brent_period",
     "time_reduced_hours",
+    "time_reduced_description",
+    "analysis_description",
+    "sensor_evidence_description",
+    "operational_interpretation_description",
+    "recommended_next_step_description",
     "detailed_analysis",
     "current_performance",
     "historical_trend",
@@ -120,6 +136,7 @@ POSTGRES_OPERATION_RECOMMENDATIONS_COLUMNS: Sequence[str] = (
     "data_quality",
     "reason",
     "expected_impact",
+    "prediction_source",
     "metrics_json",
     "created_at",
     "updated_at",
@@ -131,17 +148,41 @@ POSTGRES_OPERATION_RECOMMENDATIONS_COLUMNS: Sequence[str] = (
     "organization_id",
 )
 
+# Columns auto-added when missing so new S3 parquet fields sync into existing tables.
+OPS_ENSURE_COLUMNS: Sequence[tuple[str, str]] = (
+    ("confidence", "DOUBLE PRECISION"),
+    ("probability", "DOUBLE PRECISION"),
+    ("production_increase_description", "TEXT"),
+    ("expense_benefit_description", "TEXT"),
+    ("implementation_cost_description", "TEXT"),
+    ("time_reduced_description", "TEXT"),
+    ("asset_value_increase_description", "TEXT"),
+    ("net_daily_benefit_description", "TEXT"),
+    ("confidence_description", "TEXT"),
+    ("analysis_description", "TEXT"),
+    ("sensor_evidence_description", "TEXT"),
+    ("operational_interpretation_description", "TEXT"),
+    ("recommended_next_step_description", "TEXT"),
+    ("eia_brent_usd_per_bbl", "DOUBLE PRECISION"),
+    ("eia_brent_source", "TEXT"),
+    ("eia_brent_period", "TEXT"),
+    ("prediction_source", "TEXT"),
+)
+
 REVIEW_JSONB_COLUMNS = frozenset({"ui_text", "chart_data", "impact_metrics"})
 OPS_JSONB_COLUMNS = frozenset({"metrics_json"})
 OPS_FLOAT_COLUMNS = frozenset(
     {
         "confidence_percent",
+        "confidence",
+        "probability",
         "production_increase_bbl_day",
         "production_increase_percent",
         "daily_expense_benefit_usd",
         "implementation_cost_usd",
         "net_daily_benefit_usd",
         "asset_value_increase_usd",
+        "eia_brent_usd_per_bbl",
         "time_reduced_hours",
     }
 )
@@ -642,6 +683,7 @@ def upsert_anomaly_reviews(conn, rows: Iterable[Dict[str, Any]]) -> int:
 
 
 def upsert_operation_recommendations(conn, rows: Iterable[Dict[str, Any]]) -> int:
+    ensure_operation_recommendations_schema(conn)
     return _upsert_by_id(
         conn,
         "operation_recommendations",
@@ -649,6 +691,11 @@ def upsert_operation_recommendations(conn, rows: Iterable[Dict[str, Any]]) -> in
         rows,
         OPS_JSONB_COLUMNS,
     )
+
+
+def ensure_operation_recommendations_schema(conn) -> None:
+    """Add missing operation_recommendations columns (e.g. analysis section fields)."""
+    _ensure_table_columns(conn, "operation_recommendations", OPS_ENSURE_COLUMNS)
 
 
 def _ensure_table_columns(conn, table: str, column_defs: Sequence[tuple[str, str]]) -> None:

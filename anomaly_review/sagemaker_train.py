@@ -30,6 +30,8 @@ def main() -> None:
     )
     model_dir = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
     org_id = os.environ.get("SM_HP_ORGANIZATION_ID", "")
+    if org_id:
+        os.environ["ORGANIZATION_ID"] = str(org_id).strip()
 
     max_days_raw = (
         os.environ.get("SM_HP_REVIEW_TRAINING_PARTITION_DAYS")

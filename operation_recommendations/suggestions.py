@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 import re
 from datetime import datetime, timezone
+from typing import Any, Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -139,6 +140,370 @@ Return valid JSON only. Preserve newlines and bullet characters (•). Output co
             "alternative_models": {"conservative_approach": "N/A", "aggressive_optimization": "N/A", "hybrid_model": "N/A", "recommended_model": "N/A"},
             "citations": {"referenced_data": [], "supporting_analysis": "N/A", "data_quality": "Low"}
         }
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        fv = float(val)
+        if fv != fv:  # NaN
+            return None
+        return fv
+    except Exception:
+        return None
+
+
+def _fmt_evidence_num(val: Any, digits: int = 2) -> Optional[str]:
+    fv = _safe_float(val)
+    if fv is None:
+        return None
+    if abs(fv) >= 1000:
+        return f"{fv:,.0f}"
+    if abs(fv) >= 10 or digits <= 0:
+        return f"{fv:,.1f}" if digits == 1 else f"{fv:,.0f}"
+    return f"{fv:.{digits}f}"
+
+
+def _humanize_metric_key(key: str) -> str:
+    name = str(key or "").replace("_", " ").strip().lower()
+    replacements = (
+        ("oil volume", "oil"),
+        ("gas volume", "gas"),
+        ("water volume", "water"),
+        ("roll mean", "average"),
+        ("freq hz", "frequency"),
+        ("drive frequency", "drive frequency"),
+        ("surface pressure", "surface pressure"),
+        ("tubing pressure", "tubing pressure"),
+        ("casing pressure", "casing pressure"),
+        ("discharge pressure", "discharge pressure"),
+        ("strokes", "strokes per minute"),
+    )
+    for src, dst in replacements:
+        if src in name:
+            name = name.replace(src, dst)
+    return name
+
+
+def _extract_metric_snapshot(metrics: dict) -> dict:
+    """Pull the strongest readable facts from raw metrics for the LLM."""
+    if not isinstance(metrics, dict):
+        return {}
+
+    def first(*keys: str) -> Optional[float]:
+        for k in keys:
+            if k in metrics:
+                fv = _safe_float(metrics.get(k))
+                if fv is not None:
+                    return fv
+        return None
+
+    oil_avg = first("oil_volume_roll_mean", "oil_volume_avg", "oil_volume_mean", "oil_volume")
+    oil_latest = first("oil_volume_latest", "oil_volume_last", "oil_volume")
+    oil_trend = first("oil_volume_trend", "oil_volume_slope")
+    gas_avg = first("gas_volume_roll_mean", "gas_volume_avg", "gas_volume_mean", "gas_volume")
+    gas_trend = first("gas_volume_trend", "gas_volume_slope")
+    water_avg = first("water_volume_roll_mean", "water_volume_avg", "water_volume_mean", "water_volume")
+    water_trend = first("water_volume_trend", "water_volume_slope")
+
+    production = {}
+    if oil_avg is not None:
+        production["oil_avg_bbl_day"] = round(oil_avg, 2)
+    if oil_latest is not None and (oil_avg is None or abs(oil_latest - oil_avg) > 1e-6):
+        production["oil_latest_bbl_day"] = round(oil_latest, 2)
+    if oil_trend is not None:
+        production["oil_trend_bbl_day_per_day"] = round(oil_trend, 3)
+    if gas_avg is not None:
+        production["gas_avg"] = round(gas_avg, 2)
+    if gas_trend is not None:
+        production["gas_trend"] = round(gas_trend, 3)
+    if water_avg is not None:
+        production["water_avg_bbl_day"] = round(water_avg, 2)
+    if water_trend is not None:
+        production["water_trend_bbl_day_per_day"] = round(water_trend, 3)
+
+    if oil_avg is not None and water_avg is not None and (oil_avg + water_avg) > 0:
+        production["water_cut_pct_approx"] = round(100.0 * water_avg / (oil_avg + water_avg), 1)
+
+    sensor_candidates = []
+    skip_prefixes = ("oil_volume", "gas_volume", "water_volume")
+    for k, v in metrics.items():
+        if any(str(k).startswith(p) for p in skip_prefixes):
+            continue
+        fv = _safe_float(v)
+        if fv is None:
+            continue
+        score = abs(fv)
+        if any(s in str(k) for s in ("trend", "slope", "delta", "change", "pct", "percent")):
+            score = abs(fv) * 10.0
+        sensor_candidates.append((score, str(k), fv))
+    sensor_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    top_sensors = []
+    for _, k, fv in sensor_candidates[:8]:
+        top_sensors.append(
+            {
+                "metric": k,
+                "label": _humanize_metric_key(k),
+                "value": round(fv, 3),
+                "display": _fmt_evidence_num(fv, 2),
+            }
+        )
+
+    return {
+        "production": production,
+        "top_sensors": top_sensors,
+    }
+
+
+def _build_analysis_context(recommendation: dict) -> dict:
+    """Build bounded JSON context for OpenRouter analysis field generation."""
+    well_id = recommendation.get("well_id")
+    action = recommendation.get("action")
+    metrics = recommendation.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    if "production" in metrics or "sensors" in metrics:
+        merged = {}
+        if isinstance(metrics.get("production"), dict):
+            merged.update(metrics["production"])
+        if isinstance(metrics.get("sensors"), dict):
+            merged.update(metrics["sensors"])
+        metrics = merged
+
+    numeric_summary = {}
+    for key in (
+        "production_increase_bbl_day",
+        "production_increase_percent",
+        "daily_expense_benefit_usd",
+        "implementation_cost_usd",
+        "net_daily_benefit_usd",
+        "asset_value_increase_usd",
+        "time_reduced_hours",
+    ):
+        fv = _safe_float(recommendation.get(key))
+        if fv is not None and abs(fv) > 1e-9:
+            numeric_summary[key] = round(fv, 2)
+
+    key_metrics = {}
+    important_prefixes = (
+        "oil_volume", "gas_volume", "water_volume", "motor_", "surface_pressure",
+        "tubing_pressure", "casing_pressure", "discharge_pressure", "freq_hz",
+        "drive_frequency", "pump_", "injection_", "vibration_", "torque", "strokes_",
+        "intake_", "amp", "current", "load", "choke", "gl_", "esp_",
+    )
+    important_suffixes = (
+        "_avg", "_mean", "_roll_mean", "_trend", "_slope", "_latest", "_last",
+        "_pct", "_percent", "_std", "_min", "_max", "_delta", "_change",
+    )
+    for k, v in metrics.items():
+        if any(str(k).startswith(p) for p in important_prefixes) or any(
+            str(k).endswith(s) for s in important_suffixes
+        ):
+            fv = _safe_float(v)
+            key_metrics[k] = round(fv, 3) if fv is not None else v
+    if len(key_metrics) < 12:
+        for k, v in metrics.items():
+            if k in key_metrics:
+                continue
+            fv = _safe_float(v)
+            key_metrics[k] = round(fv, 3) if fv is not None else v
+            if len(key_metrics) >= 50:
+                break
+
+    conf_pct = _safe_float(recommendation.get("confidence_percent"))
+    if conf_pct is None:
+        conf = _safe_float(recommendation.get("confidence"))
+        if conf is not None:
+            conf_pct = conf * 100.0 if conf <= 1.0 else conf
+
+    return {
+        "well_id": well_id,
+        "action": action,
+        "priority": recommendation.get("priority"),
+        "category": recommendation.get("category"),
+        "reason": recommendation.get("reason"),
+        "expected_impact": recommendation.get("expected_impact"),
+        "confidence_percent": round(conf_pct, 1) if conf_pct is not None else None,
+        "detailed_analysis": recommendation.get("detailed_analysis"),
+        "current_performance": recommendation.get("current_performance"),
+        "historical_trend": recommendation.get("historical_trend"),
+        "numeric_summary": numeric_summary,
+        "evidence_snapshot": _extract_metric_snapshot(metrics),
+        "metrics": key_metrics,
+    }
+
+
+ANALYSIS_FIELD_KEYS: tuple[str, ...] = (
+    "analysis_description",
+    "sensor_evidence_description",
+    "operational_interpretation_description",
+    "recommended_next_step_description",
+)
+
+# Extra OpenRouter fields applied onto the recommendation record.
+ANALYSIS_ENRICHMENT_KEYS: tuple[str, ...] = ANALYSIS_FIELD_KEYS + (
+    "action",
+    "detailed_analysis",
+    "category",
+)
+
+
+def generate_analysis_fields_with_openai(recommendation: dict) -> dict[str, str]:
+    """
+    Generate data-driven analysis text plus a smart action and detailed_analysis.
+    Never returns static template text; all content is OpenRouter-generated from data.
+    """
+    if not isinstance(recommendation, dict):
+        raise ValueError("recommendation must be a dict")
+
+    ml_hint = recommendation.get("action") or recommendation.get("ml_action_hint") or ""
+    context = _build_analysis_context(recommendation)
+    context["ml_action_hint"] = ml_hint
+    context["existing_category"] = recommendation.get("category")
+    context["existing_priority"] = recommendation.get("priority")
+
+    prompt = f"""You are writing operator-facing content for ONE oilfield recommendation.
+Be smart, specific, and data-driven. Do NOT use static/template wording.
+
+Return JSON only with these keys:
+- action
+- category
+- detailed_analysis
+- analysis_description
+- sensor_evidence_description
+- operational_interpretation_description
+- recommended_next_step_description
+
+QUALITY BAR:
+- Sound like a sharp production engineer for THIS well and THIS data.
+- Different wells/actions must read differently.
+- Prefer evidence_snapshot + numeric_summary + reason.
+- Use ONLY real numbers from the JSON. Never invent sensors, ranges, or percentages.
+- If a value is missing, skip it.
+- All narrative fields must agree with the chosen action and the same numbers.
+
+WRITE THESE FIELDS:
+
+1) action
+   - Create a smart, specific recommended action for this well from the data.
+   - ml_action_hint is only a weak hint from the ML model — improve or replace it when data supports a better action.
+   - Prefer concrete operational phrasing with numbers when available, e.g.:
+     "Increase ESP frequency from 55 Hz to 58 Hz"
+     "Raise gas injection from 2.5 to 3.2 MMSCF/day"
+     "Reduce SPM from 12 to 10 to protect rod load"
+     "Monitor water cut and review lift settings"
+   - Keep action short: about 6-14 words. No generic filler like "Investigate well metrics".
+   - Must fit the evidence (do not recommend ESP changes if no ESP/frequency evidence exists).
+
+2) category
+   - One of: Production, Optimization, Maintenance
+   - Choose based on the action you wrote.
+
+3) detailed_analysis
+   - ONE short sentence only (about 50-120 characters, similar length to current UI blurbs).
+   - State the core issue + recommended response using real numbers when present.
+   - Examples of length/style (do not copy wording):
+     "Oil falling while water rises; tighten water monitoring and lift review."
+     "Motor load high at current Hz; step frequency down and recheck amps."
+   - Unique per recommendation. Never reuse canned template text.
+
+4) analysis_description
+   - One flowing paragraph (3-5 sentences, ~70-140 words). No bullets/headings.
+   - Naturally reference the action you chose.
+   - Explain strongest evidence with clean numbers.
+   - If numeric_summary has benefit/cost/uplift, weave in one practical impact clause.
+   - Close with one concrete field check for this action.
+   - Avoid repeating the same canned openers across wells.
+
+5) sensor_evidence_description
+   - One compact sentence of the key numbers used in analysis_description.
+   - Empty string only when no numeric evidence exists.
+
+6) operational_interpretation_description
+   - One sentence: what this pattern means for operations on this well.
+   - Must match analysis_description (no new diagnosis).
+
+7) recommended_next_step_description
+   - One actionable sentence matching the closing idea in analysis_description.
+   - Specific to the action you chose.
+
+NUMBER STYLE:
+- Use commas for thousands.
+- Prefer 1 decimal for rates/trends when useful; whole numbers for large USD values.
+- Plain text only.
+
+Recommendation data (JSON):
+{json.dumps(context, default=str)}
+"""
+
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior petroleum production engineer and excellent technical writer. "
+                    "Return valid JSON only. Invent a smart specific action from the data "
+                    "(ml_action_hint is optional guidance only). Write unique detailed_analysis "
+                    "and narrative fields. Never invent numeric values. Keep all fields consistent."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.45,
+        response_format={"type": "json_object"},
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    if not raw:
+        raise RuntimeError("OpenRouter returned empty analysis fields")
+
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("OpenRouter analysis response was not a JSON object")
+
+    out: dict[str, str] = {}
+    for key in ANALYSIS_ENRICHMENT_KEYS:
+        value = parsed.get(key)
+        if value is None:
+            out[key] = ""
+        else:
+            out[key] = str(value).strip()
+
+    if not out.get("analysis_description"):
+        raise RuntimeError("OpenRouter returned empty analysis_description")
+    if not out.get("action"):
+        # Keep prior hint only if model omitted action entirely.
+        out["action"] = str(ml_hint or "").strip()
+    if not out.get("detailed_analysis"):
+        raise RuntimeError("OpenRouter returned empty detailed_analysis")
+
+    # Keep detailed_analysis near current UI length.
+    da = out["detailed_analysis"]
+    if len(da) > 160:
+        first = da.split(". ")[0].strip()
+        out["detailed_analysis"] = first if first.endswith(".") else (first + ".")
+        if len(out["detailed_analysis"]) > 160:
+            out["detailed_analysis"] = out["detailed_analysis"][:157].rstrip() + "..."
+
+    cat = (out.get("category") or "").strip().lower()
+    if cat == "production":
+        out["category"] = "Production"
+    elif cat == "optimization":
+        out["category"] = "Optimization"
+    elif cat == "maintenance":
+        out["category"] = "Maintenance"
+    else:
+        out.pop("category", None)
+
+    return out
+
+
+def generate_analysis_description_with_openai(recommendation: dict) -> str:
+    """Backward-compatible helper returning only analysis_description."""
+    return generate_analysis_fields_with_openai(recommendation)["analysis_description"]
 
 
 def infer_action_category_priority(well_id: str, production_data: dict = None, sensor_metrics: dict = None, hint: str = None) -> dict:
@@ -431,7 +796,13 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         row["data_quality"] = _t(citations.get("data_quality", ""), 100)
         row["time_reduced_hours"] = float(round(time_reduced, 2)) if time_reduced > 0 else 0.0
 
-        from operation_recommendations.recommendations.persistence import write_operations_recommendations_to_s3
+        from operation_recommendations.recommendations.persistence import (
+            apply_analysis_description,
+            apply_metric_descriptions,
+            write_operations_recommendations_to_s3,
+        )
+        apply_metric_descriptions(row)
+        apply_analysis_description(row)
         written_key = write_operations_recommendations_to_s3([row])
         if written_key:
             logger.info(f"✓ Saved operation suggestion for {well_id}: {action} -> S3")

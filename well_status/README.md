@@ -22,13 +22,22 @@ python -m well_status.run
 
 ## Deploy (Lambda + EventBridge)
 
-From repo root (uses `.env` for `S3_BUCKET`, `ORGANIZATION_ID`, `DATABASE_URL`):
+Each tenant gets its own Lambda (one `ORGANIZATION_ID` per function). From repo root (uses `.env` for `S3_BUCKET`, `DATABASE_URL`, and tenant IDs):
+
+| Tenant | Script | Lambda | Schedule (UTC) |
+|--------|--------|--------|----------------|
+| Red Bluff | `./well_status/deploy/schedule.sh` | `well-status` | 02:00 |
+| Apex Permian | `./well_status/deploy/schedule_apex.sh` | `well-status-apex-permian` | 02:15 |
+| South Texas Energy Partners | `./well_status/deploy/schedule_step.sh` | `well-status-step` | 02:45 |
+
+**`.env` tenant IDs:**
 
 ```bash
-./well_status/deploy/schedule.sh
+RED_BUFF_ORGANIZATION_ID=3e0b5b18-bec1-488a-82c1-a47881c69058
+APEX_PERMIAN_ORGANIZATION_ID=147a92b9-f90a-473d-b443-e6e668c4fbb7
+STEP_ORGANIZATION_ID=d270f89a-aada-4ff2-adb0-68b3e8087565
+ORGANIZATION_IDS=...   # comma-separated list of all three (used by s3_to_postgres / transformations)
 ```
-
-This builds the container image, creates/updates Lambda **`well-status`**, and wires EventBridge rule **`well-status-daily`** (`cron(0 2 * * ? *)` = daily 02:00 UTC).
 
 **Deploy only** (no schedule):
 
@@ -52,7 +61,9 @@ aws lambda invoke --function-name well-status --region us-east-1 \
 | File | Purpose |
 |------|---------|
 | `deploy/deploy.sh` | Build ECR image + create/update Lambda |
-| `deploy/schedule.sh` | Daily EventBridge schedule |
+| `deploy/schedule.sh` | Red Bluff daily EventBridge schedule |
+| `deploy/schedule_apex.sh` | Apex Permian daily schedule |
+| `deploy/schedule_step.sh` | South Texas Energy Partners daily schedule |
 | `deploy/Dockerfile.lambda` | Lambda container image |
 | `deploy/requirements.lambda.txt` | Pinned Python deps |
 

@@ -230,3 +230,28 @@ class TransformationConfig:
         if self.organization_id:
             return f"{self.organization_id}/sensor_data"
         return "sensor_data"
+
+    def with_org_snowflake_schema(self) -> "TransformationConfig":
+        """Return a copy using the Snowflake schema for this tenant (if organization_id set)."""
+        if not self.organization_id:
+            return self
+        from transformations.org_snowflake import snowflake_connection_for_org
+
+        sf = snowflake_connection_for_org(self.snowflake, self.organization_id)
+        if sf is self.snowflake:
+            return self
+        updated = TransformationConfig(
+            snowflake=sf,
+            s3_bucket=self.s3_bucket,
+            organization_id=self.organization_id,
+            output_prefix=self.output_prefix,
+            tables=list(self.tables),
+            batch_size=self.batch_size,
+            write_empty_files=self.write_empty_files,
+            aws_region=self.aws_region,
+            mode=self.mode,
+            write_partitions=self.write_partitions,
+            write_snapshots=self.write_snapshots,
+            merge_snapshots=self.merge_snapshots,
+        )
+        return updated

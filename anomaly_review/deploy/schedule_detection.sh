@@ -149,6 +149,7 @@ repl = {
   "ANOMALY_REVIEW_FORCE_WINDOW_VALUE": os.environ.get("ANOMALY_REVIEW_FORCE_WINDOW", "0"),
   "OPENAI_API_KEY_VALUE": os.environ.get("OPENAI_API_KEY", ""),
   "OPENAI_API_BASE_VALUE": os.environ.get("OPENAI_API_BASE", ""),
+  "OPENAI_MODEL_VALUE": os.environ.get("OPENAI_MODEL", "openai/gpt-4o-mini"),
 }
 for k, v in repl.items():
   text = text.replace(k, v)

@@ -70,6 +70,7 @@ SYNTH_ASSETS_COLUMNS: Tuple[str, ...] = (
     "asset_type",
     "lift_type",
     "lease",
+    "area",
     "basin",
     "sub_basin",
     "state",

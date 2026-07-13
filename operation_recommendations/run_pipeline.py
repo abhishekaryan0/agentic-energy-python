@@ -219,9 +219,9 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
                     except Exception:
                         pass
 
-                    # Also enrich financial/production/operational fields from LLM if not set
-                    if not rec.get("detailed_analysis"):
-                        rec["detailed_analysis"] = _t(op.get("detailed_analysis"), 2000)
+                    # Always refresh narrative fields from OpenRouter enrichment when present.
+                    if op.get("detailed_analysis"):
+                        rec["detailed_analysis"] = _t(op.get("detailed_analysis"), 160)
                     if not rec.get("current_performance"):
                         rec["current_performance"] = _t(op.get("current_performance"), 255)
                     if not rec.get("historical_trend"):
@@ -231,6 +231,21 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
                     if cit:
                         rec["supporting_analysis"] = _t(cit.get("supporting_analysis"), 2000)
                         rec["data_quality"] = _t(cit.get("data_quality"), 100)
+
+                    # Refresh metric blurbs; regenerate analysis only if missing/failed
+                    # (already generated once in prediction record creation).
+                    try:
+                        from operation_recommendations.recommendations.persistence import (
+                            apply_analysis_description,
+                            apply_metric_descriptions,
+                        )
+                        apply_metric_descriptions(rec)
+                        analysis = str(rec.get("analysis_description") or "")
+                        if (not analysis) or analysis.startswith("OpenRouter analysis generation failed"):
+                            apply_analysis_description(rec)
+                        action = rec.get("action") or action
+                    except Exception:
+                        pass
 
                     logger.info("✓ LLM enriched: %s | %s", well_id, action)
                 except Exception as enrich_err:

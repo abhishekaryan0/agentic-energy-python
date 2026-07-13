@@ -9,11 +9,10 @@
 #   ./well_status/deploy/deploy.sh
 #
 # Apex Permian (separate Lambda — do not overwrite Red Bluff well-status):
-#   export ORGANIZATION_ID=147a92b9-f90a-473d-b443-e6e668c4fbb7
-#   export LAMBDA_FUNCTION_NAME=well-status-apex-permian
-#   export LAMBDA_ROLE_NAME=well-status-apex-permian-lambda-role
-#   export RULE_NAME=well-status-apex-permian-daily
-#   ./well_status/deploy/schedule.sh
+#   ./well_status/deploy/schedule_apex.sh
+#
+# South Texas Energy Partners (separate Lambda — uses STEP_ORGANIZATION_ID from .env):
+#   ./well_status/deploy/schedule_step.sh
 #
 set -euo pipefail
 export AWS_PAGER=""

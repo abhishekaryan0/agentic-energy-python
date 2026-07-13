@@ -1,5 +1,5 @@
 """
-Latest Brent spot ($/BBL) from the U.S. EIA Open Data API v2.
+Latest Brent/WTI spot ($/BBL) from the U.S. EIA Open Data API v2.
 
 Uses EIA_API_KEY from the environment. Caches successful responses (TTL configurable)
 with a thread-safe lock. Retries transient failures. Validates plausible prices.
@@ -22,7 +22,10 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_CACHE: Dict[str, Any] = {"ts": 0.0, "price": None, "period": None, "raw": None}
+_CACHES: Dict[str, Dict[str, Any]] = {
+    "brent": {"ts": 0.0, "price": None, "period": None, "raw": None},
+    "wti": {"ts": 0.0, "price": None, "period": None, "raw": None},
+}
 
 _EIA_BRENT_URL = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
 _DEFAULT_TTL = 3600.0
@@ -82,11 +85,12 @@ def _http_get_json(url: str, timeout: float) -> dict:
     return json.loads(body)
 
 
-def _fetch_brent_spot_data(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
-    """
-    Brent spot via petroleum/pri/spt. Prefer series facet RBRTE (Europe Brent);
-    fall back to product EPCBRENT.
-    """
+def _fetch_spot_data(
+    api_key: str,
+    timeout: float,
+    facets: Tuple[Tuple[str, str], ...],
+) -> Tuple[float, Optional[str]]:
+    """Generic spot fetch using supplied EIA facets."""
     base_params = {
         "api_key": api_key,
         "frequency": "daily",
@@ -96,10 +100,7 @@ def _fetch_brent_spot_data(api_key: str, timeout: float) -> Tuple[float, Optiona
         "length": "1",
     }
     last_err: Optional[BaseException] = None
-    for facet_key, facet_val in (
-        ("facets[series][]", "RBRTE"),
-        ("facets[product][]", "EPCBRENT"),
-    ):
+    for facet_key, facet_val in facets:
         try:
             params = {**base_params, facet_key: facet_val}
             qs = urllib.parse.urlencode(params)
@@ -111,9 +112,54 @@ def _fetch_brent_spot_data(api_key: str, timeout: float) -> Tuple[float, Optiona
     raise ValueError(f"EIA spot facets failed: {last_err}")
 
 
+def _fetch_brent_spot_data(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
+    """
+    Brent spot via petroleum/pri/spt. Prefer series facet RBRTE (Europe Brent);
+    fall back to product EPCBRENT.
+    """
+    return _fetch_spot_data(
+        api_key,
+        timeout,
+        (
+        ("facets[series][]", "RBRTE"),
+        ("facets[product][]", "EPCBRENT"),
+        ),
+    )
+
+
 def _fetch_brent_seriesid(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
     """Fallback: v2 seriesid endpoint for daily Europe Brent."""
     series_id = (os.getenv("EIA_BRENT_SERIES_ID") or "PET.RBRTE.D").strip()
+    params = {
+        "api_key": api_key,
+        "length": "1",
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+    }
+    qs = urllib.parse.urlencode(params)
+    url = f"https://api.eia.gov/v2/seriesid/{series_id}?{qs}"
+    data = _http_get_json(url, timeout)
+    return _parse_eia_rows(data)
+
+
+def _fetch_wti_spot_data(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
+    """
+    WTI spot via petroleum/pri/spt.
+    Prefer series facet RWTC (Cushing WTI), fall back to product EPCWTI.
+    """
+    return _fetch_spot_data(
+        api_key,
+        timeout,
+        (
+            ("facets[series][]", "RWTC"),
+            ("facets[product][]", "EPCWTI"),
+        ),
+    )
+
+
+def _fetch_wti_seriesid(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
+    """Fallback: v2 seriesid endpoint for daily Cushing WTI."""
+    series_id = (os.getenv("EIA_WTI_SERIES_ID") or "PET.RWTC.D").strip()
     params = {
         "api_key": api_key,
         "length": "1",
@@ -134,6 +180,14 @@ def _fetch_brent_once(api_key: str, timeout: float) -> Tuple[float, Optional[str
         return _fetch_brent_seriesid(api_key, timeout)
 
 
+def _fetch_wti_once(api_key: str, timeout: float) -> Tuple[float, Optional[str]]:
+    try:
+        return _fetch_wti_spot_data(api_key, timeout)
+    except Exception as spot_err:
+        logger.debug("EIA WTI spot facet fetch failed (%s); trying seriesid", spot_err)
+        return _fetch_wti_seriesid(api_key, timeout)
+
+
 def get_brent_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
     """
     Return (price_usd_per_bbl, source, period).
@@ -143,12 +197,13 @@ def get_brent_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
     """
     now = time.time()
     ttl = _cache_ttl_sec()
+    cache = _CACHES["brent"]
     with _lock:
         if (
-            _CACHE["price"] is not None
-            and now - float(_CACHE["ts"]) < ttl
+            cache["price"] is not None
+            and now - float(cache["ts"]) < ttl
         ):
-            return float(_CACHE["price"]), "eia_brent_cached", _CACHE.get("period")
+            return float(cache["price"]), "eia_brent_cached", cache.get("period")
 
     api_key = (os.getenv("EIA_API_KEY") or "").strip()
     if not api_key:
@@ -162,10 +217,10 @@ def get_brent_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
         try:
             price, period = _fetch_brent_once(api_key, timeout)
             with _lock:
-                _CACHE["ts"] = time.time()
-                _CACHE["price"] = price
-                _CACHE["period"] = period
-                _CACHE["raw"] = None
+                cache["ts"] = time.time()
+                cache["price"] = price
+                cache["period"] = period
+                cache["raw"] = None
             logger.info("EIA Brent spot: $%.2f/bbl period=%s", price, period)
             return price, "eia_brent", period
         except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
@@ -177,4 +232,51 @@ def get_brent_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
 
     p = _fallback_price()
     logger.warning("EIA Brent fetch failed after retries (%s); using fallback %s $/BBL", last_err, p)
+    return p, "env_fallback", None
+
+
+def get_wti_spot_usd_per_bbl() -> Tuple[float, str, Optional[str]]:
+    """
+    Return (price_usd_per_bbl, source, period).
+
+    source is 'eia_wti' on success, 'eia_wti_cached' when served from cache,
+    or 'env_fallback' if the request fails or EIA_API_KEY is missing.
+    """
+    now = time.time()
+    ttl = _cache_ttl_sec()
+    cache = _CACHES["wti"]
+    with _lock:
+        if (
+            cache["price"] is not None
+            and now - float(cache["ts"]) < ttl
+        ):
+            return float(cache["price"]), "eia_wti_cached", cache.get("period")
+
+    api_key = (os.getenv("EIA_API_KEY") or "").strip()
+    if not api_key:
+        p = _fallback_price()
+        logger.warning("EIA_API_KEY not set; using OPERATIONS_OIL_PRICE_USD=%s", p)
+        return p, "env_fallback", None
+
+    timeout = _http_timeout()
+    last_err: Optional[BaseException] = None
+    for attempt in range(_retry_count()):
+        try:
+            price, period = _fetch_wti_once(api_key, timeout)
+            with _lock:
+                cache["ts"] = time.time()
+                cache["price"] = price
+                cache["period"] = period
+                cache["raw"] = None
+            logger.info("EIA WTI spot: $%.2f/bbl period=%s", price, period)
+            return price, "eia_wti", period
+        except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+            last_err = e
+            if attempt < _retry_count() - 1:
+                delay = 0.5 * (2**attempt)
+                logger.warning("EIA WTI fetch attempt %s failed: %s; retry in %.1fs", attempt + 1, e, delay)
+                time.sleep(delay)
+
+    p = _fallback_price()
+    logger.warning("EIA WTI fetch failed after retries (%s); using fallback %s $/BBL", last_err, p)
     return p, "env_fallback", None

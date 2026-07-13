@@ -1,0 +1,13 @@
+# Container image for AWS Lambda: South Texas Energy Partners synthetic data → Snowflake.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY SOUTH_TEXAS_ENERGY_PARTNERS/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY SOUTH_TEXAS_ENERGY_PARTNERS ${LAMBDA_TASK_ROOT}/SOUTH_TEXAS_ENERGY_PARTNERS
+COPY transformations/__init__.py ${LAMBDA_TASK_ROOT}/transformations/__init__.py
+COPY transformations/columns.py ${LAMBDA_TASK_ROOT}/transformations/columns.py
+
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+CMD ["SOUTH_TEXAS_ENERGY_PARTNERS.handler.handler"]

@@ -44,6 +44,8 @@ def main():
         or "5000"
     )
     org_id = hp.get("ORGANIZATION_ID") or os.environ.get("SM_HP_ORGANIZATION_ID", "")
+    if org_id:
+        os.environ["ORGANIZATION_ID"] = str(org_id).strip()
 
     partition_days = (
         hp.get("ANOMALY_SENSOR_PARTITION_DAYS")

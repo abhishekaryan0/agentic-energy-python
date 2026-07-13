@@ -23,6 +23,7 @@ def run_table_sync(
     key_fragment: str,
     dataframe_to_rows_fn: Callable,
     upsert_fn: Callable,
+    on_connect: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     event = event or {}
     overrides = dict(event.get("settings_overrides") or {})
@@ -61,6 +62,9 @@ def run_table_sync(
     }
 
     if not keys_to_sync:
+        with postgres_connection(settings.database_url, settings.postgres_schema) as conn:
+            if on_connect is not None:
+                on_connect(conn)
         save_checkpoint(s3, settings.s3_bucket, settings.checkpoint_key, checkpoint, status="skipped", rows_upserted=0)
         result["status"] = "skipped"
         return result
@@ -69,6 +73,8 @@ def run_table_sync(
     synced_files: List[str] = []
 
     with postgres_connection(settings.database_url, settings.postgres_schema) as conn:
+        if on_connect is not None:
+            on_connect(conn)
         for key in keys_to_sync:
             logger.info("Syncing s3://%s/%s", settings.s3_bucket, key)
             df = read_parquet_from_s3(s3, settings.s3_bucket, key)

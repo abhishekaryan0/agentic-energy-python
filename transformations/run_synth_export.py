@@ -72,6 +72,7 @@ def main() -> None:
 
     config = _config_from_args(args)
     config.validate()
+    config = config.with_org_snowflake_schema()
 
     source_names = None
     if args.sources:

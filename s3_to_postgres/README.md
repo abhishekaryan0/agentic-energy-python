@@ -38,12 +38,23 @@ python -m s3_to_postgres.run --sync-mode backfill --table daily_production --bac
 ## Deploy (Lambda + EventBridge)
 
 ```bash
-# Deploy Lambda + daily schedule (01:00 UTC)
+# Deploy Lambda + daily schedule (01:00 UTC) — ORGANIZATION_IDS from .env
 ./s3_to_postgres/deploy/schedule.sh
 
 # Lambda only
 ./s3_to_postgres/deploy/deploy.sh
+
+# STEP-only incremental sync (after deploy includes STEP in ORGANIZATION_IDS)
+./s3_to_postgres/deploy/run_sync_step.sh
 ```
+
+Tenants share one Lambda. Include all org UUIDs in `.env` `ORGANIZATION_IDS` (Red Bluff, Apex, STEP), then redeploy so IAM and Lambda env pick up the new S3 prefix.
+
+| Tenant | Org env |
+|--------|---------|
+| Red Bluff | `RED_BUFF_ORGANIZATION_ID` |
+| Apex Permian | `APEX_PERMIAN_ORGANIZATION_ID` |
+| South Texas Energy Partners | `STEP_ORGANIZATION_ID` |
 
 - Lambda: `s3-to-postgres-sync`
 - EventBridge rule: `s3-to-postgres-sync-daily`

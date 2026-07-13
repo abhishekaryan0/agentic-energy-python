@@ -35,6 +35,8 @@ def main() -> None:
     )
     model_dir = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
     org_id = os.environ.get("SM_HP_ORGANIZATION_ID", "")
+    if org_id:
+        os.environ["ORGANIZATION_ID"] = str(org_id).strip()
 
     max_days_raw = (os.getenv("OPS_TRAINING_PARTITION_DAYS") or "250").strip()
     max_days = int(max_days_raw) if max_days_raw.isdigit() else 250
@@ -74,14 +76,20 @@ def main() -> None:
 
     summary = train_operations_from_parquet(sensor_path, production_path, model_dir)
     expected = os.path.join(model_dir, "decision_tree_alldata.joblib")
+    category_expected = os.path.join(model_dir, "category_classifier.joblib")
     if not os.path.isfile(expected):
         logger.error("Training did not produce required artifact: %s", expected)
         sys.exit(1)
+    if not os.path.isfile(category_expected):
+        logger.error("Training did not produce required artifact: %s", category_expected)
+        sys.exit(1)
     logger.info(
-        "Operations training finished: train_accuracy=%s trained_on=%s artifact=%s",
+        "Operations training finished: train_accuracy=%s category_accuracy=%s trained_on=%s artifacts=%s,%s",
         summary.get("train_accuracy"),
+        summary.get("category_train_accuracy"),
         summary.get("trained_on"),
         expected,
+        category_expected,
     )
 
 

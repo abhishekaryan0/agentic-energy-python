@@ -19,6 +19,7 @@ import pandas as pd
 
 RED_BUFF_ORGANIZATION_ID = "3e0b5b18-bec1-488a-82c1-a47881c69058"
 APEX_PERMIAN_ORGANIZATION_ID = "147a92b9-f90a-473d-b443-e6e668c4fbb7"
+STEP_ORGANIZATION_ID = "d270f89a-aada-4ff2-adb0-68b3e8087565"
 
 # Apex twin engine → canonical sensor names (see APEX_PERMIAN/generate_digital_twin.py).
 APEX_TWIN_TO_CANONICAL_SENSOR: Dict[str, str] = {
@@ -101,6 +102,7 @@ _EXPORT_PROFILES: Dict[str, ExportFieldProfile] = {
 _ORG_ID_TO_PROFILE: Dict[str, str] = {
     APEX_PERMIAN_ORGANIZATION_ID: "apex_permian",
     RED_BUFF_ORGANIZATION_ID: "red_buff",
+    STEP_ORGANIZATION_ID: "red_buff",
 }
 
 
@@ -114,9 +116,12 @@ def resolve_export_profile(organization_id: Optional[str]) -> Optional[ExportFie
     if not profile_key:
         apex_env = (os.getenv("APEX_PERMIAN_ORGANIZATION_ID") or "").strip()
         red_env = (os.getenv("RED_BUFF_ORGANIZATION_ID") or "").strip()
+        step_env = (os.getenv("STEP_ORGANIZATION_ID") or STEP_ORGANIZATION_ID).strip()
         if org == apex_env:
             profile_key = "apex_permian"
         elif org == red_env:
+            profile_key = "red_buff"
+        elif org == step_env:
             profile_key = "red_buff"
     if not profile_key:
         return None

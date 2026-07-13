@@ -44,6 +44,11 @@ Deploy / run:
 
 # Apex Permian weekly training (Mon 02:40 UTC)
 ./operation_recommendations/deploy/schedule_sagemaker_training_apex.sh
+
+# South Texas Energy Partners
+./operation_recommendations/deploy/run_sagemaker_training_step.sh
+./operation_recommendations/deploy/schedule_sagemaker_training_step.sh
+./operation_recommendations/deploy/schedule_detection_step.sh
 ```
 
 ## S3 layout

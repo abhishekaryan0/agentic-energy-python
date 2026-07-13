@@ -285,6 +285,24 @@ LIFT_TYPE_FEATURES: Dict[str, List[str]] = {
     ],
 }
 
+# South Texas Energy Partners parquet uses "Pumping Unit" (same columns as Red Bluff rod pump).
+LIFT_TYPE_ALIASES: Dict[str, str] = {
+    "Pumping Unit": "Rod Pump",
+    "pumping unit": "Rod Pump",
+    "rod_pump": "Rod Pump",
+}
+
+STEP_ORGANIZATION_ID = "d270f89a-aada-4ff2-adb0-68b3e8087565"
+
+
+def normalize_lift_type(lift_type: Optional[str]) -> str:
+    """Map tenant parquet lift labels to canonical LIFT_TYPE_FEATURES keys."""
+    if not lift_type:
+        return ""
+    key = str(lift_type).strip()
+    return LIFT_TYPE_ALIASES.get(key, LIFT_TYPE_ALIASES.get(key.lower(), key))
+
+
 # =============================================================================
 # BATCH PROCESSING CONFIGURATION
 # =============================================================================

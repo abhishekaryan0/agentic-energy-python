@@ -6,12 +6,75 @@ Generates detailed, professional reports using OpenAI API for detected anomalies
 
 import json
 import logging
+import os
+import time
 from datetime import datetime
 from typing import Dict, Optional
 
 from anomaly_review.data import get_openai_client
 
 logger = logging.getLogger("AnomalyReviewLLM")
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
+LLM_TIMEOUT_SEC = int(os.getenv("ANOMALY_REVIEW_LLM_TIMEOUT", "60"))
+LLM_MAX_RETRIES = max(1, int(os.getenv("ANOMALY_REVIEW_LLM_MAX_RETRIES", "3")))
+
+
+def _llm_fallback(reason: str) -> Dict:
+    description = (
+        "Automated narrative generation did not complete. "
+        "Please review the raw sensor data and charts below."
+    )
+    if "402" in reason or "Insufficient credits" in reason:
+        description += " OpenRouter API credits are exhausted; add credits and re-run detection."
+    return {
+        "title": "Analysis Pending",
+        "description": description,
+        "why_is_this_an_anomaly": "Metrics deviate from established baselines.",
+        "suspected_root_cause": "Pending automated investigation.",
+        "economic_impact": "Impact calculation pending.",
+        "risk_analysis": "Please conduct manual review of the attached charts.",
+        "recommended_actions": "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence.",
+        "historical_context": {
+            "recurrence_status": "Unknown",
+            "history_timeline": [],
+        },
+        "is_valid_anomaly": True,
+        "_llm_fallback_reason": reason,
+    }
+
+
+def _call_llm_json(client, prompt: str) -> Dict:
+    last_err = None
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                timeout=LLM_TIMEOUT_SEC,
+            )
+            raw_content = response.choices[0].message.content or ""
+            if "```json" in raw_content:
+                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_content:
+                raw_content = raw_content.split("```")[1].split("```")[0].strip()
+            return json.loads(raw_content)
+        except Exception as e:
+            last_err = e
+            if attempt < LLM_MAX_RETRIES:
+                wait = min(2 ** attempt, 8)
+                logger.warning(
+                    "LLM attempt %s/%s failed (%s); retrying in %ss",
+                    attempt,
+                    LLM_MAX_RETRIES,
+                    e,
+                    wait,
+                )
+                time.sleep(wait)
+            else:
+                raise last_err
+    raise RuntimeError("LLM call failed without exception")
 
 
 def generate_llm_content(
@@ -266,41 +329,17 @@ Generate a JSON response with these EXACT keys and STRICT formats:
 Return ONLY valid JSON. Ensure all fields are populated based on data provided.
 """
 
-        # Call OpenAI with explicit timeout
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                timeout=15,  # 15-second timeout
-            )
-
-            raw_content = response.choices[0].message.content
-            # Cleanup Markdown code blocks if present
-            if "```json" in raw_content:
-                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_content:
-                raw_content = raw_content.split("```")[1].split("```")[0].strip()
-
-            content = json.loads(raw_content)
-
+            content = _call_llm_json(client, prompt)
         except Exception as e:
-            # Handle Timeout or API Error by returning structured fallback
-            logger.warning(f"LLM Call failed or timed out: {e}")
-            return {
-                "title": "Analysis Pending",
-                "description": "Automated technical analysis is currently unavailable due to high system load. Please review the raw sensor data below.",
-                "why_is_this_an_anomaly": "Metrics deviate from established baselines.",
-                "suspected_root_cause": "Pending automated investigation.",
-                "economic_impact": "Impact calculation pending.",
-                "risk_analysis": "Please conduct manual review of the attached charts.",
-                "recommended_actions": "1. Review raw sensor data.\n2. Verify sensor calibration.\n3. Monitor for recurrence.",
-                "historical_context": {
-                    "recurrence_status": "Unknown",
-                    "history_timeline": [],
-                },
-                "is_valid_anomaly": True,
-            }
+            logger.warning(
+                "LLM call failed after %s attempts (model=%s, timeout=%ss): %s",
+                LLM_MAX_RETRIES,
+                OPENAI_MODEL,
+                LLM_TIMEOUT_SEC,
+                e,
+            )
+            return _llm_fallback(str(e))
 
         # Default recommended_actions if missing
         if "recommended_actions" not in content:
@@ -316,16 +355,4 @@ Return ONLY valid JSON. Ensure all fields are populated based on data provided.
 
     except Exception as e:
         logger.error(f"LLM content generation critical failure: {e}")
-        return {
-            "title": "Analysis Pending",
-            "description": "Automated technical analysis is currently unavailable due to high system load. Please review the raw sensor data below.",
-            "why_is_this_an_anomaly": "Metrics deviate from established baselines.",
-            "suspected_root_cause": "Pending automated investigation.",
-            "economic_impact": "Impact calculation pending.",
-            "risk_analysis": "Please conduct manual review of the attached charts.",
-            "historical_context": {
-                "recurrence_status": "Unknown",
-                "history_timeline": [],
-            },
-            "is_valid_anomaly": True,
-        }
+        return _llm_fallback(str(e))

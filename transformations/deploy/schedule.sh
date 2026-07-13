@@ -10,7 +10,7 @@
 #   ./transformations/deploy/schedule.sh
 #
 # Optional:
-#   SCHEDULE_CRON="cron(15 0 * * ? *)"      # default: daily at 00:15 UTC
+#   SCHEDULE_CRON="cron(45 0 * * ? *)"      # default: daily at 00:45 UTC (06:15 IST)
 #   LAMBDA_REGION=us-east-1
 #   LAMBDA_FUNCTION_NAME=transformations
 #   RULE_NAME=transformations-daily
@@ -34,7 +34,7 @@ fi
 LAMBDA_REGION="${LAMBDA_REGION:-us-east-1}"
 LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-transformations}"
 RULE_NAME="${RULE_NAME:-transformations-daily}"
-SCHEDULE_CRON="${SCHEDULE_CRON:-cron(15 0 * * ? *)}"
+SCHEDULE_CRON="${SCHEDULE_CRON:-cron(45 0 * * ? *)}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
 
 if [[ "${SKIP_LAMBDA_DEPLOY:-0}" != "1" ]]; then

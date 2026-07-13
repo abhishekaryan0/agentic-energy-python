@@ -10,6 +10,9 @@
 # Apex Permian (separate ECS task — does not change Red Buff schedule):
 #   ./anomaly_detection/deploy/schedule_detection_apex.sh
 #
+# South Texas Energy Partners (separate ECS task):
+#   ./anomaly_detection/deploy/schedule_detection_step.sh
+#
 set -euo pipefail
 export AWS_PAGER=""
 
@@ -66,7 +69,17 @@ EVENTBRIDGE_ROLE_NAME="${EVENTBRIDGE_ROLE_NAME:-ecs-anomaly-detection-events-rol
 
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET or add to .env}"
 ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID or add to .env}"
-ANOMALY_MODEL_TRAINING_JOB="${ANOMALY_MODEL_TRAINING_JOB:-anomaly-train-20260605-1757}"
+
+if [[ -z "${ANOMALY_MODEL_TRAINING_JOB:-}" ]]; then
+  latest_key="$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "${ORGANIZATION_ID}/model/" \
+    --query 'Contents[?contains(Key, `anomaly-train`) && ends_with(Key, `model.tar.gz`)]|sort_by(@,&LastModified)[-1].Key' \
+    --output text --region "$REGION" 2>/dev/null || true)"
+  if [[ -n "$latest_key" && "$latest_key" != "None" ]]; then
+    ANOMALY_MODEL_TRAINING_JOB="$(basename "$(dirname "$(dirname "$latest_key")")")"
+    echo "Auto-selected anomaly model job: ${ANOMALY_MODEL_TRAINING_JOB}"
+  fi
+fi
+ANOMALY_MODEL_TRAINING_JOB="${ANOMALY_MODEL_TRAINING_JOB:-}"
 
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null)}"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG}"

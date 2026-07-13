@@ -196,6 +196,150 @@ def apply_time_reduced_hours(rec: Dict[str, Any]) -> None:
         rec["time_reduced_hours"] = 0.0
 
 
+# Keys written by ``apply_metric_descriptions`` (also used by S3 write backfill).
+METRIC_DESCRIPTION_KEYS: tuple[str, ...] = (
+    "production_increase_description",
+    "expense_benefit_description",
+    "implementation_cost_description",
+    "time_reduced_description",
+    "asset_value_increase_description",
+    "net_daily_benefit_description",
+    "confidence_description",
+)
+
+
+def _fmt_desc_number(val: Any, digits: int = 0) -> Optional[str]:
+    """Format a metric number for short description text; None if missing/invalid."""
+    try:
+        if val is None:
+            return None
+        fv = float(val)
+        if abs(fv) < 1e-9:
+            fv = 0.0
+        if digits <= 0:
+            return f"{fv:,.0f}"
+        return f"{fv:,.{digits}f}"
+    except Exception:
+        return None
+
+
+def build_metric_descriptions(rec: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Short blurbs that include this recommendation's actual impact numbers.
+    Example: \"About 25 bbl/day extra production if this action is taken.\"
+    """
+    prod = _fmt_desc_number(rec.get("production_increase_bbl_day"), 0)
+    expense = _fmt_desc_number(rec.get("daily_expense_benefit_usd"), 0)
+    impl = _fmt_desc_number(rec.get("implementation_cost_usd"), 0)
+    hours = _fmt_desc_number(rec.get("time_reduced_hours"), 0)
+    asset = _fmt_desc_number(rec.get("asset_value_increase_usd"), 0)
+    net = _fmt_desc_number(rec.get("net_daily_benefit_usd"), 0)
+    pct = _fmt_desc_number(rec.get("production_increase_percent"), 1)
+
+    if prod is not None:
+        prod_desc = f"About {prod} bbl/day extra production if this action is taken."
+        if pct is not None and float(rec.get("production_increase_percent") or 0) > 0:
+            prod_desc = (
+                f"About {prod} bbl/day extra production (~{pct}% uplift) "
+                "if this action is taken."
+            )
+    else:
+        prod_desc = "Estimated extra oil production per day if this action is taken."
+
+    if expense is not None:
+        expense_desc = f"About ${expense}/day revenue gain from the expected production increase."
+    else:
+        expense_desc = "Estimated daily revenue gain from the expected production increase."
+
+    if impl is not None:
+        impl_desc = f"About ${impl} one-time cost to carry out this recommendation."
+    else:
+        impl_desc = "One-time cost to carry out this recommendation."
+
+    if hours is not None:
+        time_desc = f"About {hours} hrs of unproductive time this action can recover."
+    else:
+        time_desc = "Estimated hours of unproductive time this action can recover."
+
+    if asset is not None:
+        asset_desc = f"About ${asset} estimated yearly gain in asset value from the net daily benefit."
+    else:
+        asset_desc = "Estimated yearly gain in asset value from the net daily benefit."
+
+    if net is not None:
+        net_desc = (
+            f"About ${net}/day net benefit after spreading the one-time implementation cost."
+        )
+    else:
+        net_desc = "Daily benefit after spreading the one-time implementation cost."
+
+    conf_pct: Optional[float] = None
+    try:
+        if rec.get("confidence_percent") is not None:
+            conf_pct = float(rec["confidence_percent"])
+        elif rec.get("confidence") is not None:
+            c = float(rec["confidence"])
+            conf_pct = c * 100.0 if c <= 1.0 else c
+    except Exception:
+        conf_pct = None
+
+    if conf_pct is not None and conf_pct > 0:
+        if conf_pct >= 70:
+            strength = "strong"
+        elif conf_pct >= 50:
+            strength = "moderate"
+        else:
+            strength = "lower"
+        conf_desc = (
+            f"Model confidence is about {_fmt_desc_number(conf_pct, 0)}%, "
+            f"indicating a {strength} match between well data and this recommended action."
+        )
+    else:
+        conf_desc = (
+            "Model confidence reflects how closely well sensor and production data "
+            "support this recommended action."
+        )
+
+    return {
+        "production_increase_description": prod_desc,
+        "expense_benefit_description": expense_desc,
+        "implementation_cost_description": impl_desc,
+        "time_reduced_description": time_desc,
+        "asset_value_increase_description": asset_desc,
+        "net_daily_benefit_description": net_desc,
+        "confidence_description": conf_desc,
+    }
+
+
+def apply_metric_descriptions(rec: Dict[str, Any]) -> None:
+    """Attach short number-aware descriptions for each impact metric field."""
+    rec.update(build_metric_descriptions(rec))
+
+
+def apply_analysis_description(rec: Dict[str, Any]) -> None:
+    """Attach OpenRouter-generated action, detailed_analysis, and analysis text fields."""
+    try:
+        from operation_recommendations.suggestions import generate_analysis_fields_with_openai
+        # Preserve ML class as hint only; OpenRouter may replace action.
+        if rec.get("action") and not rec.get("ml_action_hint"):
+            rec["ml_action_hint"] = rec.get("action")
+        fields = generate_analysis_fields_with_openai(rec)
+        for key, value in fields.items():
+            if value:
+                rec[key] = value
+    except Exception as e:
+        # No static fallback by request; keep explicit failure marker instead.
+        msg = f"OpenRouter analysis generation failed: {e}"
+        for key in (
+            "analysis_description",
+            "sensor_evidence_description",
+            "operational_interpretation_description",
+            "recommended_next_step_description",
+            "detailed_analysis",
+        ):
+            rec[key] = msg
+
+
 def merge_metrics_for_financial_impact(
     production_data: Optional[Dict[str, Any]],
     sensor_metrics: Optional[Dict[str, Any]],
@@ -722,7 +866,7 @@ def _fmt_metric(val: Any, digits: int = 2) -> str:
 
 def _build_current_vs_optimal_performance(metrics: Dict[str, Any], uplift_bbl_day: Optional[float]) -> str:
     """
-    Build a "Current vs Optimal Performance" text block.
+    Build a "Current Average Daily Performance vs Projected Improvement Estimate" text block.
 
     - Current production uses `*_roll_mean` values.
     - Optimal production uses uplift applied to BOE, split into oil/gas by current proportions.
@@ -766,7 +910,7 @@ def _build_current_vs_optimal_performance(metrics: Dict[str, Any], uplift_bbl_da
     # Optional rule-template target hint will be appended by caller if available.
     return "\n".join(
         [
-            "Current vs. Optimal Performance",
+            "Current Average Daily Performance vs Projected Improvement Estimate",
             "Performance Snapshot",
             f"Oil: {_fmt_metric(oil_cur)} bbl/d  | Optimal: {_fmt_metric(oil_opt)} bbl/d",
             f"Gas: {_fmt_metric(gas_cur)} mcf/d  | Optimal: {_fmt_metric(gas_opt)} mcf/d",
@@ -901,29 +1045,30 @@ def _create_prediction_record(
         pass
 
     apply_time_reduced_hours(rec)
+    apply_metric_descriptions(rec)
 
-    # Enrich from rule templates (ACTION_MAPPING) so citations and narrative fields are populated.
+    # Keep ML class as a hint only. OpenRouter generates smart action + detailed_analysis.
+    rec["ml_action_hint"] = action
     cfg = CLASS_TO_ACTION_CONFIG.get(action)
     target_hint: Optional[str] = None
     if cfg:
-        rec['detailed_analysis'] = cfg.get('high_action') or cfg.get('low_action') or action
-        templates = cfg.get('templates') or []
+        templates = cfg.get("templates") or []
         if templates:
             tpl = templates[0]
             try:
-                raw_val = metrics.get('oil_volume_roll_mean') or '—'
+                raw_val = metrics.get("oil_volume_roll_mean") or "—"
                 try:
                     cur_val = round(float(raw_val), 2)
                 except Exception:
                     cur_val = raw_val
-                target_hint = tpl.format(current=cur_val, target='optimal')
+                target_hint = tpl.format(current=cur_val, target="optimal")
             except Exception:
                 target_hint = tpl
         else:
-            target_hint = cfg.get('high_action') or cfg.get('low_action')
-    else:
-        rec['detailed_analysis'] = rec.get('reason') or action
-        target_hint = None
+            target_hint = cfg.get("high_action") or cfg.get("low_action")
+
+    # OpenRouter fills action, detailed_analysis, and narrative fields (non-static).
+    apply_analysis_description(rec)
 
     # Build user-visible performance blocks.
     current_vs_opt = _build_current_vs_optimal_performance(metrics, rec.get("production_increase_bbl_day"))
@@ -1072,18 +1217,29 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         "confidence_percent",
         "confidence",
         "probability",
+        "confidence_description",
         "reason",
         "expected_impact",
         "production_increase_bbl_day",
         "production_increase_percent",
+        "production_increase_description",
         "daily_expense_benefit_usd",
+        "expense_benefit_description",
         "implementation_cost_usd",
+        "implementation_cost_description",
         "net_daily_benefit_usd",
+        "net_daily_benefit_description",
         "asset_value_increase_usd",
+        "asset_value_increase_description",
         "eia_brent_usd_per_bbl",
         "eia_brent_source",
         "eia_brent_period",
         "time_reduced_hours",
+        "time_reduced_description",
+        "analysis_description",
+        "sensor_evidence_description",
+        "operational_interpretation_description",
+        "recommended_next_step_description",
         "detailed_analysis",
         "current_performance",
         "historical_trend",
@@ -1140,6 +1296,19 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
             row["created_at"] = datetime.now(timezone.utc).isoformat()
         if row.get("updated_at") is None:
             row["updated_at"] = row.get("created_at")
+
+        # Ensure metric description fields are always present in parquet output.
+        apply_metric_descriptions(row)
+        if any(
+            not row.get(k)
+            for k in (
+                "analysis_description",
+                "sensor_evidence_description",
+                "operational_interpretation_description",
+                "recommended_next_step_description",
+            )
+        ):
+            apply_analysis_description(row)
 
         metrics_val = r.get("metrics")
         if metrics_val is not None:

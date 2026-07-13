@@ -4,6 +4,7 @@ Sensor configuration for anomaly detection — tenant-aware band profiles.
 
 Red Buff: full sensor set (red_buff_sensors).
 Apex Permian: Apex parquet columns and bands (apex_permian_sensors).
+South Texas Energy Partners: full canonical parquet + Eagle Ford bands (step_sensors).
 """
 
 import logging

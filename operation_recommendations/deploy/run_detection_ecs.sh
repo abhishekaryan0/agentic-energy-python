@@ -20,6 +20,7 @@ LOG_GROUP="${LOG_GROUP:-/ecs/operations-detection}"
 DETECTION_DAYS="${OPS_DETECTION_DAYS:-7}"
 FORCE_WINDOW="${OPS_DETECTION_FORCE_WINDOW:-1}"
 RESET_CHECKPOINT="${OPS_RESET_CHECKPOINT:-0}"
+MIN_SENSOR_ROWS="${OPS_MIN_SENSOR_ROWS_PER_WELL:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -31,6 +32,7 @@ _SAVED_LOG_GROUP="${LOG_GROUP:-}"
 _SAVED_DETECTION_DAYS="${OPS_DETECTION_DAYS:-}"
 _SAVED_FORCE_WINDOW="${OPS_DETECTION_FORCE_WINDOW:-}"
 _SAVED_RESET_CHECKPOINT="${OPS_RESET_CHECKPOINT:-}"
+_SAVED_MIN_SENSOR_ROWS="${OPS_MIN_SENSOR_ROWS_PER_WELL:-}"
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -56,6 +58,9 @@ fi
 if [[ -n "$_SAVED_RESET_CHECKPOINT" ]]; then
   RESET_CHECKPOINT="$_SAVED_RESET_CHECKPOINT"
 fi
+if [[ -n "$_SAVED_MIN_SENSOR_ROWS" ]]; then
+  MIN_SENSOR_ROWS="$_SAVED_MIN_SENSOR_ROWS"
+fi
 
 S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET}"
 ORGANIZATION_ID="${ORGANIZATION_ID:?Set ORGANIZATION_ID}"
@@ -75,14 +80,26 @@ fi
 
 TASK_DEF=$(aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --region "$REGION" --query 'taskDefinition.taskDefinitionArn' --output text)
 
+ENV_OVERRIDES=$(cat <<EOF
+      {"name": "OPS_DETECTION_DAYS", "value": "${DETECTION_DAYS}"},
+      {"name": "OPS_DETECTION_FORCE_WINDOW", "value": "${FORCE_WINDOW}"},
+      {"name": "OPS_RESET_CHECKPOINT", "value": "${RESET_CHECKPOINT}"}
+EOF
+)
+if [[ -n "$MIN_SENSOR_ROWS" ]]; then
+  ENV_OVERRIDES+=$(cat <<EOF
+,
+      {"name": "OPS_MIN_SENSOR_ROWS_PER_WELL", "value": "${MIN_SENSOR_ROWS}"}
+EOF
+)
+fi
+
 OVERRIDES=$(cat <<EOF
 {
   "containerOverrides": [{
     "name": "operations-detection",
     "environment": [
-      {"name": "OPS_DETECTION_DAYS", "value": "${DETECTION_DAYS}"},
-      {"name": "OPS_DETECTION_FORCE_WINDOW", "value": "${FORCE_WINDOW}"},
-      {"name": "OPS_RESET_CHECKPOINT", "value": "${RESET_CHECKPOINT}"}
+${ENV_OVERRIDES}
     ]
   }]
 }
@@ -90,7 +107,7 @@ EOF
 )
 
 echo "One-off ECS task: org=$ORGANIZATION_ID cluster=$CLUSTER family=$TASK_FAMILY"
-echo "days=$DETECTION_DAYS force_window=$FORCE_WINDOW reset_checkpoint=$RESET_CHECKPOINT"
+echo "days=$DETECTION_DAYS force_window=$FORCE_WINDOW reset_checkpoint=$RESET_CHECKPOINT min_sensor_rows=${MIN_SENSOR_ROWS:-default}"
 TASK_ARN=$(aws ecs run-task \
   --cluster "$CLUSTER" \
   --task-definition "$TASK_DEF" \

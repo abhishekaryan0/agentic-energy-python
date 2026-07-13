@@ -235,6 +235,9 @@ def get_features_for_lift_type(lift_type: str, include_production: bool = True) 
     Returns:
         List of feature names
     """
+    from operation_recommendations.tenant_config import normalize_lift_type
+
+    lift_type = normalize_lift_type(lift_type) or lift_type
     sensors = get_sensors_for_lift_type(lift_type)
     features = []
     
