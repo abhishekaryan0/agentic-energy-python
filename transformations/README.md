@@ -98,7 +98,7 @@ Env: same Snowflake/S3 vars. Optional: `SYNTH_EXPORT_MODE`, `SYNTH_EXPORT_FAIL_O
 ./transformations/deploy/schedule.sh
 ```
 
-- EventBridge: `transformations-daily` → `cron(15 0 * * ? *)` (00:15 UTC)
+- EventBridge: `transformations-daily` → `cron(45 0 * * ? *)` (00:45 UTC)
 - Lambda: `transformations`
 - Logs: `/aws/lambda/transformations`
 

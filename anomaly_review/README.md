@@ -72,6 +72,6 @@ From repo root (with `.env` or `S3_BUCKET`, `ORGANIZATION_ID`):
 |--------|---------|----------|--------------------------|
 | Red Bluff | `RED_BUFF_ORGANIZATION_ID` | `anomaly-review-detection-batch` | Mon 03:00 |
 | Apex Permian | `APEX_PERMIAN_ORGANIZATION_ID` | `anomaly-review-detection-apex-permian` | Mon 03:15 |
-| South Texas Energy Partners | `STEP_ORGANIZATION_ID` | `anomaly-review-detection-step` | Mon 03:30 |
+| South Texas Energy Partners | `STEP_ORGANIZATION_ID` | `anomaly-review-detection-step` | Mon 01:15 |
 
 Training schedules: Mon ~02:10 (Red Buff), 02:15 (Apex), 02:30 (STEP).

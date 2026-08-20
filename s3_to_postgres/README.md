@@ -49,7 +49,7 @@ CLI `--table` choices: `anomaly_suggestions`, `anomaly_reviews`, `operation_reco
 ## Deploy (Lambda + EventBridge)
 
 ```bash
-./s3_to_postgres/deploy/schedule.sh    # Lambda + daily 01:00 UTC
+./s3_to_postgres/deploy/schedule.sh    # Lambda + daily 03:30 UTC
 ./s3_to_postgres/deploy/deploy.sh      # Lambda only
 ./s3_to_postgres/deploy/run_sync_step.sh   # STEP-only invoke helper
 ```
