@@ -7,6 +7,7 @@ Usage:
   export ORGANIZATION_IDS=org-a,org-b               # or multiple tenants
   export DATABASE_URL=...
   python -m s3_to_postgres.run --table anomaly_suggestions
+  python -m s3_to_postgres.run --table daily_production --sync-mode backfill
   python -m s3_to_postgres.run --table daily_production --sync-mode backfill --backfill-years 2
   python -m s3_to_postgres.run --table all --sync-mode backfill
 """
@@ -50,8 +51,11 @@ def main() -> int:
     parser.add_argument(
         "--backfill-years",
         type=int,
-        default=2,
-        help="For production backfill: only sync partitions from the last N years (default: 2)",
+        default=None,
+        help=(
+            "Optional production retention window in years. "
+            "Omit or 0 to sync/keep all available S3 daily_production history."
+        ),
     )
     parser.add_argument(
         "--table",
@@ -79,8 +83,9 @@ def main() -> int:
     event: dict = {
         "sync_mode": args.sync_mode,
         "table": args.table,
-        "backfill_years": args.backfill_years,
     }
+    if args.backfill_years is not None:
+        event["backfill_years"] = args.backfill_years
     if args.s3_key:
         event["s3_key"] = args.s3_key
     if args.max_files is not None:

@@ -223,10 +223,31 @@ def _fmt_desc_number(val: Any, digits: int = 0) -> Optional[str]:
         return None
 
 
+def _oil_price_description_clause(rec: Dict[str, Any]) -> str:
+    """Phrase oil $/bbl source from org_settings (Manual) or EIA Brent/WTI keys."""
+    price = _fmt_desc_number(rec.get("eia_brent_usd_per_bbl"), 2)
+    if price is None:
+        return ""
+    src = str(rec.get("eia_brent_source") or "").strip().lower()
+    period = rec.get("eia_brent_period")
+    if "manual" in src:
+        clause = f" using org Manual oil price of ${price}/bbl"
+    elif "wti" in src:
+        clause = f" using EIA WTI spot of ${price}/bbl"
+    elif "brent" in src:
+        clause = f" using EIA Brent spot of ${price}/bbl"
+    else:
+        clause = f" using oil price of ${price}/bbl"
+    if period:
+        clause += f" ({period})"
+    return clause
+
+
 def build_metric_descriptions(rec: Dict[str, Any]) -> Dict[str, str]:
     """
     Short blurbs that include this recommendation's actual impact numbers.
     Example: \"About 25 bbl/day extra production if this action is taken.\"
+    Revenue text includes org Manual vs EIA Brent/WTI from stored price keys.
     """
     prod = _fmt_desc_number(rec.get("production_increase_bbl_day"), 0)
     expense = _fmt_desc_number(rec.get("daily_expense_benefit_usd"), 0)
@@ -235,6 +256,7 @@ def build_metric_descriptions(rec: Dict[str, Any]) -> Dict[str, str]:
     asset = _fmt_desc_number(rec.get("asset_value_increase_usd"), 0)
     net = _fmt_desc_number(rec.get("net_daily_benefit_usd"), 0)
     pct = _fmt_desc_number(rec.get("production_increase_percent"), 1)
+    price_clause = _oil_price_description_clause(rec)
 
     if prod is not None:
         prod_desc = f"About {prod} bbl/day extra production if this action is taken."
@@ -247,7 +269,10 @@ def build_metric_descriptions(rec: Dict[str, Any]) -> Dict[str, str]:
         prod_desc = "Estimated extra oil production per day if this action is taken."
 
     if expense is not None:
-        expense_desc = f"About ${expense}/day revenue gain from the expected production increase."
+        expense_desc = (
+            f"About ${expense}/day revenue gain from the expected production increase"
+            f"{price_clause}."
+        )
     else:
         expense_desc = "Estimated daily revenue gain from the expected production increase."
 
@@ -268,7 +293,8 @@ def build_metric_descriptions(rec: Dict[str, Any]) -> Dict[str, str]:
 
     if net is not None:
         net_desc = (
-            f"About ${net}/day net benefit after spreading the one-time implementation cost."
+            f"About ${net}/day net benefit after spreading the one-time implementation cost"
+            f"{price_clause}."
         )
     else:
         net_desc = "Daily benefit after spreading the one-time implementation cost."
@@ -338,6 +364,81 @@ def apply_analysis_description(rec: Dict[str, Any]) -> None:
             "detailed_analysis",
         ):
             rec[key] = msg
+
+
+def apply_alternatives_and_citations(
+    rec: Dict[str, Any],
+    *,
+    financial_meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Fill model-alternation fields + SPE/research citations (OpenRouter / Perplexity).
+
+    Soft-fails: logs and leaves prior/empty values so detection still completes.
+    Does not emit financial_pricing or source labels in citations.
+    """
+    def _t(s: Any, n: int) -> Optional[str]:
+        try:
+            if s is None:
+                return None
+            s2 = str(s)
+            return s2 if len(s2) <= n else s2[:n]
+        except Exception:
+            return None
+
+    try:
+        from operation_recommendations.suggestions import generate_alternatives_and_citations
+
+        enriched = generate_alternatives_and_citations(rec)
+        for key in (
+            "conservative_approach",
+            "aggressive_optimization",
+            "hybrid_model",
+            "recommended_model",
+            "supporting_analysis",
+            "data_quality",
+        ):
+            val = enriched.get(key)
+            if val:
+                limit = 500 if key == "recommended_model" else (100 if key == "data_quality" else 2000)
+                rec[key] = _t(val, limit)
+
+        if enriched.get("citations"):
+            cite_obj: Dict[str, Any]
+            try:
+                parsed = json.loads(enriched["citations"])
+                cite_obj = parsed if isinstance(parsed, dict) else {"referenced_data": parsed}
+            except Exception:
+                cite_obj = {
+                    "referenced_data": json.loads(enriched.get("referenced_data") or "[]"),
+                    "supporting_analysis": enriched.get("supporting_analysis") or "",
+                    "data_quality": enriched.get("data_quality") or "",
+                }
+            # Drop UI-noise keys the product does not want displayed.
+            cite_obj.pop("source", None)
+            cite_obj.pop("financial_pricing", None)
+            # Keep only citation payload fields.
+            cleaned: Dict[str, Any] = {}
+            if "referenced_data" in cite_obj:
+                cleaned["referenced_data"] = cite_obj["referenced_data"]
+            if cite_obj.get("supporting_analysis"):
+                cleaned["supporting_analysis"] = cite_obj["supporting_analysis"]
+            if cite_obj.get("data_quality"):
+                cleaned["data_quality"] = cite_obj["data_quality"]
+            rec["citations"] = json.dumps(cleaned)
+        if enriched.get("referenced_data"):
+            rec["referenced_data"] = enriched["referenced_data"]
+    except Exception as e:
+        logger.warning(
+            "Alternatives/citations enrichment failed for %s: %s",
+            rec.get("well_id"),
+            e,
+        )
+        # Keep schema stable; do not overwrite analysis fields.
+        rec.setdefault("conservative_approach", None)
+        rec.setdefault("aggressive_optimization", None)
+        rec.setdefault("hybrid_model", None)
+        rec.setdefault("recommended_model", None)
 
 
 def merge_metrics_for_financial_impact(
@@ -943,6 +1044,103 @@ def _build_recent_production_30d_block(metrics: Dict[str, Any]) -> str:
     )
 
 
+def _chart_point(label: str, val: Any) -> Optional[Dict[str, Any]]:
+    fv = _fmt_desc_number(val, 2) if val is not None else None
+    if fv is None:
+        return None
+    try:
+        return {"label": label, "value": float(str(fv).replace(",", ""))}
+    except Exception:
+        return None
+
+
+def build_recommendation_chart_data(metrics: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Trend + projection payload for the dedicated chart_data column."""
+    series: List[Dict[str, Any]] = []
+    prod_specs = (
+        ("Oil", "oil_volume", "bbl/d"),
+        ("Water", "water_volume", "bbl/d"),
+        ("Gas", "gas_volume", "Mcf/d"),
+    )
+    for name, prefix, unit in prod_specs:
+        pts: List[Dict[str, Any]] = []
+        for label, suffix in (
+            ("baseline", "_baseline_mean"),
+            ("recent_avg", "_roll_mean"),
+            ("latest", "_latest"),
+        ):
+            p = _chart_point(label, metrics.get(f"{prefix}{suffix}") or metrics.get(f"{prefix}_current_mean"))
+            if p:
+                pts.append(p)
+        if len(pts) >= 2:
+            series.append({"name": name, "unit": unit, "points": pts})
+
+    sensor_keys = [
+        k
+        for k in metrics
+        if any(str(k).endswith(s) for s in ("_latest", "_roll_mean"))
+        and not any(str(k).startswith(p) for p in ("oil_volume", "gas_volume", "water_volume", "invoice", "chart"))
+    ][:6]
+    seen: set[str] = set()
+    for k in sensor_keys:
+        sk = str(k)
+        if sk.endswith("_roll_mean"):
+            base = sk.rsplit("_", 2)[0]
+        else:
+            base = sk.replace("_latest", "")
+        if base in seen:
+            continue
+        seen.add(base)
+        pts = []
+        for label, suffix in (("recent_avg", "_roll_mean"), ("latest", "_latest")):
+            p = _chart_point(label, metrics.get(f"{base}{suffix}"))
+            if p:
+                pts.append(p)
+        if len(pts) >= 2:
+            label = base.replace("_", " ").title()
+            series.append({"name": label, "unit": "", "points": pts})
+
+    projection = None
+    uplift = rec.get("production_increase_bbl_day")
+    oil_latest = metrics.get("oil_volume_latest") or metrics.get("oil_volume_roll_mean")
+    try:
+        if uplift and oil_latest:
+            projection = {
+                "name": "Projected oil after action",
+                "uplift_bbl_day": round(float(uplift), 2),
+                "current_bbl_day": round(float(oil_latest), 2),
+                "projected_bbl_day": round(float(oil_latest) + float(uplift), 2),
+            }
+    except Exception:
+        projection = None
+
+    return {
+        "series": series,
+        "projection": projection,
+        "issue": rec.get("action"),
+        "recommended_action": rec.get("analysis_description"),
+    }
+
+
+def apply_chart_data(rec: Dict[str, Any]) -> None:
+    """Set top-level chart_data (JSON string). Does not modify metrics_json contents."""
+    metrics = rec.get("metrics") if isinstance(rec.get("metrics"), dict) else {}
+    # Never keep a nested copy inside metrics — chart_data is its own column.
+    if isinstance(metrics, dict) and "chart_data" in metrics:
+        metrics = {k: v for k, v in metrics.items() if k != "chart_data"}
+        rec["metrics"] = metrics
+    chart = build_recommendation_chart_data(metrics, rec)
+    if chart.get("series"):
+        rec["chart_data"] = json.dumps(to_native_type(chart), default=str)
+    else:
+        rec.setdefault("chart_data", None)
+
+
+def finalize_analysis_fields(rec: Dict[str, Any]) -> None:
+    """Attach chart_data after OpenRouter analysis. Leaves other existing fields alone."""
+    apply_chart_data(rec)
+
+
 def _financial_pricing_sentence(meta: Dict[str, Any]) -> str:
     """Create a compact, human-readable pricing blurb (keep <80 words)."""
     if not meta or not isinstance(meta, dict):
@@ -1010,7 +1208,7 @@ def _create_prediction_record(
     rec['production_increase_bbl_day'] = prod_imp.get('production_increase_bbl_day')
     rec['production_increase_percent'] = prod_imp.get('production_increase_percent')
 
-    # Financial impact: EIA Brent for revenue; financial model for one-time implementation.
+    # Financial impact: org_settings Manual or EIA Brent/WTI; financial model for one-time implementation.
     meta: Dict[str, Any] = {}
     try:
         fin = compute_financial_impact_fields(metrics, rec.get('production_increase_bbl_day'))
@@ -1067,8 +1265,9 @@ def _create_prediction_record(
         else:
             target_hint = cfg.get("high_action") or cfg.get("low_action")
 
-    # OpenRouter fills action, detailed_analysis, and narrative fields (non-static).
+    # OpenRouter fills action (= what), detailed_analysis (= why), and narrative fields.
     apply_analysis_description(rec)
+    finalize_analysis_fields(rec)
 
     # Build user-visible performance blocks.
     current_vs_opt = _build_current_vs_optimal_performance(metrics, rec.get("production_increase_bbl_day"))
@@ -1077,30 +1276,35 @@ def _create_prediction_record(
     rec["current_performance"] = current_vs_opt
     rec["historical_trend"] = _build_recent_production_30d_block(metrics)
 
-    # Citations and references for audit/supporting analysis
-    cite_obj: Dict[str, Any] = {
-        "source": "ML model + operational rule templates",
-        "referenced_data": ["well_sensor_readings", "daily_production"],
-        "supporting_analysis": "Recommendation from decision-tree classifier and sensor/production metrics.",
-        "data_quality": "Parquet-based sensor and daily production data used for trends.",
-    }
-    if meta:
-        # Store as a short readable sentence (not a nested JSON object).
-        fp = _financial_pricing_sentence(meta)
-        if fp:
-            cite_obj["financial_pricing"] = fp
-    rec['citations'] = json.dumps(cite_obj)
-    rec['referenced_data'] = json.dumps(["well_sensor_readings", "daily_production"])
-    rec['supporting_analysis'] = "Recommendation based on sensor trends, production metrics, and operational rules."
-    rec['data_quality'] = "Sensor and production parquet used for metrics; ML confidence threshold applied."
+    # Model alternation + SPE/research citations (replaces static placeholders).
+    rec.setdefault("conservative_approach", None)
+    rec.setdefault("aggressive_optimization", None)
+    rec.setdefault("hybrid_model", None)
+    rec.setdefault("recommended_model", None)
+    rec.setdefault(
+        "citations",
+        json.dumps(
+            {
+                "referenced_data": ["well_sensor_readings", "daily_production"],
+                "supporting_analysis": "Recommendation from decision-tree classifier and sensor/production metrics.",
+                "data_quality": "Parquet-based sensor and daily production data used for trends.",
+            }
+        ),
+    )
+    rec.setdefault("referenced_data", json.dumps(["well_sensor_readings", "daily_production"]))
+    rec.setdefault(
+        "supporting_analysis",
+        "Recommendation based on sensor trends, production metrics, and operational rules.",
+    )
+    rec.setdefault(
+        "data_quality",
+        "Sensor and production parquet used for metrics; ML confidence threshold applied.",
+    )
+    apply_alternatives_and_citations(rec)
 
     # Keep output schema stable: never emit null for numeric columns.
     # `time_reduced_hours` is deterministically computed later in the pipeline; if unavailable, default to 0.0.
     rec.setdefault('time_reduced_hours', 0.0)
-    rec.setdefault('conservative_approach', None)
-    rec.setdefault('aggressive_optimization', None)
-    rec.setdefault('hybrid_model', None)
-    rec.setdefault('recommended_model', None)
     rec.setdefault('status_reason', None)
     rec.setdefault('mute_till', None)
     rec.setdefault('open_up', None)
@@ -1256,6 +1460,7 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         "mute_till",
         "open_up",
         "metrics_json",
+        "chart_data",
         "user_id",
         "user_name",
         "created_at",
@@ -1309,13 +1514,38 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
             )
         ):
             apply_analysis_description(row)
+        # Backfill model alternation + citations when missing (production UI fields).
+        if any(
+            not row.get(k)
+            for k in (
+                "conservative_approach",
+                "aggressive_optimization",
+                "hybrid_model",
+                "recommended_model",
+            )
+        ):
+            apply_alternatives_and_citations(row)
 
         metrics_val = r.get("metrics")
+        if isinstance(metrics_val, dict) and "chart_data" in metrics_val:
+            metrics_val = {k: v for k, v in metrics_val.items() if k != "chart_data"}
         if metrics_val is not None:
             serialized = json.dumps(to_native_type(metrics_val), default=str)
             row["metrics_json"] = serialized
         elif row.get("metrics_json") is None:
             row["metrics_json"] = None
+
+        # Dedicated chart_data column (JSON string), separate from metrics_json.
+        chart_val = r.get("chart_data")
+        if chart_val is None and isinstance(r.get("metrics"), dict):
+            apply_chart_data(r)
+            chart_val = r.get("chart_data")
+        if isinstance(chart_val, (dict, list)):
+            row["chart_data"] = json.dumps(to_native_type(chart_val), default=str)
+        elif chart_val is not None:
+            row["chart_data"] = str(chart_val)
+        else:
+            row["chart_data"] = None
 
         # Round all numeric fields to 2 decimal places
         for field in _NUMERIC_FIELDS:

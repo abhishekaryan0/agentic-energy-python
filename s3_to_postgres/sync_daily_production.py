@@ -13,6 +13,7 @@ from s3_to_postgres.checkpoint import load_checkpoint, save_checkpoint
 from s3_to_postgres.config import Settings, load_settings
 from s3_to_postgres.db import (
     DEFAULT_RETENTION_YEARS,
+    daily_production_date_bounds,
     dataframe_to_daily_production_rows,
     ensure_production_tables,
     postgres_connection,
@@ -34,16 +35,26 @@ from s3_to_postgres.s3_io import (
 
 logger = logging.getLogger(__name__)
 
+# None = sync / keep all available history (default).
 DEFAULT_BACKFILL_YEARS = DEFAULT_RETENTION_YEARS
 
 
-def resolve_retention_years(event: Dict[str, Any]) -> int:
+def resolve_retention_years(event: Dict[str, Any]) -> Optional[int]:
+    """
+    Optional retention window in years.
+
+    None / missing / <= 0  → keep all available S3 history (no prune).
+    Positive int           → only sync and retain that many years.
+    """
     raw_years = event.get("backfill_years")
     if raw_years is None:
         raw_years = event.get("settings_overrides", {}).get("backfill_years")
     if raw_years is None:
         raw_years = DEFAULT_RETENTION_YEARS
-    return max(1, int(raw_years))
+    if raw_years is None:
+        return None
+    years = int(raw_years)
+    return years if years > 0 else None
 
 
 def resolve_max_files(event: Dict[str, Any]) -> Optional[int]:
@@ -73,19 +84,34 @@ def _month_range(min_date: date, max_date: date) -> List[date]:
 
 
 def _months_for_run(
+    conn,
+    *,
+    organization_id: str,
     sync_mode: str,
     partition_dates: List[date],
-    retention_start: date,
+    retention_start: Optional[date],
 ) -> List[date]:
     if sync_mode == "backfill":
-        return _month_range(retention_start, date.today())
+        start = retention_start
+        if start is None:
+            if partition_dates:
+                start = min(partition_dates)
+            else:
+                bounds = daily_production_date_bounds(conn, organization_id)
+                if bounds is None:
+                    return [date.today().replace(day=1)]
+                start = bounds[0]
+        return _month_range(start, date.today())
     if partition_dates:
         return _months_to_refresh(partition_dates)
     return [date.today().replace(day=1)]
 
 
-def _filter_df_to_retention_window(df: pd.DataFrame, retention_start: date) -> pd.DataFrame:
-    if df.empty or "date" not in df.columns:
+def _filter_df_to_retention_window(
+    df: pd.DataFrame,
+    retention_start: Optional[date],
+) -> pd.DataFrame:
+    if retention_start is None or df.empty or "date" not in df.columns:
         return df
     dates = pd.to_datetime(df["date"], errors="coerce")
     return df.loc[dates.dt.date >= retention_start].copy()
@@ -97,7 +123,7 @@ def _select_production_keys_to_sync(
     *,
     sync_mode: str,
     single_key: Optional[str],
-    retention_start: date,
+    retention_start: Optional[date],
     reset_checkpoint: bool,
 ) -> List[str]:
     if single_key:
@@ -105,7 +131,7 @@ def _select_production_keys_to_sync(
             raise ValueError(f"Not a daily_production object: {single_key}")
         return [single_key]
 
-    if sync_mode == "backfill":
+    if sync_mode == "backfill" and retention_start is not None:
         candidates = [
             key
             for key in all_keys
@@ -125,7 +151,7 @@ def _list_production_keys(
     s3,
     settings: Settings,
     *,
-    retention_start: date,
+    retention_start: Optional[date],
 ) -> List[str]:
     keys = list_daily_production_keys(
         s3,
@@ -147,13 +173,19 @@ def _finalize_production_sync(
     organization_id: str,
     sync_mode: str,
     partition_dates: List[date],
-    retention_start: date,
+    retention_start: Optional[date],
     prune: bool,
 ) -> Dict[str, Any]:
-    months = _months_for_run(sync_mode, partition_dates, retention_start)
+    months = _months_for_run(
+        conn,
+        organization_id=organization_id,
+        sync_mode=sync_mode,
+        partition_dates=partition_dates,
+        retention_start=retention_start,
+    )
     monthly_rows = refresh_monthly_production(conn, organization_id, months)
     pruned = {"daily_deleted": 0, "monthly_deleted": 0}
-    if prune:
+    if prune and retention_start is not None:
         pruned = prune_production_outside_retention(conn, organization_id, retention_start)
     return {
         "months_refreshed": [m.isoformat() for m in months],
@@ -208,7 +240,7 @@ def sync_daily_production(
         "schema": settings.postgres_schema,
         "sync_mode": sync_mode,
         "retention_years": retention_years,
-        "retention_min_date": retention_start.isoformat(),
+        "retention_min_date": retention_start.isoformat() if retention_start else None,
         "files_found": len(all_keys),
         "files_to_sync": pending_count,
         "files_synced": [],
@@ -245,7 +277,7 @@ def sync_daily_production(
                     df = _filter_df_to_retention_window(df, retention_start)
                     if df.empty:
                         logger.info(
-                            "No rows in retention window for s3://%s/%s",
+                            "No rows after retention filter for s3://%s/%s",
                             settings.s3_bucket,
                             key,
                         )
@@ -317,7 +349,7 @@ def sync_daily_production(
         result["monthly_rows_refreshed"],
         result["daily_rows_deleted"],
         result["monthly_rows_deleted"],
-        retention_start.isoformat(),
+        retention_start.isoformat() if retention_start else "all",
         result["status"],
     )
     return result

@@ -50,4 +50,7 @@ htmlcov/
 *.db
 *.sqlite
 
+# Archives (local packaging only — do not commit)
+*.zip
+
 /docs

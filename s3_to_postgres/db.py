@@ -138,6 +138,7 @@ POSTGRES_OPERATION_RECOMMENDATIONS_COLUMNS: Sequence[str] = (
     "expected_impact",
     "prediction_source",
     "metrics_json",
+    "chart_data",
     "created_at",
     "updated_at",
     "status_reason",
@@ -167,10 +168,11 @@ OPS_ENSURE_COLUMNS: Sequence[tuple[str, str]] = (
     ("eia_brent_source", "TEXT"),
     ("eia_brent_period", "TEXT"),
     ("prediction_source", "TEXT"),
+    ("chart_data", "JSONB"),
 )
 
 REVIEW_JSONB_COLUMNS = frozenset({"ui_text", "chart_data", "impact_metrics"})
-OPS_JSONB_COLUMNS = frozenset({"metrics_json"})
+OPS_JSONB_COLUMNS = frozenset({"metrics_json", "chart_data"})
 OPS_FLOAT_COLUMNS = frozenset(
     {
         "confidence_percent",
@@ -251,7 +253,8 @@ PRODUCTION_FLOAT_COLUMNS = frozenset(
 )
 PRODUCTION_DATE_COLUMNS = frozenset({"date", "month"})
 
-DEFAULT_RETENTION_YEARS = 2
+# None = keep all history (no date window / no prune). Set via backfill_years to limit.
+DEFAULT_RETENTION_YEARS: Optional[int] = None
 
 _PRODUCTION_LOCK_CLASS = 90421
 
@@ -976,18 +979,40 @@ def refresh_monthly_production(
     return run_with_deadlock_retry(conn, _refresh)
 
 
-def retention_min_date(years: int = DEFAULT_RETENTION_YEARS) -> "date":
+def retention_min_date(years: Optional[int] = DEFAULT_RETENTION_YEARS) -> Optional["date"]:
+    """Return the earliest date to keep, or None when retention is unlimited."""
     from datetime import date, timedelta
 
+    if years is None or years <= 0:
+        return None
     return date.today() - timedelta(days=365 * years)
+
+
+def daily_production_date_bounds(conn, organization_id: str) -> Optional[tuple]:
+    """Return (min_date, max_date) for an org's daily_production, or None if empty."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT MIN(date), MAX(date)
+            FROM daily_production
+            WHERE organization_id = %s
+            """,
+            (organization_id,),
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None or row[1] is None:
+        return None
+    return row[0], row[1]
 
 
 def prune_production_outside_retention(
     conn,
     organization_id: str,
-    min_date: "date",
+    min_date: Optional["date"],
 ) -> Dict[str, int]:
-    """Keep only rows inside the retention window (default: last 2 years)."""
+    """Delete rows older than min_date. No-op when min_date is None (keep all)."""
+    if min_date is None:
+        return {"daily_deleted": 0, "monthly_deleted": 0}
 
     def _prune() -> Dict[str, int]:
         min_month = min_date.replace(day=1)

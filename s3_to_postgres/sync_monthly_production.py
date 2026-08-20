@@ -6,10 +6,9 @@ import logging
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-import boto3
-
 from s3_to_postgres.config import Settings, load_settings
 from s3_to_postgres.db import (
+    daily_production_date_bounds,
     ensure_production_tables,
     postgres_connection,
     prune_production_outside_retention,
@@ -18,7 +17,7 @@ from s3_to_postgres.db import (
     retention_min_date,
     try_acquire_production_sync_lock,
 )
-from s3_to_postgres.sync_daily_production import DEFAULT_BACKFILL_YEARS, resolve_retention_years
+from s3_to_postgres.sync_daily_production import resolve_retention_years
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,8 @@ def sync_monthly_production(
     Aggregate daily_production into monthly_production.
 
     On incremental runs, refreshes the current calendar month from daily rows.
-    On backfill runs, refreshes every month in the backfill window (default 2 years).
+    On backfill runs, refreshes every month present in daily_production
+    (or within backfill_years when that is set).
     """
     event = event or {}
     overrides = dict(event.get("settings_overrides") or {})
@@ -52,11 +52,9 @@ def sync_monthly_production(
     retention_years = resolve_retention_years(event)
     retention_start = retention_min_date(retention_years)
     today = date.today()
-
-    if sync_mode == "backfill":
-        months = _month_range(retention_start, today)
-    else:
-        months = [today.replace(day=1)]
+    monthly_rows = 0
+    pruned = {"daily_deleted": 0, "monthly_deleted": 0}
+    months: List[date] = []
 
     with postgres_connection(settings.database_url, settings.postgres_schema) as conn:
         ensure_production_tables(conn)
@@ -67,13 +65,25 @@ def sync_monthly_production(
                 "schema": settings.postgres_schema,
                 "sync_mode": sync_mode,
                 "retention_years": retention_years,
-                "retention_min_date": retention_start.isoformat(),
+                "retention_min_date": retention_start.isoformat() if retention_start else None,
                 "status": "skipped",
                 "skip_reason": "production_sync_in_progress",
             }
         try:
+            if sync_mode == "backfill":
+                start = retention_start
+                if start is None:
+                    bounds = daily_production_date_bounds(conn, settings.organization_id)
+                    start = bounds[0] if bounds else today
+                months = _month_range(start, today)
+            else:
+                months = [today.replace(day=1)]
+
             monthly_rows = refresh_monthly_production(conn, settings.organization_id, months)
-            pruned = prune_production_outside_retention(conn, settings.organization_id, retention_start)
+            if retention_start is not None:
+                pruned = prune_production_outside_retention(
+                    conn, settings.organization_id, retention_start
+                )
             conn.commit()
         finally:
             release_production_sync_lock(conn, settings.organization_id)
@@ -84,7 +94,7 @@ def sync_monthly_production(
         "schema": settings.postgres_schema,
         "sync_mode": sync_mode,
         "retention_years": retention_years,
-        "retention_min_date": retention_start.isoformat(),
+        "retention_min_date": retention_start.isoformat() if retention_start else None,
         "months_refreshed": [m.isoformat() for m in months],
         "monthly_rows_refreshed": monthly_rows,
         "daily_rows_deleted": pruned["daily_deleted"],

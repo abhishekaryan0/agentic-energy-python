@@ -23,7 +23,9 @@
         { "name": "DATABASE_URL_SECRET_ARN", "value": "DATABASE_URL_SECRET_ARN_VALUE" },
         { "name": "EIA_API_KEY", "value": "EIA_API_KEY_VALUE" },
         { "name": "OPENAI_API_KEY", "value": "OPENAI_API_KEY_VALUE" },
-        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" }
+        { "name": "OPENAI_API_BASE", "value": "OPENAI_API_BASE_VALUE" },
+        { "name": "OPENAI_MODEL", "value": "OPENAI_MODEL_VALUE" },
+        { "name": "OPERATIONS_RESEARCH_MODEL", "value": "OPERATIONS_RESEARCH_MODEL_VALUE" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

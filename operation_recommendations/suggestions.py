@@ -12,6 +12,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from dotenv import load_dotenv
 import openai
@@ -35,7 +37,13 @@ client = openai.OpenAI(
         "X-Title": "Well Anomaly Detection",
     }
 )
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-3.5-turbo")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
+# Stronger research-capable model for SPE / literature citations (OpenRouter).
+RESEARCH_MODEL = (
+    os.getenv("OPERATIONS_RESEARCH_MODEL")
+    or os.getenv("OPENAI_RESEARCH_MODEL")
+    or "perplexity/sonar-pro"
+)
 
 
 def generate_operation_suggestion_with_openai(well_id: str, action: str,
@@ -82,9 +90,9 @@ hybrid_model: 3-4 bullets—phased + real-time/AI, expected uplift % and timefra
 recommended_model: One sentence picking the best option and why—specific to this well, not generic.
 time_reduced_hours: Estimated hours until measurable improvement (e.g., 24, 48, 72). Must be a real numeric estimate, never 0.
 
-CITATIONS: Use ONLY AUTHENTIC, NON-FABRICATED data.
-- referenced_data: Array of 2-4 strings using only generic, authentic sources.
-- supporting_analysis: One paragraph of technical analysis specific to this well.
+CITATIONS: Use ONLY AUTHENTIC sources with EXACT clickable URLs.
+- referenced_data: Array of 2-4 objects OR strings. Each MUST include a real https URL (OnePetro or https://doi.org/...). Format preferred: {{"title":"...","id":"SPE #####","url":"https://..."}}. Never invent SPE IDs or fake URLs; omit items without a real URL.
+- supporting_analysis: One short paragraph specific to this well and action.
 - data_quality: One line with confidence and basis.
 
 FINANCIAL (placeholders): Downstream replaces USD fields using EIA Brent spot and ML models. Treat implementation_cost_usd as total ONE-TIME implementation cost (USD lump sum), not a daily rate.
@@ -202,6 +210,7 @@ def _extract_metric_snapshot(metrics: dict) -> dict:
     oil_avg = first("oil_volume_roll_mean", "oil_volume_avg", "oil_volume_mean", "oil_volume")
     oil_latest = first("oil_volume_latest", "oil_volume_last", "oil_volume")
     oil_trend = first("oil_volume_trend", "oil_volume_slope")
+    oil_baseline = first("oil_volume_baseline_mean")
     gas_avg = first("gas_volume_roll_mean", "gas_volume_avg", "gas_volume_mean", "gas_volume")
     gas_trend = first("gas_volume_trend", "gas_volume_slope")
     water_avg = first("water_volume_roll_mean", "water_volume_avg", "water_volume_mean", "water_volume")
@@ -214,6 +223,8 @@ def _extract_metric_snapshot(metrics: dict) -> dict:
         production["oil_latest_bbl_day"] = round(oil_latest, 2)
     if oil_trend is not None:
         production["oil_trend_bbl_day_per_day"] = round(oil_trend, 3)
+    if oil_baseline is not None:
+        production["oil_baseline_bbl_day"] = round(oil_baseline, 2)
     if gas_avg is not None:
         production["gas_avg"] = round(gas_avg, 2)
     if gas_trend is not None:
@@ -228,16 +239,28 @@ def _extract_metric_snapshot(metrics: dict) -> dict:
 
     sensor_candidates = []
     skip_prefixes = ("oil_volume", "gas_volume", "water_volume")
+    skip_substrings = (
+        "invoice",
+        "workover",
+        "total_usd",
+        "implementation_cost",
+        "expense",
+        "financial",
+    )
     for k, v in metrics.items():
-        if any(str(k).startswith(p) for p in skip_prefixes):
+        key = str(k)
+        key_l = key.lower()
+        if any(key.startswith(p) for p in skip_prefixes):
+            continue
+        if any(s in key_l for s in skip_substrings):
             continue
         fv = _safe_float(v)
         if fv is None:
             continue
         score = abs(fv)
-        if any(s in str(k) for s in ("trend", "slope", "delta", "change", "pct", "percent")):
+        if any(s in key_l for s in ("trend", "slope", "delta", "change", "pct", "percent")):
             score = abs(fv) * 10.0
-        sensor_candidates.append((score, str(k), fv))
+        sensor_candidates.append((score, key, fv))
     sensor_candidates.sort(key=lambda x: x[0], reverse=True)
 
     top_sensors = []
@@ -255,6 +278,64 @@ def _extract_metric_snapshot(metrics: dict) -> dict:
         "production": production,
         "top_sensors": top_sensors,
     }
+
+
+def _engineering_computations(metrics: dict, numeric_summary: Optional[dict] = None) -> list[str]:
+    """Accepted engineering derivations from real metrics only."""
+    notes: list[str] = []
+    numeric_summary = numeric_summary or {}
+    oil = _safe_float(
+        metrics.get("oil_volume_roll_mean")
+        or metrics.get("oil_volume_current_mean")
+        or metrics.get("oil_volume_latest")
+    )
+    water = _safe_float(
+        metrics.get("water_volume_roll_mean")
+        or metrics.get("water_volume_current_mean")
+        or metrics.get("water_volume_latest")
+    )
+    baseline = _safe_float(metrics.get("oil_volume_baseline_mean"))
+    if oil is not None and water is not None and (oil + water) > 0:
+        wc = 100.0 * water / (oil + water)
+        notes.append(f"Water cut ≈ {wc:.1f}% from rolling oil and water rates.")
+    if oil is not None and baseline is not None and baseline > 0:
+        delta = oil - baseline
+        pct = 100.0 * delta / baseline
+        notes.append(f"Oil vs baseline: {delta:+.1f} bbl/d ({pct:+.1f}%).")
+    uplift = _safe_float(numeric_summary.get("production_increase_bbl_day"))
+    if uplift is not None and uplift > 0 and oil is not None and oil > 0:
+        notes.append(
+            f"Estimated recoverable uplift ≈ {uplift:.1f} bbl/d ({100.0 * uplift / oil:.1f}% of current oil rate)."
+        )
+    pct_uplift = _safe_float(numeric_summary.get("production_increase_percent"))
+    if pct_uplift is not None and pct_uplift > 0:
+        notes.append(f"Estimated production increase ≈ {pct_uplift:.1f}%.")
+    fillage = _safe_float(metrics.get("pump_fillage_latest") or metrics.get("pump_fillage_roll_mean"))
+    if fillage is not None and fillage < 70:
+        notes.append(f"Pump fillage {fillage:.0f}% indicates incomplete fill (<70% operating guideline).")
+    return notes
+
+
+def _suggested_issue_label(category: str = "", ml_hint: str = "") -> str:
+    """
+    Fallback Issue (What) title — short engineer language, not a canned template.
+    Prefer LLM-generated action text; this is only used when the model returns empty.
+    """
+    cat = (category or "").strip().lower()
+    hint = (ml_hint or "").strip().lower()
+    if any(w in hint for w in ("allocat", "allocation", "test number", "on test", "lease test")):
+        return "Lease allocation mismatch suspected"
+    if any(w in hint for w in ("cavit", "gas lock", "intake pressure")):
+        return "Lift cavitation risk at current operating point"
+    if any(w in hint for w in ("fillage", "pump-off", "pump off", "underload", "spm", "stroke")):
+        return "Pump underloading limiting oil rate"
+    if any(w in hint for w in ("fail", "failure", "run life", "integrity", "vibration")):
+        return "Elevated equipment failure risk"
+    if cat == "maintenance":
+        return "Equipment operating outside preferred envelope"
+    if cat == "optimization" or any(w in hint for w in ("water", "efficien", "freq", "choke", "gl ")):
+        return "Operating point not at preferred efficiency"
+    return "Oil rate below recoverable capacity"
 
 
 def _build_analysis_context(recommendation: dict) -> dict:
@@ -319,9 +400,12 @@ def _build_analysis_context(recommendation: dict) -> dict:
         if conf is not None:
             conf_pct = conf * 100.0 if conf <= 1.0 else conf
 
+    ml_hint = recommendation.get("ml_action_hint") or action or ""
+    snapshot = _extract_metric_snapshot(metrics)
     return {
         "well_id": well_id,
-        "action": action,
+        "ml_action_hint": ml_hint,
+        "suggested_issue": _suggested_issue_label(recommendation.get("category") or "", ml_hint),
         "priority": recommendation.get("priority"),
         "category": recommendation.get("category"),
         "reason": recommendation.get("reason"),
@@ -331,7 +415,8 @@ def _build_analysis_context(recommendation: dict) -> dict:
         "current_performance": recommendation.get("current_performance"),
         "historical_trend": recommendation.get("historical_trend"),
         "numeric_summary": numeric_summary,
-        "evidence_snapshot": _extract_metric_snapshot(metrics),
+        "engineering_computations": _engineering_computations(metrics, numeric_summary),
+        "evidence_snapshot": snapshot,
         "metrics": key_metrics,
     }
 
@@ -359,14 +444,13 @@ def generate_analysis_fields_with_openai(recommendation: dict) -> dict[str, str]
     if not isinstance(recommendation, dict):
         raise ValueError("recommendation must be a dict")
 
-    ml_hint = recommendation.get("action") or recommendation.get("ml_action_hint") or ""
+    ml_hint = recommendation.get("ml_action_hint") or recommendation.get("action") or ""
     context = _build_analysis_context(recommendation)
-    context["ml_action_hint"] = ml_hint
     context["existing_category"] = recommendation.get("category")
     context["existing_priority"] = recommendation.get("priority")
 
-    prompt = f"""You are writing operator-facing content for ONE oilfield recommendation.
-Be smart, specific, and data-driven. Do NOT use static/template wording.
+    prompt = f"""You are a senior petroleum production engineer writing ONE Operational Recommendation.
+Assume sensor and production data are reliable. Prefer revenue via better production when the well can do more.
 
 Return JSON only with these keys:
 - action
@@ -377,63 +461,58 @@ Return JSON only with these keys:
 - operational_interpretation_description
 - recommended_next_step_description
 
+FIELD ROLES (existing columns — keep content roles):
+- action → ISSUE (What): short title of the opportunity / risk / anomaly on THIS well
+- analysis_description → ACTION (How): specific operational recommendation
+- detailed_analysis → ANALYSIS: one-sentence problem/opportunity summary
+- sensor_evidence_description → Sensor Raw Data Reference (values, trends, engineering notes)
+- operational_interpretation_description → Operational Interpretation
+- recommended_next_step_description → Recommended Next Step
+
 QUALITY BAR:
-- Sound like a sharp production engineer for THIS well and THIS data.
-- Different wells/actions must read differently.
-- Prefer evidence_snapshot + numeric_summary + reason.
-- Use ONLY real numbers from the JSON. Never invent sensors, ranges, or percentages.
-- If a value is missing, skip it.
-- All narrative fields must agree with the chosen action and the same numbers.
+- Write like a production engineer who knows artificial lift and well tests.
+- Use ONLY real numbers from the JSON. Never invent sensors or percentages.
+- Never mention invoice, USD, EIA, or financial fields in these narrative fields.
+- Prefer lift/equipment sensors over raw rates when explaining uplift actions.
+- All fields must agree on the same diagnosis and numbers.
 
-WRITE THESE FIELDS:
-
-1) action
-   - Create a smart, specific recommended action for this well from the data.
-   - ml_action_hint is only a weak hint from the ML model — improve or replace it when data supports a better action.
-   - Prefer concrete operational phrasing with numbers when available, e.g.:
-     "Increase ESP frequency from 55 Hz to 58 Hz"
-     "Raise gas injection from 2.5 to 3.2 MMSCF/day"
-     "Reduce SPM from 12 to 10 to protect rod load"
-     "Monitor water cut and review lift settings"
-   - Keep action short: about 6-14 words. No generic filler like "Investigate well metrics".
-   - Must fit the evidence (do not recommend ESP changes if no ESP/frequency evidence exists).
+1) action  (= ISSUE / What)
+   - Compact engineer title (about 4–12 words). Name the actual condition.
+   - Do NOT start with "Potential to…" or reuse canned marketing phrases.
+   - Client theme examples were illustrative only — invent a specific title for THIS well.
+   - Good style: "Pump underloading limiting oil rate", "ESP intake near cavitation limit",
+     "Lease oil allocation looks inconsistent", "Rod unit speed below inflow capacity".
+   - suggested_issue in JSON is a weak fallback hint only — improve it from evidence.
 
 2) category
    - One of: Production, Optimization, Maintenance
-   - Choose based on the action you wrote.
 
-3) detailed_analysis
-   - ONE short sentence only (about 50-120 characters, similar length to current UI blurbs).
-   - State the core issue + recommended response using real numbers when present.
-   - Examples of length/style (do not copy wording):
-     "Oil falling while water rises; tighten water monitoring and lift review."
-     "Motor load high at current Hz; step frequency down and recheck amps."
-   - Unique per recommendation. Never reuse canned template text.
+3) detailed_analysis  (= ANALYSIS)
+   - ONE sentence (~15–100 words): what is wrong or what opportunity exists.
+   - No field checks or next steps here.
 
-4) analysis_description
-   - One flowing paragraph (3-5 sentences, ~70-140 words). No bullets/headings.
-   - Naturally reference the action you chose.
-   - Explain strongest evidence with clean numbers.
-   - If numeric_summary has benefit/cost/uplift, weave in one practical impact clause.
-   - Close with one concrete field check for this action.
-   - Avoid repeating the same canned openers across wells.
+4) analysis_description  (= ACTION / How)
+   - Concrete operational recommendation for THIS well with real numbers (SPM, Hz, bbl/d, %, test days).
+   - One or two sentences; multi-step only when investigation is required.
+   - Use ml_action_hint as guidance; improve with evidence.
 
-5) sensor_evidence_description
-   - One compact sentence of the key numbers used in analysis_description.
-   - Empty string only when no numeric evidence exists.
+5) sensor_evidence_description  (= Sensor Raw Data Reference)
+   - 2–4 sentences: which sensors/production matter, latest values, change vs recent average,
+     and any engineering_computations provided (water cut, baseline delta, uplift).
+   - Never invent sensors or calculations not in the JSON.
 
-6) operational_interpretation_description
-   - One sentence: what this pattern means for operations on this well.
-   - Must match analysis_description (no new diagnosis).
+6) operational_interpretation_description  (= Operational Interpretation)
+   - Observations (1–2 sentences), then what it means operationally.
+   - Root causes ranked most→least likely as "1. … 2. … 3. …" when ranking helps;
+     otherwise a clear short list. Do not repeat the sensor paragraph verbatim.
 
-7) recommended_next_step_description
-   - One actionable sentence matching the closing idea in analysis_description.
-   - Specific to the action you chose.
+7) recommended_next_step_description  (= Recommended Next Step)
+   - Practical path: validate → what result to look for → remediation.
+   - Use a diagnostic branch only when it clarifies the decision (do not stack many "If…If…" lines).
+   - Prefer clear steps: check X; for result A do Y; for result B do Z.
+   - End by re-checking the key sensor(s) and production after the change.
 
-NUMBER STYLE:
-- Use commas for thousands.
-- Prefer 1 decimal for rates/trends when useful; whole numbers for large USD values.
-- Plain text only.
+NUMBER STYLE: commas for thousands; plain text only.
 
 Recommendation data (JSON):
 {json.dumps(context, default=str)}
@@ -445,10 +524,13 @@ Recommendation data (JSON):
             {
                 "role": "system",
                 "content": (
-                    "You are a senior petroleum production engineer and excellent technical writer. "
-                    "Return valid JSON only. Invent a smart specific action from the data "
-                    "(ml_action_hint is optional guidance only). Write unique detailed_analysis "
-                    "and narrative fields. Never invent numeric values. Keep all fields consistent."
+                    "You are a senior petroleum production engineer. Return valid JSON only. "
+                    "action = short Issue title (engineer language; never default to 'Potential to…'). "
+                    "analysis_description = Action (How). detailed_analysis = one-sentence Analysis. "
+                    "sensor_evidence_description = values + engineering notes. "
+                    "operational_interpretation_description = meaning + ranked root causes. "
+                    "recommended_next_step_description = validate → result → remediation (sparing use of if-branches). "
+                    "Never invent numbers. Never mention invoice or USD in narrative fields."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -475,18 +557,50 @@ Recommendation data (JSON):
     if not out.get("analysis_description"):
         raise RuntimeError("OpenRouter returned empty analysis_description")
     if not out.get("action"):
-        # Keep prior hint only if model omitted action entirely.
-        out["action"] = str(ml_hint or "").strip()
+        out["action"] = _suggested_issue_label(
+            recommendation.get("category") or "",
+            ml_hint,
+        )
     if not out.get("detailed_analysis"):
         raise RuntimeError("OpenRouter returned empty detailed_analysis")
 
-    # Keep detailed_analysis near current UI length.
+    # Issue (What) — compact engineer title; strip canned "Potential to…" if model slips.
+    issue = out["action"].strip()
+    for prefix in (
+        "Potential to ",
+        "Potential for ",
+        "Potential ",
+    ):
+        if issue.lower().startswith(prefix.lower()):
+            rest = issue[len(prefix) :].strip()
+            if rest:
+                issue = rest[0].upper() + rest[1:] if len(rest) > 1 else rest.upper()
+            break
+    if len(issue) > 120:
+        issue = issue[:117].rstrip() + "..."
+    out["action"] = issue
+
+    # Action (How) — allow longer operational instructions.
+    how = out.get("analysis_description") or ""
+    if len(how) > 900:
+        out["analysis_description"] = how[:897].rstrip() + "..."
+
+    # Analysis summary
     da = out["detailed_analysis"]
-    if len(da) > 160:
+    if len(da) > 280:
         first = da.split(". ")[0].strip()
         out["detailed_analysis"] = first if first.endswith(".") else (first + ".")
-        if len(out["detailed_analysis"]) > 160:
-            out["detailed_analysis"] = out["detailed_analysis"][:157].rstrip() + "..."
+        if len(out["detailed_analysis"]) > 280:
+            out["detailed_analysis"] = out["detailed_analysis"][:277].rstrip() + "..."
+
+    for key in (
+        "sensor_evidence_description",
+        "operational_interpretation_description",
+        "recommended_next_step_description",
+    ):
+        val = out.get(key) or ""
+        if len(val) > 2500:
+            out[key] = val[:2497].rstrip() + "..."
 
     cat = (out.get("category") or "").strip().lower()
     if cat == "production":
@@ -504,6 +618,340 @@ Recommendation data (JSON):
 def generate_analysis_description_with_openai(recommendation: dict) -> str:
     """Backward-compatible helper returning only analysis_description."""
     return generate_analysis_fields_with_openai(recommendation)["analysis_description"]
+
+
+def _strip_alternative_headers(text: str) -> str:
+    """Remove section titles and RECOMMENDED: prefix so we store only content."""
+    if not text or not isinstance(text, str):
+        return (text or "").strip()
+    lines = text.strip().split("\n")
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if re.match(r"^[A-Z0-9][A-Z0-9\s\-\.]+:\s*$", stripped) and len(stripped) < 60:
+            continue
+        if stripped.upper().startswith("RECOMMENDED:"):
+            stripped = stripped[12:].strip()
+        out.append(stripped)
+    return "\n".join(out).strip()
+
+
+_URL_RE = re.compile(r"https?://[^\s\]\),\"']+", re.IGNORECASE)
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.IGNORECASE)
+_URL_STATUS_CACHE: dict[str, bool] = {}
+
+
+def _is_citation_url_working(url: str, timeout_s: float = 8.0) -> bool:
+    """
+    Best-effort URL reachability check for citation links.
+
+    Accepts 2xx/3xx and auth-gated statuses (401/403) as reachable.
+    Uses HEAD first, then GET fallback for hosts that reject HEAD.
+    """
+    raw = str(url or "").strip().rstrip(".,);]")
+    if not raw:
+        return False
+    if raw.startswith("http://"):
+        raw = "https://" + raw[7:]
+    if not raw.lower().startswith("https://"):
+        return False
+
+    cached = _URL_STATUS_CACHE.get(raw)
+    if cached is not None:
+        return cached
+
+    headers = {"User-Agent": "Mozilla/5.0 (CitationValidator/1.0)"}
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib_request.Request(raw, headers=headers, method=method)
+            with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+                code = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+            ok = (200 <= code < 400) or code in (401, 403)
+            _URL_STATUS_CACHE[raw] = ok
+            if ok:
+                return True
+        except urllib_error.HTTPError as e:
+            code = int(getattr(e, "code", 0) or 0)
+            if code in (401, 403):
+                _URL_STATUS_CACHE[raw] = True
+                return True
+            # Some endpoints don't support HEAD; retry with GET.
+            if method == "HEAD" and code in (405, 501):
+                continue
+        except Exception:
+            # Fallback to GET on HEAD failure.
+            if method == "HEAD":
+                continue
+
+    _URL_STATUS_CACHE[raw] = False
+    return False
+
+
+def _filter_reachable_reference_urls(refs: list[str]) -> list[str]:
+    """Keep only references that contain a reachable URL."""
+    out: list[str] = []
+    for ref in refs:
+        s = str(ref or "").strip()
+        if not s:
+            continue
+        m = _URL_RE.search(s)
+        if not m:
+            continue
+        url = m.group(0).rstrip(".,);]")
+        if _is_citation_url_working(url):
+            out.append(s)
+        else:
+            logger.info("Dropping citation with non-working URL: %s", url)
+    return out
+
+
+def _normalize_citation_refs(refs: list) -> list[str]:
+    """
+    Normalize citation items to display strings that always include an https URL.
+
+    Accepts either plain strings or dicts with title/id/url.
+    Drops items that have no usable URL (title-only citations are rejected).
+    """
+    out: list[str] = []
+    for item in refs:
+        title = ""
+        cite_id = ""
+        url = ""
+
+        if isinstance(item, dict):
+            title = str(item.get("title") or item.get("name") or "").strip()
+            cite_id = str(item.get("id") or item.get("spe") or item.get("doi") or "").strip()
+            url = str(item.get("url") or item.get("link") or item.get("href") or "").strip()
+            raw = " ".join(x for x in (title, cite_id, url) if x)
+        else:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            m = _URL_RE.search(raw)
+            if m:
+                url = m.group(0).rstrip(".,);]")
+                title = raw[: m.start()].strip(" –-\t ")
+            else:
+                title = raw
+
+        if not url:
+            doi_m = _DOI_RE.search(raw) or (_DOI_RE.search(cite_id) if cite_id else None)
+            if doi_m:
+                url = f"https://doi.org/{doi_m.group(0).rstrip('.,);]')}"
+
+        if not url or not url.lower().startswith("http"):
+            # No exact link → do not show title-only noise in the UI.
+            continue
+        if url.lower().startswith("http://"):
+            url = "https://" + url[7:]
+
+        label_parts = []
+        if title:
+            label_parts.append(title.rstrip(" –-"))
+        if cite_id and cite_id.lower() not in (title or "").lower() and cite_id not in url:
+            label_parts.append(cite_id)
+        label = " – ".join(label_parts) if label_parts else url
+        # Avoid duplicating URL if already present in the label.
+        if url in label:
+            formatted = label
+        else:
+            formatted = f"{label} – {url}"
+        if formatted not in out:
+            out.append(formatted)
+    return out
+
+
+def generate_alternatives_and_citations(recommendation: dict) -> dict:
+    """
+    Generate model-alternation text + SPE/research citations for one recommendation.
+
+    Returns keys:
+      conservative_approach, aggressive_optimization, hybrid_model, recommended_model,
+      citations (JSON string), referenced_data (JSON string), supporting_analysis, data_quality
+    """
+    if not isinstance(recommendation, dict):
+        raise ValueError("recommendation must be a dict")
+
+    context = _build_analysis_context(recommendation)
+    action = recommendation.get("action") or context.get("action") or ""
+    well_id = recommendation.get("well_id") or context.get("well_id") or ""
+
+    # --- Alternatives (standard ops model) ---
+    alt_prompt = f"""You are a petroleum production engineer. Propose three implementation approaches
+for the recommended action on this well. Content only — no section headers.
+
+Return JSON only:
+{{
+  "conservative_approach": "3-4 bullets (•) — incremental/safe change, risk, expected uplift % and timeframe",
+  "aggressive_optimization": "3-4 bullets (•) — bold change, higher return + monitoring, uplift % and timeframe",
+  "hybrid_model": "3-4 bullets (•) — phased + monitoring, uplift % and timeframe",
+  "recommended_model": "One sentence picking the best option and why for THIS well"
+}}
+
+Rules:
+- Tailor to action and evidence_snapshot / numeric_summary. Never invent sensors.
+- No labels like "CONSERVATIVE APPROACH:" or "RECOMMENDED:".
+- Start bullets with • only.
+
+Well context (JSON):
+{json.dumps({"well_id": well_id, "action": action, "context": context}, default=str)}
+"""
+    alt_resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Petroleum engineer. Valid JSON only. Bullets only for approaches.",
+            },
+            {"role": "user", "content": alt_prompt},
+        ],
+        temperature=0.35,
+        response_format={"type": "json_object"},
+    )
+    alt_raw = (alt_resp.choices[0].message.content or "").strip()
+    alt_parsed = json.loads(alt_raw) if alt_raw else {}
+    if not isinstance(alt_parsed, dict):
+        alt_parsed = {}
+
+    alternatives = {
+        "conservative_approach": _strip_alternative_headers(
+            str(alt_parsed.get("conservative_approach") or "").strip()
+        ),
+        "aggressive_optimization": _strip_alternative_headers(
+            str(alt_parsed.get("aggressive_optimization") or "").strip()
+        ),
+        "hybrid_model": _strip_alternative_headers(
+            str(alt_parsed.get("hybrid_model") or "").strip()
+        ),
+        "recommended_model": _strip_alternative_headers(
+            str(alt_parsed.get("recommended_model") or "").strip()
+        ),
+    }
+
+    # --- Citations (research-capable model: Perplexity via OpenRouter) ---
+    cite_prompt = f"""Find authentic petroleum-engineering references that support this operational recommendation.
+
+Recommended action: {action}
+Well: {well_id}
+Evidence summary: {json.dumps(context.get("evidence_snapshot") or {}, default=str)}
+Numeric impact: {json.dumps(context.get("numeric_summary") or {}, default=str)}
+Category: {recommendation.get("category") or context.get("category") or ""}
+
+Return JSON only:
+{{
+  "referenced_data": [
+    {{
+      "title": "Exact paper or article title",
+      "id": "SPE 145723 or DOI or empty string",
+      "url": "https://onepetro.org/... or https://doi.org/10...."
+    }}
+  ],
+  "supporting_analysis": "One short paragraph linking THESE references to THIS well action",
+  "data_quality": "One line on confidence / data basis"
+}}
+
+CRITICAL URL RULES:
+- EVERY referenced_data item MUST include a real clickable url starting with https://
+- Prefer OnePetro links (https://onepetro.org/...) or DOI links (https://doi.org/10....)
+- If you only know a DOI like 10.1038/..., set url to https://doi.org/10.1038/...
+- NEVER invent SPE numbers or fake URLs. If you cannot provide a real URL, OMIT that item.
+- Do NOT return title-only citations without a url.
+- 2–4 referenced_data items max.
+- supporting_analysis must be specific to this action, not generic.
+- Do not include source or financial_pricing fields.
+"""
+    cite_model = RESEARCH_MODEL or OPENAI_MODEL
+    cite_kwargs: dict[str, Any] = {
+        "model": cite_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a petroleum research librarian. Return valid JSON only. "
+                    "Every citation MUST include a real https URL (OnePetro or doi.org). "
+                    "Never fabricate paper IDs or URLs. Omit items without a real link. "
+                    "Do not include source or financial_pricing fields."
+                ),
+            },
+            {"role": "user", "content": cite_prompt},
+        ],
+        "temperature": 0.2,
+    }
+    # Perplexity rejects response_format=json_object; only attach for non-Perplexity models.
+    if "perplexity" not in str(cite_model).lower():
+        cite_kwargs["response_format"] = {"type": "json_object"}
+    try:
+        cite_resp = client.chat.completions.create(**cite_kwargs)
+        cite_raw = (cite_resp.choices[0].message.content or "").strip()
+        # Strip markdown fences if the research model wraps JSON.
+        if cite_raw.startswith("```"):
+            cite_raw = re.sub(r"^```(?:json)?\s*", "", cite_raw)
+            cite_raw = re.sub(r"\s*```$", "", cite_raw)
+        cite_parsed = json.loads(cite_raw) if cite_raw else {}
+        if not isinstance(cite_parsed, dict):
+            cite_parsed = {}
+    except Exception as cite_err:
+        logger.warning(
+            "Research citations via %s failed (%s); falling back to %s",
+            cite_model,
+            cite_err,
+            OPENAI_MODEL,
+        )
+        cite_resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Petroleum engineer. Valid JSON only. Every citation must include a real "
+                        "https OnePetro or doi.org URL. Never invent SPE numbers or URLs. "
+                        "Do not include source or financial_pricing."
+                    ),
+                },
+                {"role": "user", "content": cite_prompt},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        cite_raw = (cite_resp.choices[0].message.content or "").strip()
+        cite_parsed = json.loads(cite_raw) if cite_raw else {}
+        if not isinstance(cite_parsed, dict):
+            cite_parsed = {}
+
+    refs_raw = cite_parsed.get("referenced_data") or []
+    if isinstance(refs_raw, str):
+        refs_raw = [refs_raw]
+    if not isinstance(refs_raw, list):
+        refs_raw = []
+    refs = _normalize_citation_refs(refs_raw)[:4]
+    validate_urls = (os.getenv("OPERATIONS_VALIDATE_CITATION_URLS") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    )
+    if validate_urls and refs:
+        refs = _filter_reachable_reference_urls(refs)[:4]
+
+    supporting = str(cite_parsed.get("supporting_analysis") or "").strip()
+    data_quality = str(cite_parsed.get("data_quality") or "").strip()
+
+    cite_obj = {
+        "referenced_data": refs,
+        "supporting_analysis": supporting,
+        "data_quality": data_quality,
+    }
+
+    return {
+        **alternatives,
+        "citations": json.dumps(cite_obj),
+        "referenced_data": json.dumps(refs),
+        "supporting_analysis": supporting[:2000] if supporting else "",
+        "data_quality": data_quality[:100] if data_quality else "",
+    }
 
 
 def infer_action_category_priority(well_id: str, production_data: dict = None, sensor_metrics: dict = None, hint: str = None) -> dict:
@@ -622,25 +1070,6 @@ def refine_suggestion_with_openai(well_id: str, suggested_action: str, productio
         logger.warning(f"Refine OpenAI call failed: {e}")
         fallback_cat = category_hint if category_hint in {'Production', 'Optimization', 'Maintenance'} else 'Production'
         return {'action': suggested_action, 'category': fallback_cat, 'priority': ('HIGH' if (model_confidence or 0) > 0.85 else 'MEDIUM')}
-
-
-def _strip_alternative_headers(text: str) -> str:
-    """Remove section titles and RECOMMENDED: prefix so we store only content."""
-    if not text or not isinstance(text, str):
-        return (text or "").strip()
-    lines = text.strip().split("\n")
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            out.append("")
-            continue
-        if re.match(r"^[A-Z0-9][A-Z0-9\s\-\.]+:\s*$", stripped) and len(stripped) < 60:
-            continue
-        if stripped.upper().startswith("RECOMMENDED:"):
-            stripped = stripped[12:].strip()
-        out.append(stripped)
-    return "\n".join(out).strip()
 
 
 def save_operation_suggestion(well_id: str, action: str, category: str = "Production", status: str = "New",
@@ -799,10 +1228,13 @@ def save_operation_suggestion(well_id: str, action: str, category: str = "Produc
         from operation_recommendations.recommendations.persistence import (
             apply_analysis_description,
             apply_metric_descriptions,
+            finalize_analysis_fields,
             write_operations_recommendations_to_s3,
         )
+        row["ml_action_hint"] = action
         apply_metric_descriptions(row)
         apply_analysis_description(row)
+        finalize_analysis_fields(row)
         written_key = write_operations_recommendations_to_s3([row])
         if written_key:
             logger.info(f"✓ Saved operation suggestion for {well_id}: {action} -> S3")

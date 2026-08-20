@@ -180,6 +180,11 @@ repl = {
   "DATABASE_URL_SECRET_ARN_VALUE": os.environ.get("DATABASE_URL_SECRET_ARN", ""),
   "OPENAI_API_KEY_VALUE": os.environ.get("OPENAI_API_KEY", ""),
   "OPENAI_API_BASE_VALUE": os.environ.get("OPENAI_API_BASE", ""),
+  "OPENAI_MODEL_VALUE": os.environ.get("OPENAI_MODEL", "openai/gpt-4o-mini"),
+  "OPERATIONS_RESEARCH_MODEL_VALUE": os.environ.get(
+      "OPERATIONS_RESEARCH_MODEL",
+      os.environ.get("OPENAI_RESEARCH_MODEL", "perplexity/sonar-pro"),
+  ),
 }
 for k, v in repl.items():
   text = text.replace(k, v)

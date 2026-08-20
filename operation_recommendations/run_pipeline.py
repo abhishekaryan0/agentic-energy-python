@@ -146,53 +146,21 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
 
         logger.info("Detected %s recommendations", len(all_recs))
 
-        logger.info("\n3b. Enriching recommendations with LLM (alternative models, time_reduced_hours)...")
+        logger.info("\n3b. Enriching recommendations with LLM (alternative models, citations)...")
         try:
-            from operation_recommendations.suggestions import generate_operation_suggestion_with_openai, _strip_alternative_headers
-
-            def _safe_float(v, default=0.0):
-                try:
-                    return float(v or default)
-                except Exception:
-                    return default
-
-            def _t(s, n):
-                try:
-                    if s is None:
-                        return None
-                    s2 = str(s)
-                    return s2 if len(s2) <= n else s2[:n]
-                except Exception:
-                    return s
+            from operation_recommendations.recommendations.persistence import (
+                apply_alternatives_and_citations,
+                apply_analysis_description,
+                apply_metric_descriptions,
+                finalize_analysis_fields,
+            )
 
             for rec in all_recs:
                 try:
                     well_id = rec.get("well_id", "")
                     action = rec.get("action", "")
-                    production_data = (rec.get("metrics") or {}).get("production") or {}
-                    sensor_data = (rec.get("metrics") or {}).get("sensors") or {}
-                    llm_result = generate_operation_suggestion_with_openai(
-                        well_id, action, production_data, sensor_data
-                    )
-                    alt = llm_result.get("alternative_models", {}) or {}
-                    op = llm_result.get("operational_details", {}) or {}
-                    fin = llm_result.get("financial_impact", {}) or {}
-                    prod = llm_result.get("production_impact", {}) or {}
-                    cit = llm_result.get("citations", {}) or {}
 
-                    for key in ("conservative_approach", "aggressive_optimization", "hybrid_model"):
-                        if alt.get(key):
-                            alt[key] = _strip_alternative_headers(alt[key])
-
-                    rec["conservative_approach"] = _t(alt.get("conservative_approach"), 2000)
-                    rec["aggressive_optimization"] = _t(alt.get("aggressive_optimization"), 2000)
-                    rec["hybrid_model"] = _t(alt.get("hybrid_model"), 2000)
-                    rec["recommended_model"] = _t(alt.get("recommended_model"), 500)
-
-                    # Compute `time_reduced_hours` deterministically from the already
-                    # model-driven economics (no constant LLM defaults).
-                    # Interpret as time to recover the one-time implementation cost
-                    # using daily benefit, capped to the amortization horizon.
+                    # Deterministic time_reduced_hours from economics.
                     try:
                         impl = float(rec.get("implementation_cost_usd") or 0.0)
                         daily_benefit = float(rec.get("daily_expense_benefit_usd") or 0.0)
@@ -209,43 +177,13 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
                     except Exception:
                         rec["time_reduced_hours"] = 0.0
 
-                    # If deterministic time is unavailable (0.0), allow OpenRouter to provide a fallback.
-                    # This does not override a valid deterministic value.
-                    try:
-                        if float(rec.get("time_reduced_hours") or 0.0) <= 0.0:
-                            llm_hours = float(op.get("time_reduced_hours") or 0.0)
-                            if llm_hours > 0.0:
-                                rec["time_reduced_hours"] = float(round(llm_hours, 2))
-                    except Exception:
-                        pass
-
-                    # Always refresh narrative fields from OpenRouter enrichment when present.
-                    if op.get("detailed_analysis"):
-                        rec["detailed_analysis"] = _t(op.get("detailed_analysis"), 160)
-                    if not rec.get("current_performance"):
-                        rec["current_performance"] = _t(op.get("current_performance"), 255)
-                    if not rec.get("historical_trend"):
-                        rec["historical_trend"] = _t(
-                            op.get("historical_trend") or op.get("optimal_performance"), 255
-                        )
-                    if cit:
-                        rec["supporting_analysis"] = _t(cit.get("supporting_analysis"), 2000)
-                        rec["data_quality"] = _t(cit.get("data_quality"), 100)
-
-                    # Refresh metric blurbs; regenerate analysis only if missing/failed
-                    # (already generated once in prediction record creation).
-                    try:
-                        from operation_recommendations.recommendations.persistence import (
-                            apply_analysis_description,
-                            apply_metric_descriptions,
-                        )
-                        apply_metric_descriptions(rec)
-                        analysis = str(rec.get("analysis_description") or "")
-                        if (not analysis) or analysis.startswith("OpenRouter analysis generation failed"):
-                            apply_analysis_description(rec)
-                        action = rec.get("action") or action
-                    except Exception:
-                        pass
+                    apply_metric_descriptions(rec)
+                    analysis = str(rec.get("analysis_description") or "")
+                    if (not analysis) or analysis.startswith("OpenRouter analysis generation failed"):
+                        apply_analysis_description(rec)
+                        finalize_analysis_fields(rec)
+                    apply_alternatives_and_citations(rec)
+                    action = rec.get("action") or action
 
                     logger.info("✓ LLM enriched: %s | %s", well_id, action)
                 except Exception as enrich_err:

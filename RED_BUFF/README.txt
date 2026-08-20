@@ -3,6 +3,13 @@ RED BLUFF RESOURCES SYNTHETIC DATASET
 Digital Twin Pipeline
 ================================================================================
 
+NOTE
+----
+This file is the dataset design + offline JSON/CSV rebuild guide.
+Production generation writes directly to Snowflake (Lambda / CLI).
+See README.md for the live path: run_incremental_snowflake.py, handler.py,
+and deploy/schedule.sh.
+
 OVERVIEW
 --------
 This pipeline generates a fully realistic, physics-driven synthetic dataset for
