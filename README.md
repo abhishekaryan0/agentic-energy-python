@@ -39,18 +39,6 @@ s3_to_postgres/  →  PostgreSQL schema = {ORGANIZATION_ID}
 | `APEX_PERMIAN/` | `generate_digital_twin.py`, `generate_master.py`, `generate_invoices.py`, `snowflake_io.py`, `column_maps.py` |
 | `SOUTH_TEXAS_ENERGY_PARTNERS/` | `generate_digital_twin.py`, `generate_invoices.py`, `build_master.py`, `config.py`, `snowflake_io.py`, `column_maps.py` |
 
-Offline self-contained master JSON builders (repo root, not the Lambda path):
-
-| File | Output |
-|------|--------|
-| `RBNR_V2_Master_build.py` | `RBNR_V2_Master.json` (Red Bluff V2) |
-| `STEP_V2_Master_build.py` | `STEP_V2_Master.json` (STEP V2) |
-
-```bash
-python3 RBNR_V2_Master_build.py          # RBNR_SCALE=full|mid|test
-python3 STEP_V2_Master_build.py
-```
-
 ### `transformations/`
 
 | File | Purpose |
