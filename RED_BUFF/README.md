@@ -65,7 +65,7 @@ aws lambda invoke --function-name red-buff --region us-east-1 \
 ## Pipeline order (production)
 
 1. **red-buff** (00:00 UTC) — generate new days in Snowflake  
-2. **transformations** (00:15 UTC) — export Snowflake → S3 parquet  
+2. **transformations** (00:45 UTC) — export Snowflake → S3 parquet  
 
 ## Key modules
 
