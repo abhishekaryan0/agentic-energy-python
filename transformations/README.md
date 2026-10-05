@@ -4,6 +4,8 @@ Exports canonical Snowflake tables into S3 parquet used by the ML packages. **Re
 
 **Tenant isolation:** With `ORGANIZATION_ID` or comma-separated `ORGANIZATION_IDS`, each export runs `SELECT … FROM WELL_* WHERE "organization_id" = %s` and writes only to `s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/`.
 
+**V2 (new folder only — v1 paths unchanged):** `version: "v2"` / `TRANSFORM_DATA_VERSION=v2` reads Snowflake `*_V2` tables and writes under `{ORGANIZATION_ID}/v2/…` (same subfolders as v1: `sensor_data/`, `digital_twin/`, `financial_data/`). Applies to Red Buff + STEP only.
+
 **Per-org Snowflake schema:** `org_snowflake.py` routes STEP (`STEP_ORGANIZATION_ID`) to `STEP_SNOWFLAKE_SCHEMA` (default `SOUTH_TEXAS_SENSOR_DATA`); Red Buff / Apex use `SNOWFLAKE_SCHEMA` (default `SENSOR_DATA`).
 
 **Per-org field mapping:** `field_mappings.py` shapes parquet per tenant. Apex uses `freq_hz` and a subset column set; Red Bluff / STEP keep the full canonical schema (`drive_frequency` + `freq_hz`). Override profile with `TRANSFORM_ORG_PROFILE_{UUID}=apex_permian` when needed.
@@ -96,9 +98,11 @@ Env: same Snowflake/S3 vars. Optional: `SYNTH_EXPORT_MODE`, `SYNTH_EXPORT_FAIL_O
 
 ```bash
 ./transformations/deploy/schedule.sh
+./transformations/deploy/schedule_v2.sh   # Red Buff + STEP → {org}/v2/ only
 ```
 
-- EventBridge: `transformations-daily` → `cron(45 0 * * ? *)` (00:45 UTC)
+- EventBridge: `transformations-daily` → `cron(45 0 * * ? *)` (00:45 UTC) — v1
+- EventBridge: `transformations-v2-daily` → `cron(50 0 * * ? *)` (00:50 UTC) — v2
 - Lambda: `transformations`
 - Logs: `/aws/lambda/transformations`
 
@@ -108,8 +112,19 @@ Env: same Snowflake/S3 vars. Optional: `SYNTH_EXPORT_MODE`, `SYNTH_EXPORT_FAIL_O
 {"mode": "incremental"}
 {"mode": "full", "organization_id": "147a92b9-f90a-473d-b443-e6e668c4fbb7"}
 {"mode": "full", "organization_id": "d270f89a-aada-4ff2-adb0-68b3e8087565", "synth": true}
+{"mode": "full", "version": "v2"}
+{"mode": "full", "version": "v2", "organization_id": "3e0b5b18-bec1-488a-82c1-a47881c69058", "synth": true}
+```
+
+`version: "v2"` / `data_version: "v2"` writes only under `{ORG}/v2/` and does not modify v1 `{ORG}/sensor_data/`.
+
+Local V2:
+
+```bash
+python -m transformations.run --mode full --data-version v2 --organization-id 3e0b5b18-bec1-488a-82c1-a47881c69058
+python -m transformations.run_synth_export --mode full --data-version v2 --organization-id d270f89a-aada-4ff2-adb0-68b3e8087565
 ```
 
 `synth: true` or `export_type: "synth"` routes to SYNTH export (`run_synth_export_for_event`).
 
-Deploy layout: `transformations/deploy/` (`deploy.sh`, `schedule.sh`, `Dockerfile.lambda`, `requirements.lambda.txt`).
+Deploy layout: `transformations/deploy/` (`deploy.sh`, `schedule.sh`, `schedule_v2.sh`, `Dockerfile.lambda`, `requirements.lambda.txt`).

@@ -35,6 +35,8 @@ def _config_from_args(args) -> TransformationConfig:
         config.batch_size = args.batch_size
     if args.mode:
         config.mode = args.mode
+    if getattr(args, "data_version", None):
+        config.data_version = args.data_version
     return config
 
 
@@ -49,6 +51,14 @@ def main() -> None:
         choices=("full", "incremental"),
         default=None,
         help="full = all history/invoices; incremental = since synth checkpoint.",
+    )
+    parser.add_argument(
+        "--data-version",
+        "--version",
+        dest="data_version",
+        choices=("v1", "v2"),
+        default=None,
+        help="v1 = {org}/digital_twin + financial_data. v2 = {org}/v2/... from SYNTH_*_V2.",
     )
     parser.add_argument(
         "--sources",

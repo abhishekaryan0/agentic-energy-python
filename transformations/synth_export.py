@@ -22,14 +22,6 @@ from transformations.synth_mappers import (
     build_master_assets_df,
     build_master_history_df,
 )
-from transformations.synth_schemas import (
-    DEFAULT_SYNTH_SOURCES,
-    SYNTH_ASSETS_SPEC,
-    SYNTH_HISTORY_SPEC,
-    SYNTH_INVOICES_SPEC,
-    SYNTH_PERSONNEL_SPEC,
-    get_synth_source_specs,
-)
 from transformations.synth_snowflake import (
     iter_synth_batches,
     preflight_synth_counts,
@@ -72,14 +64,28 @@ def run_synth_export(
 ) -> Dict[str, Any]:
     """
     Snowflake SYNTH_* → S3:
-      {org}/digital_twin/master_data/run_ts=.../master_*.parquet
-      {org}/financial_data/run_ts=.../invoices_v2.parquet
+      v1: {org}/digital_twin/... and {org}/financial_data/...
+      v2: {org}/v2/digital_twin/... and {org}/v2/financial_data/...  (v1 paths untouched)
     """
     org = (config.organization_id or "").strip()
     if not org:
         raise ValueError("ORGANIZATION_ID is required for synth export")
 
     import os
+
+    from transformations.config import normalize_data_version
+    from transformations.synth_schemas import (
+        DEFAULT_SYNTH_SOURCES,
+        SYNTH_ASSETS_SPEC,
+        SYNTH_ASSETS_V2_SPEC,
+        SYNTH_HISTORY_SPEC,
+        SYNTH_HISTORY_V2_SPEC,
+        SYNTH_INVOICES_SPEC,
+        SYNTH_INVOICES_V2_SPEC,
+        SYNTH_PERSONNEL_SPEC,
+        SYNTH_PERSONNEL_V2_SPEC,
+        get_synth_source_specs,
+    )
 
     mode = (
         mode
@@ -90,8 +96,32 @@ def run_synth_export(
     if mode not in SYNTH_MODES:
         raise ValueError(f"synth mode must be one of {SYNTH_MODES}")
 
-    sources = get_synth_source_specs(source_names or DEFAULT_SYNTH_SOURCES)
-    checkpoint = load_synth_checkpoint(config.s3_bucket, org, region_name=config.aws_region)
+    data_version = normalize_data_version(config.data_version)
+    sources = get_synth_source_specs(
+        source_names or DEFAULT_SYNTH_SOURCES,
+        data_version=data_version,
+    )
+    if data_version == "v2":
+        assets_spec, personnel_spec, history_spec, invoices_spec = (
+            SYNTH_ASSETS_V2_SPEC,
+            SYNTH_PERSONNEL_V2_SPEC,
+            SYNTH_HISTORY_V2_SPEC,
+            SYNTH_INVOICES_V2_SPEC,
+        )
+    else:
+        assets_spec, personnel_spec, history_spec, invoices_spec = (
+            SYNTH_ASSETS_SPEC,
+            SYNTH_PERSONNEL_SPEC,
+            SYNTH_HISTORY_SPEC,
+            SYNTH_INVOICES_SPEC,
+        )
+
+    checkpoint = load_synth_checkpoint(
+        config.s3_bucket,
+        org,
+        region_name=config.aws_region,
+        data_version=data_version,
+    )
     if checkpoint is None:
         checkpoint = SynthExportCheckpoint(organization_id=org)
 
@@ -115,11 +145,13 @@ def run_synth_export(
     )
 
     ts = _run_ts()
-    master_prefix = f"{org}/digital_twin/master_data/run_ts={ts}"
-    financial_prefix = f"{org}/financial_data/run_ts={ts}"
+    root = config.org_data_root()
+    master_prefix = f"{root}/digital_twin/master_data/run_ts={ts}"
+    financial_prefix = f"{root}/financial_data/run_ts={ts}"
 
     plan = {
         "mode": mode,
+        "data_version": data_version,
         "organization_id": org,
         "run_ts": ts,
         "master_prefix": f"s3://{config.s3_bucket}/{master_prefix}",
@@ -135,14 +167,14 @@ def run_synth_export(
     conn = connect_snowflake(config.snowflake)
     try:
         preflight = preflight_synth_counts(conn, config, sources)
-        logger.info("Synth preflight counts for %s: %s", org, preflight)
+        logger.info("Synth preflight counts for %s (%s): %s", org, data_version, preflight)
         if _env_bool("SYNTH_EXPORT_FAIL_ON_EMPTY", False) and sum(preflight.values()) == 0:
             raise ValueError(f"No SYNTH rows for organization_id={org!r}")
 
-        assets_df = _collect_table(conn, config, SYNTH_ASSETS_SPEC, None)
-        personnel_df = _collect_table(conn, config, SYNTH_PERSONNEL_SPEC, None)
-        history_df = _collect_table(conn, config, SYNTH_HISTORY_SPEC, hist_window)
-        invoices_df = _collect_table(conn, config, SYNTH_INVOICES_SPEC, inv_window)
+        assets_df = _collect_table(conn, config, assets_spec, None)
+        personnel_df = _collect_table(conn, config, personnel_spec, None)
+        history_df = _collect_table(conn, config, history_spec, hist_window)
+        invoices_df = _collect_table(conn, config, invoices_spec, inv_window)
 
         master_assets = build_master_assets_df(assets_df, personnel_df, invoices_df, org)
         master_history = build_master_history_df(history_df, org)
@@ -186,20 +218,26 @@ def run_synth_export(
         checkpoint.mode = mode
         checkpoint.last_run_status = "success"
         checkpoint.last_run_ts = ts
-        ck_uri = save_synth_checkpoint(config.s3_bucket, checkpoint, region_name=config.aws_region)
+        ck_uri = save_synth_checkpoint(
+            config.s3_bucket,
+            checkpoint,
+            region_name=config.aws_region,
+            data_version=data_version,
+        )
 
         return {
             "status": "success",
             "dry_run": False,
             "mode": mode,
+            "data_version": data_version,
             "organization_id": org,
             "run_ts": ts,
             "preflight_snowflake_row_counts": preflight,
             "snowflake_rows_read": {
-                "SYNTH_ASSETS": len(assets_df),
-                "SYNTH_PERSONNEL": len(personnel_df),
-                "SYNTH_ASSET_DAILY_HISTORY": len(history_df),
-                "SYNTH_INVOICES": len(invoices_df),
+                assets_spec.source_table: len(assets_df),
+                personnel_spec.source_table: len(personnel_df),
+                history_spec.source_table: len(history_df),
+                invoices_spec.source_table: len(invoices_df),
             },
             "outputs": outputs,
             "checkpoint_uri": ck_uri,
@@ -208,7 +246,12 @@ def run_synth_export(
     except Exception:
         checkpoint.last_run_status = "failed"
         try:
-            save_synth_checkpoint(config.s3_bucket, checkpoint, region_name=config.aws_region)
+            save_synth_checkpoint(
+                config.s3_bucket,
+                checkpoint,
+                region_name=config.aws_region,
+                data_version=data_version,
+            )
         except Exception:
             logger.exception("Failed to save synth checkpoint after error")
         raise

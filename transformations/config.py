@@ -9,6 +9,12 @@ _ORG_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 DEFAULT_TABLES = ("well_sensor_readings", "well_daily_production")
 TRANSFORM_MODES = ("full", "incremental")
+DATA_VERSIONS = ("v1", "v2")
+
+# Orgs with Snowflake *_V2 tables (STEP + Red Buff). Apex has no V2 twin yet.
+STEP_ORGANIZATION_ID = "d270f89a-aada-4ff2-adb0-68b3e8087565"
+RED_BUFF_ORGANIZATION_ID = "3e0b5b18-bec1-488a-82c1-a47881c69058"
+DEFAULT_V2_ORGANIZATION_IDS = (RED_BUFF_ORGANIZATION_ID, STEP_ORGANIZATION_ID)
 
 
 def _strip(value: Optional[str]) -> str:
@@ -43,13 +49,52 @@ def load_organization_ids(overrides: Optional[Dict[str, Any]] = None) -> List[st
     raise ValueError("ORGANIZATION_ID or ORGANIZATION_IDS is required")
 
 
-def resolve_organization_ids(event: Optional[Dict[str, Any]] = None) -> List[str]:
+def normalize_data_version(value: Optional[str]) -> str:
+    version = _strip(value or os.getenv("TRANSFORM_DATA_VERSION") or "v1").lower()
+    if version in {"2", "v2"}:
+        return "v2"
+    if version in {"1", "v1", ""}:
+        return "v1"
+    raise ValueError(f"TRANSFORM_DATA_VERSION must be one of {DATA_VERSIONS}, got {value!r}")
+
+
+def load_v2_organization_ids(overrides: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return org UUIDs that have V2 Snowflake tables (default: Red Buff + STEP only)."""
+    overrides = overrides or {}
+    raw = overrides.get("organization_ids")
+    if raw is None:
+        # Do not fall back to ORGANIZATION_IDS (may include Apex with no V2 tables).
+        raw = os.getenv("TRANSFORM_V2_ORGANIZATION_IDS")
+    if raw:
+        ids = _parse_organization_id_list(raw)
+        if ids:
+            return ids
+    single = _strip(overrides.get("organization_id"))
+    if single:
+        return [single]
+    return [
+        _strip(os.getenv("RED_BUFF_ORGANIZATION_ID") or RED_BUFF_ORGANIZATION_ID),
+        _strip(os.getenv("STEP_ORGANIZATION_ID") or STEP_ORGANIZATION_ID),
+    ]
+
+
+def resolve_organization_ids(
+    event: Optional[Dict[str, Any]] = None,
+    *,
+    data_version: Optional[str] = None,
+) -> List[str]:
     """
     Resolve which organizations to export for a handler/CLI/Lambda event.
 
     Priority: event organization_id -> event organization_ids -> env ORGANIZATION_IDS -> ORGANIZATION_ID.
+    For data_version=v2 with no explicit orgs, defaults to Red Buff + STEP.
     """
     event = event or {}
+    version = normalize_data_version(
+        data_version
+        if data_version is not None
+        else (event.get("data_version") or event.get("version"))
+    )
 
     single = _strip(event.get("organization_id"))
     if single:
@@ -62,6 +107,8 @@ def resolve_organization_ids(event: Optional[Dict[str, Any]] = None) -> List[str
             raise ValueError("organization_ids is empty")
         return ids
 
+    if version == "v2":
+        return load_v2_organization_ids()
     return load_organization_ids()
 
 
@@ -173,13 +220,15 @@ class TransformationConfig:
     write_partitions: bool = True
     write_snapshots: bool = False
     merge_snapshots: bool = False
+    # v1 → {org}/sensor_data (unchanged). v2 → {org}/v2/sensor_data (new folder only).
+    data_version: str = "v1"
 
     @classmethod
     def from_env(cls) -> "TransformationConfig":
         tables = _split_csv(os.getenv("TRANSFORM_TABLES", "")) or list(DEFAULT_TABLES)
         output_prefix = (
             os.getenv("TRANSFORM_OUTPUT_S3_PREFIX")
-            or os.getenv("TRANSFORMATION_OUTPUT_S3_PREFIX")
+            or os.getenv("TRANSFORMAT_OUTPUT_S3_PREFIX")
             or None
         )
         mode = (os.getenv("TRANSFORM_MODE", "full") or "full").strip().lower()
@@ -196,6 +245,7 @@ class TransformationConfig:
             write_partitions=_env_bool("TRANSFORM_WRITE_PARTITIONS", True),
             write_snapshots=_env_bool("TRANSFORM_WRITE_SNAPSHOTS", False),
             merge_snapshots=_env_bool("TRANSFORM_MERGE_SNAPSHOTS", False),
+            data_version=normalize_data_version(os.getenv("TRANSFORM_DATA_VERSION")),
         )
 
     def validate(self) -> None:
@@ -211,6 +261,7 @@ class TransformationConfig:
             )
         if self.mode not in TRANSFORM_MODES:
             raise ValueError(f"TRANSFORM_MODE must be one of {TRANSFORM_MODES}")
+        self.data_version = normalize_data_version(self.data_version)
         if self.mode == "incremental" and not self.organization_id:
             raise ValueError("ORGANIZATION_ID is required for incremental transform mode")
         if not self.organization_id and not _env_bool(
@@ -219,16 +270,26 @@ class TransformationConfig:
             raise ValueError(
                 "ORGANIZATION_ID is required: exports use "
                 'WHERE "organization_id" = %s in Snowflake (same tenant column as RED_BUFF) '
-                "and write to s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/. "
+                "and write to s3://$S3_BUCKET/{ORGANIZATION_ID}/sensor_data/ (v1) or "
+                ".../{ORGANIZATION_ID}/v2/sensor_data/ (v2). "
                 "Set TRANSFORM_ALLOW_CROSS_TENANT_EXPORT=1 only for intentional full-table exports."
             )
+
+    def org_data_root(self) -> str:
+        """Tenant root: {org} for v1 (unchanged), {org}/v2 for version 2."""
+        org = (self.organization_id or "").strip()
+        version = normalize_data_version(self.data_version)
+        if not org:
+            return "v2" if version == "v2" else ""
+        return f"{org}/v2" if version == "v2" else org
 
     def sensor_data_prefix(self) -> str:
         """Return the S3 prefix used by downstream ML packages for source parquet."""
         if self.output_prefix:
             return self.output_prefix.strip().strip("/")
-        if self.organization_id:
-            return f"{self.organization_id}/sensor_data"
+        root = self.org_data_root()
+        if root:
+            return f"{root}/sensor_data"
         return "sensor_data"
 
     def with_org_snowflake_schema(self) -> "TransformationConfig":
@@ -237,10 +298,14 @@ class TransformationConfig:
             return self
         from transformations.org_snowflake import snowflake_connection_for_org
 
-        sf = snowflake_connection_for_org(self.snowflake, self.organization_id)
+        sf = snowflake_connection_for_org(
+            self.snowflake,
+            self.organization_id,
+            data_version=self.data_version,
+        )
         if sf is self.snowflake:
             return self
-        updated = TransformationConfig(
+        return TransformationConfig(
             snowflake=sf,
             s3_bucket=self.s3_bucket,
             organization_id=self.organization_id,
@@ -253,5 +318,5 @@ class TransformationConfig:
             write_partitions=self.write_partitions,
             write_snapshots=self.write_snapshots,
             merge_snapshots=self.merge_snapshots,
+            data_version=self.data_version,
         )
-        return updated

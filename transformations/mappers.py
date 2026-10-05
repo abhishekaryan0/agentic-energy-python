@@ -104,11 +104,46 @@ def normalize_batch(
     if batch is None or batch.empty:
         cols = resolve_parquet_columns(organization_id, spec.source_table, spec.columns)
         return pd.DataFrame(columns=list(cols))
-    if spec.source_table == "WELL_DAILY_PRODUCTION":
-        out = _coerce_production(batch, spec.columns)
+    if spec.source_table in ("WELL_DAILY_PRODUCTION", "WELL_DAILY_PRODUCTION_V2"):
+        if spec.source_table.endswith("_V2"):
+            out = _coerce_v2_daily(batch, spec.columns)
+        else:
+            out = _coerce_production(batch, spec.columns)
+    elif spec.source_table.endswith("_V2"):
+        out = _coerce_v2_sensor(batch, spec.columns)
     else:
         out = _coerce_sensor(batch, spec.columns)
+    if spec.source_table.endswith("_V2"):
+        return out
     return apply_export_field_mapping(out, organization_id, spec.source_table)
+
+
+def _coerce_v2_daily(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    out = df.reindex(columns=list(columns)).copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    for col in ("organization_id", "asset_id", "lift_type", "run_status", "timestamp"):
+        if col in out.columns:
+            out[col] = _to_object_str_series(out[col])
+    for col in out.columns:
+        if col in ("organization_id", "asset_id", "date", "timestamp", "lift_type", "run_status"):
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float32")
+    return out
+
+
+def _coerce_v2_sensor(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    out = df.reindex(columns=list(columns)).copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    for col in ("organization_id", "asset_id", "lift_type", "run_status", "timestamp"):
+        if col in out.columns:
+            out[col] = _to_object_str_series(out[col])
+    for col in out.columns:
+        if col in ("organization_id", "asset_id", "date", "timestamp", "lift_type", "run_status"):
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float32")
+    return out
 
 
 def validate_batch(
@@ -120,8 +155,8 @@ def validate_batch(
     """
     Drop invalid rows and return (clean_df, dropped_count).
 
-    Production requires well_id and date.
-    Sensors require well_id and timestamp.
+    Production requires well_id and date (v1) or asset_id and date (v2).
+    Sensors require well_id and timestamp (v1) or asset_id and date (v2).
 
     When expected_organization_id is set and the batch includes organization_id,
     every remaining row must match (defense in depth on top of SQL WHERE).
@@ -131,8 +166,12 @@ def validate_batch(
 
     df = batch
     before = len(df)
+    is_v2 = spec.source_table.endswith("_V2")
 
-    if spec.source_table == "WELL_DAILY_PRODUCTION":
+    if is_v2:
+        df = df.dropna(subset=["asset_id", "date"])
+        df = df[df["asset_id"].astype(str).str.len() > 0]
+    elif spec.source_table == "WELL_DAILY_PRODUCTION":
         df = df.dropna(subset=["well_id", "date"])
         df = df[df["well_id"].astype(str).str.len() > 0]
     else:

@@ -16,7 +16,7 @@ import logging
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import io
 
@@ -647,6 +647,73 @@ def get_all_well_statuses() -> List[Dict]:
     return get_all_well_status_rows()
 
 
+def _reading_age_hours(last_timestamp: Any, now: Optional[datetime] = None) -> Optional[float]:
+    if last_timestamp is None or (isinstance(last_timestamp, float) and pd.isna(last_timestamp)):
+        return None
+    now = now or datetime.now(timezone.utc)
+    if isinstance(last_timestamp, str):
+        try:
+            last_ts = datetime.fromisoformat(last_timestamp.replace("Z", "+00:00"))
+        except Exception:
+            last_ts = datetime.strptime(str(last_timestamp)[:19], "%Y-%m-%d %H:%M:%S")
+    else:
+        last_ts = last_timestamp
+    if getattr(last_ts, "tzinfo", None) is not None:
+        last_ts = last_ts.replace(tzinfo=None)
+    return (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600.0
+
+
+def _refresh_existing_well_statuses_from_postgres() -> Tuple[int, Dict[str, int]]:
+    """
+    Re-evaluate every row already in PostgreSQL using current time.
+
+    Incremental S3 reads only touch wells with *new* rows. Without this refresh,
+    wells that stop reporting stay frozen as RUNNING forever. Age-based SHUTDOWN
+    (and IDLE re-score from stored metrics) must run every job.
+    """
+    from well_status.postgres import get_all_well_status_rows, upsert_well_status_dataframe
+
+    existing = get_all_well_status_rows()
+    if not existing:
+        return 0, {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
+
+    now = datetime.now(timezone.utc)
+    refreshed: List[Dict] = []
+    for row in existing:
+        well = {
+            "well_id": row.get("well_id"),
+            "lift_type": row.get("lift_type"),
+            "last_reading_timestamp": row.get("last_reading_timestamp"),
+            "strokes_per_minute": row.get("strokes_per_minute"),
+            "motor_current": row.get("motor_current"),
+            "injection_rate": row.get("injection_rate"),
+        }
+        status, reason = determine_well_status(well)
+        updated = dict(row)
+        updated["status"] = status
+        updated["status_reason"] = reason
+        updated["last_reading_age_hours"] = _reading_age_hours(
+            well.get("last_reading_timestamp"), now=now
+        )
+        updated["updated_at"] = now
+        refreshed.append(updated)
+
+    status_df = pd.DataFrame(refreshed)
+    rows_upserted = upsert_well_status_dataframe(status_df)
+    status_counts = {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
+    if "status" in status_df.columns:
+        for s in status_counts:
+            status_counts[s] = int((status_df["status"] == s).sum())
+    logger.info(
+        "Re-evaluated %s existing well_status rows: RUNNING=%s IDLE=%s SHUTDOWN=%s",
+        rows_upserted,
+        status_counts["RUNNING"],
+        status_counts["IDLE"],
+        status_counts["SHUTDOWN"],
+    )
+    return rows_upserted, status_counts
+
+
 def update_all_well_statuses() -> Dict:
     """
     Main function to update status for all wells.
@@ -654,6 +721,9 @@ def update_all_well_statuses() -> Dict:
     Reads sensor parquet from S3 (partition layout), computes RUNNING/IDLE/SHUTDOWN,
     and upserts rows into PostgreSQL schema ORGANIZATION_ID.well_status.
     Checkpoint remains on S3 for incremental sensor reads.
+
+    Always re-evaluates existing Postgres rows so age-based SHUTDOWN applies even
+    when no new sensor partitions arrive.
     """
     from well_status.postgres import upsert_well_status_dataframe
 
@@ -682,59 +752,67 @@ def update_all_well_statuses() -> Dict:
 
     wells, max_seen_ts = _get_all_wells_from_s3_with_checkpoint(sensor_uri, checkpoint=checkpoint)
 
-    if not wells:
-        logger.warning("No new wells/readings found after checkpoint; PostgreSQL unchanged")
-        checkpoint_payload = dict(checkpoint or {})
-        checkpoint_payload["organization_id"] = os.getenv("ORGANIZATION_ID")
-        checkpoint_payload["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        checkpoint_payload["last_run_status"] = "skipped_no_new_rows"
-        if checkpoint_ts is not None:
-            checkpoint_payload["sensor_high_watermark"] = checkpoint_ts.isoformat()
-        _save_checkpoint(checkpoint_uri, checkpoint_payload)
-        return {
-            "status": "skipped",
-            "reason": "no_new_rows_since_checkpoint",
-            "wells_processed": 0,
-            "rows_upserted": 0,
-        }
+    new_rows_upserted = 0
+    new_status_counts = {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
+    if wells:
+        status_df = _build_status_rows(wells)
+        new_rows_upserted = upsert_well_status_dataframe(status_df)
+        if "status" in status_df.columns:
+            for s in new_status_counts:
+                new_status_counts[s] = int((status_df["status"] == s).sum())
+        logger.info(
+            "Applied %s new/changed sensor wells: RUNNING=%s IDLE=%s SHUTDOWN=%s",
+            new_rows_upserted,
+            new_status_counts["RUNNING"],
+            new_status_counts["IDLE"],
+            new_status_counts["SHUTDOWN"],
+        )
+    else:
+        logger.info(
+            "No new wells/readings after checkpoint; refreshing existing Postgres rows for age-based status"
+        )
 
-    status_df = _build_status_rows(wells)
-    rows_upserted = upsert_well_status_dataframe(status_df)
-
-    status_counts = {"RUNNING": 0, "IDLE": 0, "SHUTDOWN": 0}
-    if "status" in status_df.columns:
-        for s in status_counts.keys():
-            status_counts[s] = int((status_df["status"] == s).sum())
+    refreshed_rows, status_counts = _refresh_existing_well_statuses_from_postgres()
 
     logger.info("=" * 50)
     logger.info("Well status update complete")
     logger.info(
-        "Summary: RUNNING=%s, IDLE=%s, SHUTDOWN=%s, rows_upserted=%s",
+        "Summary (after age refresh): RUNNING=%s, IDLE=%s, SHUTDOWN=%s, "
+        "new_sensor_rows=%s, refreshed_rows=%s",
         status_counts["RUNNING"],
         status_counts["IDLE"],
         status_counts["SHUTDOWN"],
-        rows_upserted,
+        new_rows_upserted,
+        refreshed_rows,
     )
     logger.info("=" * 50)
 
     checkpoint_payload = dict(checkpoint or {})
     checkpoint_payload["organization_id"] = os.getenv("ORGANIZATION_ID")
     checkpoint_payload["last_run_at"] = datetime.now(timezone.utc).isoformat()
-    checkpoint_payload["last_run_status"] = "success"
-    if max_seen_ts is not None:
+    if wells and max_seen_ts is not None:
+        checkpoint_payload["last_run_status"] = "success"
         checkpoint_payload["sensor_high_watermark"] = pd.to_datetime(max_seen_ts, utc=True).isoformat()
+    else:
+        checkpoint_payload["last_run_status"] = "success_age_refresh"
+        if checkpoint_ts is not None:
+            checkpoint_payload["sensor_high_watermark"] = checkpoint_ts.isoformat()
     _save_checkpoint(checkpoint_uri, checkpoint_payload)
     logger.info(
-        "Saved well status checkpoint to %s (sensor_high_watermark=%s)",
+        "Saved well status checkpoint to %s (sensor_high_watermark=%s, last_run_status=%s)",
         checkpoint_uri,
         checkpoint_payload.get("sensor_high_watermark"),
+        checkpoint_payload.get("last_run_status"),
     )
 
     return {
         "status": "success",
-        "wells_processed": len(status_df),
-        "rows_upserted": rows_upserted,
+        "wells_processed": new_rows_upserted,
+        "rows_upserted": refreshed_rows,
+        "new_sensor_rows_upserted": new_rows_upserted,
+        "refreshed_rows": refreshed_rows,
         "summary": status_counts,
+        "reason": None if wells else "no_new_rows_age_refresh",
     }
 
 

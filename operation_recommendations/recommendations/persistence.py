@@ -1044,6 +1044,100 @@ def _build_recent_production_30d_block(metrics: Dict[str, Any]) -> str:
     )
 
 
+def _chart_metric_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        if isinstance(val, float) and np.isnan(val):
+            return None
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def flatten_recommendation_metrics(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize metrics from flat dict, nested production/sensors, or metrics_json string.
+    Used so chart_data builds consistently for every organization / write path.
+    """
+    metrics = rec.get("metrics")
+    if isinstance(metrics, str):
+        try:
+            metrics = json.loads(metrics)
+        except Exception:
+            metrics = {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    merged: Dict[str, Any] = {}
+    if isinstance(metrics.get("production"), dict):
+        merged.update(metrics["production"])
+    if isinstance(metrics.get("sensors"), dict):
+        merged.update(metrics["sensors"])
+    for key, value in metrics.items():
+        if key in ("production", "sensors", "chart_data"):
+            continue
+        merged.setdefault(key, value)
+
+    metrics_json = rec.get("metrics_json")
+    if isinstance(metrics_json, str) and metrics_json.strip():
+        try:
+            parsed = json.loads(metrics_json)
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if key != "chart_data":
+                        merged.setdefault(key, value)
+        except Exception:
+            pass
+
+    return merged
+
+
+def _first_chart_metric(metrics: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        val = _chart_metric_float(metrics.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _production_chart_points(metrics: Dict[str, Any], prefix: str) -> List[Dict[str, Any]]:
+    """Collect baseline / recent / latest production points using org-specific key variants."""
+    point_specs = (
+        ("baseline", (f"{prefix}_baseline_mean", f"{prefix}_baseline")),
+        (
+            "recent_avg",
+            (
+                f"{prefix}_roll_mean",
+                f"{prefix}_recent_30d_mean",
+                f"{prefix}_avg",
+                f"{prefix}_mean",
+                f"{prefix}_current_mean",
+            ),
+        ),
+        (
+            "latest",
+            (
+                f"{prefix}_latest",
+                f"{prefix}_recent_30d_latest",
+                f"{prefix}_last",
+                prefix,
+            ),
+        ),
+    )
+    pts: List[Dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for label, keys in point_specs:
+        val = _first_chart_metric(metrics, keys)
+        if val is None or label in seen_labels:
+            continue
+        p = _chart_point(label, val)
+        if p:
+            pts.append(p)
+            seen_labels.add(label)
+    return pts
+
+
 def _chart_point(label: str, val: Any) -> Optional[Dict[str, Any]]:
     fv = _fmt_desc_number(val, 2) if val is not None else None
     if fv is None:
@@ -1054,86 +1148,338 @@ def _chart_point(label: str, val: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-def build_recommendation_chart_data(metrics: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Trend + projection payload for the dedicated chart_data column."""
-    series: List[Dict[str, Any]] = []
-    prod_specs = (
-        ("Oil", "oil_volume", "bbl/d"),
-        ("Water", "water_volume", "bbl/d"),
-        ("Gas", "gas_volume", "Mcf/d"),
-    )
-    for name, prefix, unit in prod_specs:
-        pts: List[Dict[str, Any]] = []
-        for label, suffix in (
-            ("baseline", "_baseline_mean"),
-            ("recent_avg", "_roll_mean"),
-            ("latest", "_latest"),
+# Narrative phrases → metric base names used in TrendAnalyzer / metrics_json.
+# Order in each tuple is preference when matching available metrics.
+_CHART_TOPIC_ALIASES: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...], str, str], ...] = (
+    # (phrases in text, metric bases, display name, unit)
+    (("discharge pressure", "pump discharge"), ("discharge_pressure",), "Discharge Pressure", "psi"),
+    (("motor temperature", "motor temp"), ("motor_temp",), "Motor Temperature", "°F"),
+    (("drive frequency", "vsd frequency", "esp frequency", "freq hz", "frequency"), ("drive_frequency", "freq_hz"), "Drive Frequency", "Hz"),
+    (("motor current", "amps", "amp draw"), ("motor_current",), "Motor Current", "A"),
+    (("motor voltage",), ("motor_voltage",), "Motor Voltage", "V"),
+    (("injection rate", "gas injection", "inject rate"), ("injection_rate",), "Injection Rate", ""),
+    (("injection pressure",), ("injection_pressure",), "Injection Pressure", "psi"),
+    (("injection temperature", "injection temp"), ("injection_temperature",), "Injection Temperature", "°F"),
+    (("water cut", "watercut", "water loading"), ("water_cut", "watercut"), "Water Cut", "%"),
+    (("pump fillage", "fillage", "pump loading", "underloading", "underload"), ("pump_fillage",), "Pump Fillage", "%"),
+    (("intake pressure", "pip ", "pump intake"), ("intake_pressure", "pump_intake_pressure"), "Intake Pressure", "psi"),
+    (("surface pressure",), ("surface_pressure",), "Surface Pressure", "psi"),
+    (("tubing pressure",), ("tubing_pressure",), "Tubing Pressure", "psi"),
+    (("casing pressure",), ("casing_pressure",), "Casing Pressure", "psi"),
+    (("vibration",), ("vibration", "vibration_x", "vibration_y"), "Vibration", ""),
+    (("spm", "strokes per minute", "stroke rate", "pumping speed"), ("strokes_per_minute", "spm"), "Strokes Per Minute", "SPM"),
+    (("stroke length",), ("stroke_length", "surface_stroke_length"), "Stroke Length", "in"),
+    (("polish rod", "rod load"), ("polish_rod_load",), "Polish Rod Load", ""),
+    (("torque",), ("torque",), "Torque", ""),
+    (("choke",), ("choke", "choke_size"), "Choke", ""),
+    (("bottomhole pressure", "bhp"), ("bottomhole_pressure",), "Bottomhole Pressure", "psi"),
+    (("downhole flow", "flow rate"), ("downhole_flow_rate",), "Downhole Flow Rate", ""),
+)
+
+
+def _recommendation_narrative_text(rec: Dict[str, Any]) -> str:
+    parts = [
+        rec.get("action"),
+        rec.get("analysis_description"),
+        rec.get("detailed_analysis"),
+        rec.get("sensor_evidence_description"),
+        rec.get("operational_interpretation_description"),
+        rec.get("recommended_next_step_description"),
+        rec.get("reason"),
+        rec.get("ml_action_hint"),
+        rec.get("expected_impact"),
+    ]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _metric_bases_available(metrics: Dict[str, Any]) -> set[str]:
+    bases: set[str] = set()
+    for key in metrics:
+        sk = str(key)
+        for suffix in (
+            "_roll_mean",
+            "_recent_30d_mean",
+            "_recent_30d_latest",
+            "_baseline_mean",
+            "_current_mean",
+            "_latest",
+            "_last",
+            "_avg",
+            "_mean",
+            "_slope",
+            "_trend",
         ):
-            p = _chart_point(label, metrics.get(f"{prefix}{suffix}") or metrics.get(f"{prefix}_current_mean"))
-            if p:
-                pts.append(p)
-        if len(pts) >= 2:
-            series.append({"name": name, "unit": unit, "points": pts})
-
-    sensor_keys = [
-        k
-        for k in metrics
-        if any(str(k).endswith(s) for s in ("_latest", "_roll_mean"))
-        and not any(str(k).startswith(p) for p in ("oil_volume", "gas_volume", "water_volume", "invoice", "chart"))
-    ][:6]
-    seen: set[str] = set()
-    for k in sensor_keys:
-        sk = str(k)
-        if sk.endswith("_roll_mean"):
-            base = sk.rsplit("_", 2)[0]
+            if sk.endswith(suffix):
+                bases.add(sk[: -len(suffix)])
+                break
         else:
-            base = sk.replace("_latest", "")
-        if base in seen:
-            continue
-        seen.add(base)
-        pts = []
-        for label, suffix in (("recent_avg", "_roll_mean"), ("latest", "_latest")):
-            p = _chart_point(label, metrics.get(f"{base}{suffix}"))
-            if p:
-                pts.append(p)
-        if len(pts) >= 2:
-            label = base.replace("_", " ").title()
-            series.append({"name": label, "unit": "", "points": pts})
+            bases.add(sk)
+    return bases
 
+
+def _series_points_for_base(metrics: Dict[str, Any], base: str) -> List[Dict[str, Any]]:
+    pts: List[Dict[str, Any]] = []
+    for label, suffixes in (
+        ("baseline", (f"{base}_baseline_mean", f"{base}_baseline")),
+        ("recent_avg", (f"{base}_roll_mean", f"{base}_recent_30d_mean", f"{base}_avg", f"{base}_mean", f"{base}_current_mean")),
+        ("latest", (f"{base}_latest", f"{base}_recent_30d_latest", f"{base}_last", base)),
+    ):
+        val = _first_chart_metric(metrics, suffixes)
+        if val is None:
+            continue
+        p = _chart_point(label, val)
+        if p and not any(x["label"] == label for x in pts):
+            pts.append(p)
+    return pts
+
+
+def _derived_water_cut_series(metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build water-cut series from oil+water rates when water_cut metric is absent."""
+    pts: List[Dict[str, Any]] = []
+    for label, oil_keys, water_keys in (
+        (
+            "recent_avg",
+            ("oil_volume_roll_mean", "oil_volume_recent_30d_mean", "oil_volume_avg", "oil_volume_mean"),
+            ("water_volume_roll_mean", "water_volume_recent_30d_mean", "water_volume_avg", "water_volume_mean"),
+        ),
+        (
+            "latest",
+            ("oil_volume_latest", "oil_volume_recent_30d_latest", "oil_volume_last", "oil_volume"),
+            ("water_volume_latest", "water_volume_recent_30d_latest", "water_volume_last", "water_volume"),
+        ),
+    ):
+        oil = _first_chart_metric(metrics, oil_keys)
+        water = _first_chart_metric(metrics, water_keys)
+        if oil is None or water is None:
+            continue
+        total = oil + water
+        if total <= 0:
+            continue
+        p = _chart_point(label, 100.0 * water / total)
+        if p:
+            pts.append(p)
+    if not pts:
+        return None
+    return {"name": "Water Cut", "unit": "%", "points": pts, "derived": True}
+
+
+def _topics_mentioned_in_text(text: str) -> List[Tuple[str, Tuple[str, ...], str, str]]:
+    """Return ordered list of (display_name, metric_bases, unit, match_phrase) found in narrative."""
+    found: List[Tuple[str, Tuple[str, ...], str, str]] = []
+    seen_names: set[str] = set()
+    for phrases, bases, display, unit in _CHART_TOPIC_ALIASES:
+        for phrase in phrases:
+            if phrase in text:
+                if display not in seen_names:
+                    found.append((display, bases, unit, phrase))
+                    seen_names.add(display)
+                break
+    return found
+
+
+def build_recommendation_chart_data(metrics: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build chart_data so graphed series match what the recommendation cites.
+
+    Example: if narrative says discharge pressure / motor temperature / drive frequency
+    drive the issue, those series are prioritized on the chart, with oil/water for context.
+    """
+    series: List[Dict[str, Any]] = []
+    highlighted: List[str] = []
+    available = _metric_bases_available(metrics)
+    narrative = _recommendation_narrative_text(rec)
+    topics = _topics_mentioned_in_text(narrative)
+
+    # 1) Primary drivers mentioned in the recommendation text.
+    for display, bases, unit, _phrase in topics:
+        if display == "Water Cut":
+            pts = None
+            for base in bases:
+                if base in available or any(str(k).startswith(base) for k in metrics):
+                    pts = _series_points_for_base(metrics, base)
+                    if pts:
+                        break
+            if not pts:
+                derived = _derived_water_cut_series(metrics)
+                if derived:
+                    series.append(derived)
+                    highlighted.append(display)
+            else:
+                series.append({"name": display, "unit": unit, "points": pts})
+                highlighted.append(display)
+            continue
+
+        pts = []
+        chosen_base = None
+        for base in bases:
+            if base in available or any(str(k).startswith(base + "_") or str(k) == base for k in metrics):
+                pts = _series_points_for_base(metrics, base)
+                if pts:
+                    chosen_base = base
+                    break
+        if pts:
+            series.append({"name": display, "unit": unit, "points": pts, "metric_base": chosen_base})
+            highlighted.append(display)
+
+    # 2) Always add oil/water (and gas if present) for production context.
+    wants_production_context = True
+    if any(w in narrative for w in ("injection", "water cut", "watercut", "oil", "production", "bbl")):
+        wants_production_context = True
+    if wants_production_context or not series:
+        for name, prefix, unit in (
+            ("Oil", "oil_volume", "bbl/d"),
+            ("Water", "water_volume", "bbl/d"),
+            ("Gas", "gas_volume", "Mcf/d"),
+        ):
+            if any(s.get("name") == name for s in series):
+                continue
+            pts = _production_chart_points(metrics, prefix)
+            if pts:
+                series.append({"name": name, "unit": unit, "points": pts, "context": True})
+
+    # 3) If narrative mentioned nothing usable, fall back to a few strong sensors.
+    if not highlighted:
+        fallback_order = (
+            "discharge_pressure",
+            "motor_temp",
+            "drive_frequency",
+            "freq_hz",
+            "motor_current",
+            "pump_fillage",
+            "injection_rate",
+            "intake_pressure",
+            "surface_pressure",
+            "tubing_pressure",
+        )
+        for base in fallback_order:
+            if len([s for s in series if not s.get("context")]) >= 4:
+                break
+            pts = _series_points_for_base(metrics, base)
+            if not pts:
+                continue
+            display = base.replace("_", " ").title()
+            if any(s.get("name") == display for s in series):
+                continue
+            series.append({"name": display, "unit": "", "points": pts})
+
+    # Cap total series for UI readability: highlighted first, then context.
+    if len(series) > 8:
+        primary = [s for s in series if not s.get("context")][:6]
+        context = [s for s in series if s.get("context")][:2]
+        series = primary + context
+
+    # Projected oil after recommended action — also added onto Oil series points
+    # so UIs that only plot series (recent_avg / latest) still show the uplift.
     projection = None
-    uplift = rec.get("production_increase_bbl_day")
-    oil_latest = metrics.get("oil_volume_latest") or metrics.get("oil_volume_roll_mean")
+    uplift = _chart_metric_float(rec.get("production_increase_bbl_day"))
+    if uplift is None or uplift <= 0:
+        uplift = _chart_metric_float(metrics.get("production_increase_bbl_day"))
+    oil_current = _first_chart_metric(
+        metrics,
+        (
+            "oil_volume_latest",
+            "oil_volume_recent_30d_latest",
+            "oil_volume_roll_mean",
+            "oil_volume_recent_30d_mean",
+            "oil_volume_avg",
+            "oil_volume_mean",
+            "oil_volume",
+        ),
+    )
     try:
-        if uplift and oil_latest:
+        if uplift is not None and uplift > 0 and oil_current is not None:
+            projected_val = round(float(oil_current) + float(uplift), 2)
+            current_val = round(float(oil_current), 2)
+            uplift_f = round(float(uplift), 2)
             projection = {
                 "name": "Projected oil after action",
-                "uplift_bbl_day": round(float(uplift), 2),
-                "current_bbl_day": round(float(oil_latest), 2),
-                "projected_bbl_day": round(float(oil_latest) + float(uplift), 2),
+                "uplift_bbl_day": uplift_f,
+                "current_bbl_day": current_val,
+                "projected_bbl_day": projected_val,
             }
+            oil_series = next((s for s in series if s.get("name") == "Oil"), None)
+            projected_point = {"label": "projected", "value": projected_val}
+            if oil_series is not None:
+                oil_series["points"] = [
+                    p for p in oil_series.get("points") or [] if p.get("label") != "projected"
+                ]
+                oil_series["points"].append(projected_point)
+            else:
+                series.insert(
+                    0,
+                    {
+                        "name": "Oil",
+                        "unit": "bbl/d",
+                        "points": [
+                            {"label": "latest", "value": current_val},
+                            projected_point,
+                        ],
+                        "context": True,
+                    },
+                )
     except Exception:
         projection = None
+
+    # Never plot model-internal metrics as if they were field sensors.
+    series = [
+        s
+        for s in series
+        if "reconstruction" not in str(s.get("name") or "").lower()
+        and "reconstruction" not in str(s.get("metric_base") or "").lower()
+    ]
+
+    created_at = rec.get("created_at") or rec.get("updated_at")
+    data_as_of = None
+    for key in (
+        "metrics_as_of",
+        "as_of_date",
+        "data_as_of",
+        "latest_date",
+        "window_end",
+        "production_as_of",
+    ):
+        if metrics.get(key):
+            data_as_of = str(metrics.get(key))[:10]
+            break
+    if not data_as_of and created_at:
+        data_as_of = str(created_at)[:10]
+
+    story = None
+    if highlighted:
+        story = (
+            "Primary drivers on this chart: "
+            + ", ".join(highlighted)
+            + ". Oil/water included for production context when available."
+        )
 
     return {
         "series": series,
         "projection": projection,
+        "highlighted_parameters": highlighted,
+        "story": story,
         "issue": rec.get("action"),
         "recommended_action": rec.get("analysis_description"),
+        "well_id": rec.get("well_id"),
+        "snapshot": {
+            "recommendation_created_at": created_at,
+            "data_as_of": data_as_of,
+            "continuously_updated": False,
+            "note": (
+                "This chart is a snapshot of sensor/production values available when the "
+                "recommendation was generated. It is not live-updated afterward, so it should "
+                "not contain data after the recommendation date."
+            ),
+        },
     }
 
 
 def apply_chart_data(rec: Dict[str, Any]) -> None:
-    """Set top-level chart_data (JSON string). Does not modify metrics_json contents."""
-    metrics = rec.get("metrics") if isinstance(rec.get("metrics"), dict) else {}
-    # Never keep a nested copy inside metrics — chart_data is its own column.
-    if isinstance(metrics, dict) and "chart_data" in metrics:
-        metrics = {k: v for k, v in metrics.items() if k != "chart_data"}
-        rec["metrics"] = metrics
-    chart = build_recommendation_chart_data(metrics, rec)
-    if chart.get("series"):
-        rec["chart_data"] = json.dumps(to_native_type(chart), default=str)
-    else:
-        rec.setdefault("chart_data", None)
+    """Set top-level chart_data (JSON string) for every recommendation row."""
+    flat_metrics = flatten_recommendation_metrics(rec)
+    if flat_metrics:
+        rec["metrics"] = flat_metrics
+    chart = build_recommendation_chart_data(flat_metrics, rec)
+    rec["chart_data"] = json.dumps(to_native_type(chart), default=str)
 
 
 def finalize_analysis_fields(rec: Dict[str, Any]) -> None:
@@ -1502,6 +1848,11 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         if row.get("updated_at") is None:
             row["updated_at"] = row.get("created_at")
 
+        if r.get("metrics") is not None:
+            row["metrics"] = r.get("metrics")
+        if not row.get("metrics_json") and r.get("metrics_json"):
+            row["metrics_json"] = r.get("metrics_json")
+
         # Ensure metric description fields are always present in parquet output.
         apply_metric_descriptions(row)
         if any(
@@ -1514,6 +1865,10 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
             )
         ):
             apply_analysis_description(row)
+
+        # Always (re)build chart_data for every row — all orgs / all write paths.
+        apply_chart_data(row)
+
         # Backfill model alternation + citations when missing (production UI fields).
         if any(
             not row.get(k)
@@ -1526,7 +1881,7 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         ):
             apply_alternatives_and_citations(row)
 
-        metrics_val = r.get("metrics")
+        metrics_val = row.get("metrics") if isinstance(row.get("metrics"), dict) else r.get("metrics")
         if isinstance(metrics_val, dict) and "chart_data" in metrics_val:
             metrics_val = {k: v for k, v in metrics_val.items() if k != "chart_data"}
         if metrics_val is not None:
@@ -1535,17 +1890,16 @@ def write_operations_recommendations_to_s3(recommendations: List[Dict[str, Any]]
         elif row.get("metrics_json") is None:
             row["metrics_json"] = None
 
-        # Dedicated chart_data column (JSON string), separate from metrics_json.
-        chart_val = r.get("chart_data")
-        if chart_val is None and isinstance(r.get("metrics"), dict):
-            apply_chart_data(r)
-            chart_val = r.get("chart_data")
+        chart_val = row.get("chart_data")
         if isinstance(chart_val, (dict, list)):
             row["chart_data"] = json.dumps(to_native_type(chart_val), default=str)
         elif chart_val is not None:
             row["chart_data"] = str(chart_val)
         else:
-            row["chart_data"] = None
+            row["chart_data"] = json.dumps(
+                {"series": [], "projection": None, "issue": row.get("action"), "recommended_action": row.get("analysis_description"), "well_id": row.get("well_id")},
+                default=str,
+            )
 
         # Round all numeric fields to 2 decimal places
         for field in _NUMERIC_FIELDS:

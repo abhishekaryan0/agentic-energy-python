@@ -157,28 +157,73 @@ def _history_row_from_snowflake(
         row.update(
             {
                 "allocated_oil": _float_or_none(
-                    h.get("allocated_oil") or h.get("oil_volume")
+                    h.get("allocated_oil")
+                    or h.get("oil_volume")
+                    or h.get("allocated_oil_bbl")
+                    or h.get("gross_oil_production_bbl")
                 ),
-                "test_oil": _float_or_none(h.get("test_oil")),
+                "test_oil": _float_or_none(
+                    h.get("test_oil") or h.get("test_oil_bopd") or h.get("well_test_rate_bopd")
+                ),
                 "avg_tubing_pressure": _float_or_none(
-                    h.get("avg_tubing_pressure") or h.get("tubing_pressure")
+                    h.get("avg_tubing_pressure")
+                    or h.get("tubing_pressure")
+                    or h.get("tubing_pressure_psi")
+                    or h.get("wellhead_tubing_pressure_psi")
+                    or h.get("flowing_tubing_pressure_psi")
                 ),
                 "avg_casing_pressure": _float_or_none(
-                    h.get("avg_casing_pressure") or h.get("casing_pressure")
+                    h.get("avg_casing_pressure")
+                    or h.get("casing_pressure")
+                    or h.get("casing_pressure_psi")
+                    or h.get("annular_casing_pressure_psi")
                 ),
                 "avg_motor_amps": _float_or_none(
-                    h.get("avg_motor_amps") or h.get("motor_current")
+                    h.get("avg_motor_amps")
+                    or h.get("motor_current")
+                    or h.get("motor_current_amps")
+                    or h.get("surface_motor_amperage")
+                    or h.get("motor_load_amps")
                 ),
-                "gross_stroke_len": _float_or_none(h.get("gross_stroke_len")),
-                "net_stroke_len": _float_or_none(h.get("net_stroke_len")),
-                "spm": _float_or_none(h.get("spm") or h.get("strokes_per_minute")),
+                "gross_stroke_len": _float_or_none(
+                    h.get("gross_stroke_len") or h.get("gross_stroke_length_in")
+                    or h.get("polished_rod_stroke_length_in")
+                ),
+                "net_stroke_len": _float_or_none(
+                    h.get("net_stroke_len") or h.get("net_stroke_length_in")
+                    or h.get("effective_plunger_stroke_in")
+                ),
+                "spm": _float_or_none(
+                    h.get("spm") or h.get("strokes_per_minute") or h.get("strokes_per_min")
+                    or h.get("pumping_speed_spm")
+                ),
                 "pump_fillage_pct": _float_or_none(
-                    h.get("pump_fillage_pct") or h.get("pump_fillage")
+                    h.get("pump_fillage_pct")
+                    or h.get("pump_fillage")
+                    or h.get("volumetric_efficiency_pct")
                 ),
-                "freq_hz": _float_or_none(h.get("freq_hz") or h.get("drive_frequency")),
-                "pump_intake_pressure": _float_or_none(h.get("pump_intake_pressure")),
-                "motor_temp_f": _float_or_none(h.get("motor_temp_f") or h.get("motor_temp")),
-                "injection_rate_mcf": _float_or_none(h.get("injection_rate_mcf")),
+                "freq_hz": _float_or_none(
+                    h.get("freq_hz")
+                    or h.get("drive_frequency")
+                    or h.get("motor_drive_frequency_hz")
+                    or h.get("vfd_output_frequency_hz")
+                ),
+                "pump_intake_pressure": _float_or_none(
+                    h.get("pump_intake_pressure")
+                    or h.get("pump_intake_pressure_psi")
+                    or h.get("downhole_pump_intake_psi")
+                ),
+                "motor_temp_f": _float_or_none(
+                    h.get("motor_temp_f")
+                    or h.get("motor_temp")
+                    or h.get("motor_winding_temp_f")
+                    or h.get("gearbox_motor_temp_f")
+                ),
+                "injection_rate_mcf": _float_or_none(
+                    h.get("injection_rate_mcf")
+                    or h.get("injection_rate_mscfd")
+                    or h.get("lift_gas_rate_mscfd")
+                ),
             }
         )
     return row

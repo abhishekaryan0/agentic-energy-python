@@ -625,6 +625,9 @@ def dataframe_to_anomaly_review_rows(df: pd.DataFrame, organization_id: str) -> 
 
 
 def dataframe_to_operation_recommendation_rows(df: pd.DataFrame, organization_id: str) -> List[Dict[str, Any]]:
+    if "chart_data" not in df.columns:
+        df = df.copy()
+        df["chart_data"] = None
     return _build_rows(
         df,
         organization_id,

@@ -77,3 +77,27 @@ aws lambda invoke --function-name red-buff --region us-east-1 \
 | `snowflake_io.py` / `column_maps.py` | Schema + mapping via `transformations.columns` |
 | `generate_digital_twin.py` | Twin engine |
 | `deploy/` | ECR + Lambda + EventBridge |
+
+## V2 (same layout as STEP v2 → Snowflake `*_V2`)
+
+100-well RBNR V2 twin in `RED_BUFF/v2/` (local `generate_digital_twin.py`, not `RBNR_V2_Master_build.py`).  
+Org UUID on every row; tables suffixed `_V2` in `SENSOR_DATA`.
+
+```bash
+# Local
+python3 -m RED_BUFF.v2.run_incremental_snowflake
+python3 -m RED_BUFF.v2.run_incremental_snowflake --reset
+
+# ECR + Lambda
+./RED_BUFF/v2/deploy/deploy.sh
+./RED_BUFF/v2/deploy/run_full_backfill.sh   # all 100 wells (batched)
+./RED_BUFF/v2/deploy/schedule.sh           # daily incremental 00:15 UTC
+```
+
+| Item | Value |
+|------|--------|
+| Lambda | `red-buff-v2` |
+| ECR | `red-buff-v2-lambda` |
+| Handler | `RED_BUFF.v2.handler.handler` |
+| Schedule | `red-buff-v2-daily` → `cron(15 0 * * ? *)` |
+| Tables | `WELL_DAILY_PRODUCTION_V2`, `WELL_SENSOR_READINGS_V2`, `SYNTH_*_V2`, `SYNTH_REVENUE_V2` |

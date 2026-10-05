@@ -63,13 +63,17 @@ def generate_chart_config(
             detection_date = str(detection_date)
         else:
             detection_date = extract_detection_date(anomaly_data)
+
+        # Never chart "future" days after the recommendation/detection date.
+        df = _clip_dataframe_to_as_of(df, detection_date)
         
         # Route to anomaly-specific chart generators
         if anomaly_code == "MECHANICAL_FAILURE" or chart_metric == "mechanical_failure_view":
             return generate_mechanical_failure_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
 
-        if anomaly_code == "ML_PATTERN_ANOMALY" and "reconstruction_error" in df.columns:
-            return generate_ml_reconstruction_chart(df, anomaly_data, detection_date, chart_payload)
+        # ML pattern anomalies: show the sensors that drive the finding (not only reconstruction error).
+        if anomaly_code == "ML_PATTERN_ANOMALY":
+            return generate_ml_driver_sensor_chart(df, anomaly_data, detection_date, chart_payload)
 
         if chart_metric == "monthly_production":
             return generate_monthly_decline_chart(df, anomaly_data, detection_date, severity_metrics, chart_payload)
@@ -95,13 +99,72 @@ def generate_chart_config(
 # HELPER FUNCTIONS
 # =============================================================================
 
+def _clip_dataframe_to_as_of(df: pd.DataFrame, as_of_date: Optional[str]) -> pd.DataFrame:
+    """Keep only rows on/before as_of_date so charts cannot show data after the recommendation."""
+    if df is None or df.empty or not as_of_date:
+        return df
+    try:
+        as_of = pd.to_datetime(str(as_of_date)[:10])
+        ts = pd.to_datetime(df["timestamp"])
+        return df.loc[ts.dt.normalize() <= as_of.normalize()].copy()
+    except Exception:
+        return df
+
+
 def extract_detection_date(anomaly_data: str) -> Optional[str]:
     """Extract detection date from anomaly data string."""
-    match = re.search(r'(\d{4}-\d{2}-\d{2})', anomaly_data)
+    match = re.search(r'(\d{4}-\d{2}-\d{2})', anomaly_data or "")
     return match.group(1) if match else None
 
 
-def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict = None) -> Tuple[pd.DataFrame, List[str]]:
+def _parse_driver_sensor_columns(text: str, available_columns) -> List[str]:
+    """
+    Map narrative / feature-attribution text to dataframe column names.
+    Handles forms like: 'Discharge Pressure (42%), Motor Temp (30%)' or plain sensor names.
+    """
+    available = {str(c).lower(): str(c) for c in available_columns}
+    aliases = {
+        "discharge pressure": "discharge_pressure",
+        "motor temperature": "motor_temp",
+        "motor temp": "motor_temp",
+        "drive frequency": "drive_frequency",
+        "freq hz": "freq_hz",
+        "frequency": "drive_frequency",
+        "motor current": "motor_current",
+        "amps": "motor_current",
+        "injection rate": "injection_rate",
+        "injection pressure": "injection_pressure",
+        "water cut": "water_cut",
+        "pump fillage": "pump_fillage",
+        "fillage": "pump_fillage",
+        "intake pressure": "intake_pressure",
+        "tubing pressure": "tubing_pressure",
+        "casing pressure": "casing_pressure",
+        "surface pressure": "surface_pressure",
+        "strokes per minute": "strokes_per_minute",
+        "spm": "strokes_per_minute",
+        "oil volume": "oil_volume",
+        "water volume": "water_volume",
+        "gas volume": "gas_volume",
+    }
+    found: List[str] = []
+    raw = (text or "").lower()
+
+    # Prefer explicit "Name (NN%)" attribution fragments first.
+    for match in re.finditer(r"([a-z0-9][a-z0-9\s/_-]{1,40}?)\s*\(\d{1,3}%\)", raw):
+        phrase = match.group(1).strip()
+        col = aliases.get(phrase) or phrase.replace(" ", "_").replace("/", "_")
+        if col in available and available[col] not in found:
+            found.append(available[col])
+
+    for phrase, col in aliases.items():
+        if phrase in raw and col in available and available[col] not in found:
+            found.append(available[col])
+
+    return found[:4]
+
+
+def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict = None, as_of_date: Optional[str] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Aggregate data to daily level for charting.
     
@@ -109,11 +172,22 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict
         df: Input DataFrame
         days: Number of days to include
         custom_agg: Optional dictionary to override default aggregation (e.g., {'pump_fillage': 'min'})
+        as_of_date: Optional YYYY-MM-DD; chart window ends on this date (no future points)
         
     Returns:
         Tuple of (aggregated DataFrame, labels list)
     """
-    start_date = df['timestamp'].max() - pd.Timedelta(days=days)
+    df = _clip_dataframe_to_as_of(df, as_of_date)
+    if df.empty:
+        return df, []
+
+    end_ts = df['timestamp'].max()
+    if as_of_date:
+        try:
+            end_ts = min(end_ts, pd.to_datetime(str(as_of_date)[:10]) + pd.Timedelta(hours=23, minutes=59))
+        except Exception:
+            pass
+    start_date = end_ts - pd.Timedelta(days=days)
     recent_df = df[df['timestamp'] >= start_date].copy()
     
     agg_dict = {}
@@ -122,7 +196,9 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict
             agg_dict[col] = 'mean'
     
     for col in ['tubing_pressure', 'motor_current', 'strokes_per_minute', 
-                'pump_fillage', 'injection_rate', 'casing_pressure', 'predicted_oil', 'tp_std']:
+                'pump_fillage', 'injection_rate', 'casing_pressure', 'predicted_oil', 'tp_std',
+                'discharge_pressure', 'motor_temp', 'drive_frequency', 'freq_hz',
+                'intake_pressure', 'surface_pressure', 'injection_pressure']:
         if col in df.columns:
             agg_dict[col] = 'mean'
             
@@ -132,6 +208,9 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict
             if col in df.columns:
                 agg_dict[col] = method
     
+    if not agg_dict:
+        return pd.DataFrame(), []
+
     daily_df = recent_df.groupby('date_only').agg(agg_dict).reset_index()
     daily_df.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in daily_df.columns]
     
@@ -140,10 +219,9 @@ def prepare_daily_aggregation(df: pd.DataFrame, days: int = 60, custom_agg: Dict
             daily_df.rename(columns={col: col.replace('_mean', '')}, inplace=True)
 
     # Smart renaming for min/max: Only rename to base if no other variant exists
-    for col in daily_df.columns:
+    for col in list(daily_df.columns):
         if col.endswith('_min'):
             base = col[:-4] # strip _min
-            # Only rename if base doesn't exist and no siblings (like _max) exist
             siblings = [c for c in daily_df.columns if c.startswith(base) and c != col]
             if base not in daily_df.columns and not any(c.startswith(base) for c in siblings):
                 daily_df.rename(columns={col: base}, inplace=True)
@@ -624,21 +702,194 @@ def generate_monthly_decline_chart(
     }
 
 
+def generate_ml_driver_sensor_chart(
+    df: pd.DataFrame,
+    anomaly_data: str,
+    detection_date: str,
+    chart_payload: Dict = None,
+) -> Dict:
+    """
+    ML pattern anomaly chart: plot the sensors that drive the finding.
+
+    Priority:
+    1) Top contributing sensors from model attribution / narrative
+    2) Oil / water for context
+    3) Reconstruction error only as a secondary reference series (not the only story)
+    Chart window ends on detection_date (no future points).
+    """
+    chart_payload = chart_payload or {}
+    df = _clip_dataframe_to_as_of(df, detection_date)
+    if df.empty:
+        return create_fallback_chart(df, "No data as of recommendation date")
+
+    attribution = (
+        chart_payload.get("top_contributing_features")
+        or chart_payload.get("top_contributing_sensors")
+        or ""
+    )
+    search_text = f"{attribution}\n{anomaly_data or ''}"
+    driver_cols = _parse_driver_sensor_columns(search_text, df.columns)
+
+    custom_agg = {c: "mean" for c in driver_cols}
+    for prod in ("oil_volume", "water_volume"):
+        if prod in df.columns:
+            custom_agg[prod] = "mean"
+    if "reconstruction_error" in df.columns:
+        custom_agg["reconstruction_error"] = "max"
+
+    daily_df, labels = prepare_daily_aggregation(
+        df, days=60, custom_agg=custom_agg or None, as_of_date=detection_date
+    )
+    if not labels:
+        return create_fallback_chart(df, "No chartable daily data")
+
+    palette = [
+        CHART_COLORS.get("alert", "#dc2626"),
+        CHART_COLORS.get("warning", "#f59e0b"),
+        CHART_COLORS.get("predicted", "#64748b"),
+        "#7c3aed",
+        "#0891b2",
+    ]
+    datasets = []
+    highlighted = []
+    for i, col in enumerate(driver_cols):
+        if col not in daily_df.columns:
+            continue
+        label = col.replace("_", " ").title()
+        highlighted.append(label)
+        datasets.append(
+            {
+                "label": label,
+                "data": pd.to_numeric(daily_df[col], errors="coerce").fillna(0).round(2).tolist(),
+                "borderColor": palette[i % len(palette)],
+                "backgroundColor": "transparent",
+                "borderWidth": 2,
+                "yAxisID": "y",
+                "tension": 0.2,
+            }
+        )
+
+    # Production context
+    if "oil_volume" in daily_df.columns:
+        datasets.append(
+            {
+                "label": "Oil (bbl/day)",
+                "data": pd.to_numeric(daily_df["oil_volume"], errors="coerce").fillna(0).round(1).tolist(),
+                "borderColor": CHART_COLORS.get("oil", "#2563eb"),
+                "backgroundColor": "rgba(37, 99, 235, 0.08)",
+                "borderWidth": 2,
+                "fill": False,
+                "yAxisID": "y1",
+                "tension": 0.2,
+            }
+        )
+    if "water_volume" in daily_df.columns and (
+        "water" in search_text.lower() or "injection" in search_text.lower() or not datasets
+    ):
+        datasets.append(
+            {
+                "label": "Water (bbl/day)",
+                "data": pd.to_numeric(daily_df["water_volume"], errors="coerce").fillna(0).round(1).tolist(),
+                "borderColor": "#0ea5e9",
+                "backgroundColor": "transparent",
+                "borderWidth": 1.5,
+                "borderDash": [4, 3],
+                "yAxisID": "y1",
+                "tension": 0.2,
+            }
+        )
+
+    # If we still have no driver sensors, fall back to reconstruction-only view.
+    if not any(d.get("yAxisID") == "y" for d in datasets) and "reconstruction_error" in daily_df.columns:
+        return generate_ml_reconstruction_chart(df, anomaly_data, detection_date, chart_payload)
+
+    if "reconstruction_error" in daily_df.columns and datasets:
+        datasets.append(
+            {
+                "label": "Reconstruction error (reference)",
+                "data": pd.to_numeric(daily_df["reconstruction_error"], errors="coerce").fillna(0).round(1).tolist(),
+                "borderColor": "#94a3b8",
+                "borderWidth": 1,
+                "borderDash": [6, 4],
+                "pointRadius": 0,
+                "yAxisID": "y2",
+                "fill": False,
+            }
+        )
+
+    annotations = _filter_annotations([create_anomaly_zone_annotation(detection_date, labels)])
+    options = get_common_options()
+    if annotations:
+        options["plugins"]["annotation"] = {"annotations": annotations}
+
+    driver_text = ", ".join(highlighted) if highlighted else "key sensors"
+    as_of = detection_date or "recommendation date"
+    options["plugins"]["title"] = {
+        "display": True,
+        "text": f"Sensors driving this recommendation ({driver_text})",
+        "font": {"size": 16, "weight": "bold"},
+    }
+    options["plugins"]["subtitle"] = {
+        "display": True,
+        "text": (
+            f"Chart data ends on {as_of} (recommendation/detection date). "
+            "Series match the sensors named in the finding so you can verify the relationship visually."
+        ),
+        "font": {"size": 11},
+        "color": "#64748b",
+    }
+    options["scales"]["y"] = {
+        "type": "linear",
+        "position": "left",
+        "title": {"display": True, "text": "Sensor values"},
+        "grid": {"color": CHART_COLORS["grid"]},
+    }
+    options["scales"]["y1"] = {
+        "type": "linear",
+        "position": "right",
+        "title": {"display": True, "text": "Production (bbl/day)"},
+        "grid": {"drawOnChartArea": False},
+    }
+    if any(d.get("yAxisID") == "y2" for d in datasets):
+        options["scales"]["y2"] = {
+            "type": "linear",
+            "position": "right",
+            "display": False,
+            "grid": {"drawOnChartArea": False},
+        }
+
+    return {
+        "type": "line",
+        "data": {"labels": labels, "datasets": datasets},
+        "options": options,
+        "meta": {
+            "highlighted_parameters": highlighted,
+            "recommendation_date": detection_date,
+            "data_as_of": labels[-1] if labels else detection_date,
+            "continuously_updated": False,
+            "note": "Snapshot as of recommendation/detection date; not live-updating after creation.",
+        },
+    }
+
+
 def generate_ml_reconstruction_chart(
     df: pd.DataFrame,
     anomaly_data: str,
     detection_date: str,
     chart_payload: Dict = None,
 ) -> Dict:
-    """Reconstruction error over time with threshold line. Used for ML_PATTERN_ANOMALY so the chart shows what was actually flagged."""
+    """Fallback: reconstruction error only when driver sensors are unavailable."""
     chart_payload = chart_payload or {}
     threshold = chart_payload.get("threshold")
     if threshold is None:
         threshold = 0.0
     threshold = float(threshold)
 
+    df = _clip_dataframe_to_as_of(df, detection_date)
     df = df.copy()
     df["date_only"] = pd.to_datetime(df["timestamp"]).dt.date
+    if "reconstruction_error" not in df.columns:
+        return create_fallback_chart(df, "No reconstruction error data")
     daily = (
         df.groupby("date_only")["reconstruction_error"]
         .max()
@@ -656,9 +907,13 @@ def generate_ml_reconstruction_chart(
         "text": "How much does the sensor pattern match 'normal'?",
         "font": {"size": 16, "weight": "bold"},
     }
+    as_of = detection_date or (labels[-1] if labels else "n/a")
     options["plugins"]["subtitle"] = {
         "display": True,
-        "text": f"Reconstruction error = how much today's sensor pattern deviates from the learned normal. Values above the red line ({threshold:,.0f}) mean the well is behaving unusually—see the report for which sensors to check.",
+        "text": (
+            f"Data through {as_of}. Reconstruction error = deviation from learned normal. "
+            f"Values above the red line ({threshold:,.0f}) mean unusual behavior."
+        ),
         "font": {"size": 11},
         "color": "#64748b",
     }
@@ -698,6 +953,11 @@ def generate_ml_reconstruction_chart(
             ],
         },
         "options": options,
+        "meta": {
+            "recommendation_date": detection_date,
+            "data_as_of": labels[-1] if labels else detection_date,
+            "continuously_updated": False,
+        },
     }
 
 

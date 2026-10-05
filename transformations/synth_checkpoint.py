@@ -33,8 +33,13 @@ class SynthExportCheckpoint:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 
-def checkpoint_s3_key(org_id: str) -> str:
-    return f"{org_id.strip()}/synth_export/_state/export_checkpoint.json"
+def checkpoint_s3_key(org_id: str, *, data_version: str = "v1") -> str:
+    from transformations.config import normalize_data_version
+
+    org = org_id.strip()
+    if normalize_data_version(data_version) == "v2":
+        return f"{org}/v2/synth_export/_state/export_checkpoint.json"
+    return f"{org}/synth_export/_state/export_checkpoint.json"
 
 
 def load_synth_checkpoint(
@@ -42,10 +47,15 @@ def load_synth_checkpoint(
     org_id: str,
     *,
     region_name: Optional[str] = None,
+    data_version: str = "v1",
 ) -> Optional[SynthExportCheckpoint]:
     from transformations.s3 import read_s3_json
 
-    data = read_s3_json(bucket, checkpoint_s3_key(org_id), region_name=region_name)
+    data = read_s3_json(
+        bucket,
+        checkpoint_s3_key(org_id, data_version=data_version),
+        region_name=region_name,
+    )
     if not data:
         return None
     cp = SynthExportCheckpoint.from_dict(data)
@@ -60,11 +70,12 @@ def save_synth_checkpoint(
     cp: SynthExportCheckpoint,
     *,
     region_name: Optional[str] = None,
+    data_version: str = "v1",
 ) -> str:
     from transformations.s3 import write_s3_json
 
     cp.last_run_at = datetime.now(timezone.utc).isoformat()
-    key = checkpoint_s3_key(cp.organization_id)
+    key = checkpoint_s3_key(cp.organization_id, data_version=data_version)
     write_s3_json(bucket, key, cp.to_dict(), region_name=region_name)
     return f"s3://{bucket}/{key}"
 

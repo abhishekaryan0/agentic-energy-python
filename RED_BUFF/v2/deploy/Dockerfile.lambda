@@ -1,0 +1,11 @@
+# Container image for AWS Lambda: RED_BUFF V2 synthetic data → Snowflake *_V2 tables.
+FROM public.ecr.aws/lambda/python:3.11
+
+COPY RED_BUFF/v2/deploy/requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY RED_BUFF ${LAMBDA_TASK_ROOT}/RED_BUFF
+
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+CMD ["RED_BUFF.v2.handler.handler"]

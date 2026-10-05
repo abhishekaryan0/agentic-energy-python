@@ -89,4 +89,68 @@ SOUTH_TEXAS_ENERGY_PARTNERS/
   run_incremental_snowflake.py
   handler.py
   deploy/
+  v2/                        # STEP V2 (*_V2 tables, native V2 fields)
+    tables/                  # one file per Snowflake table
+    pipeline.py
+    snowflake_io.py
+    run_incremental_snowflake.py
 ```
+
+## STEP V2 (same layout & pipeline as v1 → Snowflake `*_V2`)
+
+Same structure as v1 (`generate_digital_twin` → Snowflake). Twin engine lives in
+`v2/generate_digital_twin.py`. **Every row includes `organization_id`**.  
+Tables are suffixed `_V2`.
+
+```bash
+# Same commands as v1
+python3 -m SOUTH_TEXAS_ENERGY_PARTNERS.v2.run_incremental_snowflake
+python3 -m SOUTH_TEXAS_ENERGY_PARTNERS.v2.run_incremental_snowflake --reset
+```
+
+### Deploy (Lambda + ECR) — generate all V2 data
+
+```bash
+# Build/push image + create/update Lambda
+./SOUTH_TEXAS_ENERGY_PARTNERS/v2/deploy/deploy.sh
+
+# Full backfill of all 100 wells into *_V2 (batched Lambda invokes)
+./SOUTH_TEXAS_ENERGY_PARTNERS/v2/deploy/run_full_backfill.sh
+
+# Daily incremental schedule (00:45 UTC)
+./SOUTH_TEXAS_ENERGY_PARTNERS/v2/deploy/schedule.sh
+```
+
+| Item | Value |
+|------|--------|
+| Lambda | `south-texas-energy-partners-v2` |
+| ECR | `south-texas-step-v2-lambda` |
+| Handler | `SOUTH_TEXAS_ENERGY_PARTNERS.v2.handler.handler` |
+| Schedule | `south-texas-step-v2-daily` → `cron(45 0 * * ? *)` |
+
+Full load uses batched invokes (`well_offset` / `well_limit`) because one Lambda cannot finish all 100 wells in 15 minutes.
+
+```
+v2/
+  generate_digital_twin.py   # twin engine (like v1)
+  invoice_gen.py
+  master_assets.py
+  pipeline.py
+  snowflake_io.py
+  column/table modules in tables/
+  run_incremental_snowflake.py
+  handler.py
+```
+
+| V2 table | Contents |
+|----------|----------|
+| `WELL_DAILY_PRODUCTION_V2` | V2 volumes + `organization_id` |
+| `WELL_SENSOR_READINGS_V2` | Native sensors + `organization_id` |
+| `SYNTH_ASSETS_V2` | WI, NRI, lease_type + `organization_id` |
+| `SYNTH_PERSONNEL_V2` | Personnel + `organization_id` |
+| `SYNTH_ASSET_DAILY_HISTORY_V2` | Full history JSON + `organization_id` |
+| `SYNTH_INVOICES_V2` | Invoices + `organization_id` |
+| `SYNTH_REVENUE_V2` | Revenue ledger + `organization_id` |
+| `SYNTH_PIPELINE_STATE_V2` | Incremental registry |
+
+Env: `STEP_ORGANIZATION_ID`, `STEP_V2_SNOWFLAKE_SCHEMA` (default `SOUTH_TEXAS_SENSOR_DATA`).

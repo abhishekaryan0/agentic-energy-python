@@ -1,95 +1,48 @@
 """
-STEP V2 — Self-Contained Build Script
-======================================
-Generates STEP_V2_Master.json from scratch. No input file needed.
+STEP V2 digital twin engine — same role as v1 generate_digital_twin.py.
 
-Run:  python3 STEP_V2_Master_build.py
-Reqs: Python 3, numpy  (pip install numpy)
-
-Output: STEP_V2_Master.json (~575 MB). Verifies BEFORE writing; exits 1 on failure.
-
-What this produces:
-  South Texas Energy Partners — V2 Extended Dataset
-  - 100 wells across 5 leases (Bravo, Maverick, Carrizo, Cotulla, Pearsall)
-  - 120 total assets including 20 supporting assets
-  - 14-19 year well histories (2008-2026)
-  - ~5-17 failure events per well (median ~10), sensor-driven, across 25 failure
-    modes including rod-string wear and rod parts on the beam-pump wells
-  - Genuinely CONCURRENT failures: ~1 episode in 3 grows a second mode from a
-    different family partway through, degrading alongside the first. Both write
-    to the same sensors on the same day (deltas summed off baseline), so the
-    signatures are superposed, not sequential
-  - 10 clean wells (2 per lease: 1 ESP + 1 Gas Lift), scattered through each
-    lease's well-number block. They have NO failure physics, but they are not
-    100% uptime and not free of workover spend: like every other well they take
-    ordinary non-failure downtime and carry scheduled preventive service, so
-    neither run_status nor the financial ledger identifies them
-  - 55 ESP pump curves (Centrilift GN5600, REDA D3000N, Centrilift FC1200)
-  - ~26,000 invoices (Monthly LOE + Workover) with correct WI math
-  - Monthly revenue ledger per well, derived from that well's own produced
-    volumes: Gulf Coast (LLS/MEH) oil at a premium to WTI Cushing, Houston Ship
-    Channel gas, NGLs off a rich Eagle Ford yield, less Texas severance, ad
-    valorem and midstream deducts. volume x price ties out on all three streams
-    (use residue_gas_mcf for the gas line, not wet gas_volume_mcf)
-  - Monthly revenue ledger per well, derived from that well's own produced
-    volumes: Gulf Coast (LLS/MEH) oil, Houston Ship Channel gas, NGLs off a
-    rich Eagle Ford yield, less Texas severance, ad valorem and midstream
-  - Failures running through July 8, 2026
-  - No failure labels anywhere in the payload. There is no scenario field, no
-    root description, and no free-text hint of a failure mode; the build asserts
-    that no mode name appears anywhere in the assembled JSON. Workover invoice
-    descriptions are generic and carry no outage length. Detection must come
-    from sensor behaviour alone
-  - No pre-computed fields
-  - organization_id: SOUTH_TEXAS_ENERGY_PARTNERS
-  - Tank battery is production-coupled: oil/water inflow comes from the lease's
-    own wells and run tickets reconcile with production (mass balance closes);
-    high_level_alarm is driven by real hauling disruptions
-  - Sensors are AR(1) correlated day to day (lag-1 ~0.85), not independent draws
-  - Decline has a smooth, per-well randomised secondary rolloff — no step cliff
-  - South Texas seasonality on ambient-influenced sensors, plus four historical
-    hard-freeze curtailment events including Winter Storm Uri (Feb 2021).
-    Freeze days carry run_status CURTAILED, distinct from failure SHUT-IN
-  - All four supporting asset types take maintenance downtime (run_status DOWN):
-    Facility, Compressor, SWD Well and Tank Battery. On the battery, DOWN means
-    the oil custody-transfer train is out: oil run tickets are zero and stock
-    tank inventory backs up, while water disposal continues on its own system
-  - SWD injection pressure climbs with cumulative disposal and is relieved by
-    periodic acid stimulations (stimulation_performed flag)
-  - Invoice costs are driven by fluid volumes, well age, lift type, job scope
-    and downtime, indexed to the service-cost cycle 2008-2026
-  - Working interest varies by lease (0.500-1.000); NRI is derived as
-    WI*(1-royalty), never hardcoded
-  - Every history row on every asset type carries row-level organization_id
-    and timestamp (date at 00:00:00) via stamp() — one schema across all
-    120 assets. Rows are daily; timestamp adds no sub-daily resolution.
+Used by v2/pipeline.py to generate wells/supporting history directly into
+Snowflake (*_V2 tables). Does not write STEP_V2_Master.json.
 """
 
-import json, os, sys, math, random, collections, numpy as np
+from __future__ import annotations
+
+import collections
+import math
+import os
+import random
+import sys
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from collections import defaultdict, Counter
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+
+import numpy as np
+
+_V2_DIR = Path(__file__).resolve().parent
+if str(_V2_DIR) not in sys.path:
+    sys.path.insert(0, str(_V2_DIR))
+
+try:
+    from config import STEP_ORGANIZATION_ID as ORGANIZATION_ID
+except ImportError:
+    ORGANIZATION_ID = (
+        os.getenv("STEP_ORGANIZATION_ID")
+        or os.getenv("ORGANIZATION_ID")
+        or "d270f89a-aada-4ff2-adb0-68b3e8087565"
+    )
+
 
 def usd(x):
-    """Round a currency amount to cents, half-up, as a plain Python float.
-
-    Money must never go through numpy: np.float64 rounds half-cents differently
-    from Python's round(), and numpy scalars serialise to JSON without error, so
-    the difference is silent. Any consumer recomputing round(gross*wi, 2) on the
-    published JSON would otherwise disagree with total_usd on ~7% of invoices.
-    """
+    """Round a currency amount to cents, half-up, as a plain Python float."""
     return float(Decimal(repr(float(x))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
-# Single source of truth for the output file. Override with:
-#   STEP_OUTPUT=/some/dir/STEP_V2_Master.json python3 STEP_V2_Master_build.py
-OUTPUT_PATH = os.environ.get("STEP_OUTPUT", "STEP_V2_Master.json")
 
 random.seed(20260708)
 np.random.seed(20260708)
 
-COMPANY         = "South Texas Energy Partners"
-ORGANIZATION_ID = "SOUTH_TEXAS_ENERGY_PARTNERS"
-END_DATE        = datetime(2026, 7, 8)
+COMPANY = "South Texas Energy Partners"
+END_DATE = datetime(2026, 7, 8)
 START_MIN       = datetime(2008, 1, 1)
 START_MAX       = datetime(2011, 12, 31)
 
@@ -1647,451 +1600,66 @@ def make_swd(wells_dict, lease, info, sd, ed):
         c+=timedelta(days=1); day+=1
     return h
 
-# ── MAIN BUILD ────────────────────────────────────────────────────────────────
-if __name__=="__main__":
-    print("South Texas Energy Partners V2 — Final Build v2")
-    print("="*60)
-    all_assets={}; well_num=1; EPISODES=[]; EPI_BY_WELL={}
 
-    # Assign clean well numbers — first well in each lease per lift type
-    # Bravo 1-20, Maverick 21-40, Carrizo 41-60, Cotulla 61-80, Pearsall 81-100
-    lease_base=LEASE_BASE
+# ── V1-style pipeline API (used by v2/pipeline.py) ────────────────────────────
 
-    for lease,info in LEASES.items():
-        pool=[]
-        for lift,count in info["dist"].items():
-            pool.extend([lift]*count)
+def simulate_well(asset_id, lift, spud_date, is_clean=False):
+    """Generate one well history like v1 simulate_well.
+
+    Returns (history, shutin_events, pump_curve_or_None).
+    """
+    if isinstance(spud_date, datetime):
+        spud = spud_date
+    else:
+        spud = datetime.strptime(str(spud_date)[:10], "%Y-%m-%d")
+    if lift == "ESP":
+        hist, pump_curve, shutin = gen_esp(asset_id, spud, is_clean)
+        return hist, shutin, pump_curve
+    if lift == "Gas Lift":
+        hist, shutin = gen_gl(asset_id, spud, is_clean)
+        return hist, shutin, None
+    hist, shutin = gen_pu(asset_id, spud, is_clean)
+    return hist, shutin, None
+
+
+def build_wells():
+    """Build the fixed 100-well V2 catalog (asset_id, lease, lift, spud, WI/NRI)."""
+    random.seed(20260708)
+    np.random.seed(20260708)
+    wells = []
+    for lease, info in LEASES.items():
+        pool = []
+        for lift, count in info["dist"].items():
+            pool.extend([lift] * count)
         random.shuffle(pool)
-        # Put an ESP and a Gas Lift in this lease's two CLEAN slots. Previously
-        # this forced slots 0 and 1, which is what pinned the clean cohort to
-        # well numbers 001/002 of every lease.
-        s_esp,s_gl=CLEAN_SLOTS[lease]
-        if pool[s_esp]!="ESP":
-            cand=[i for i,l in enumerate(pool) if l=="ESP" and i!=s_gl]
-            if cand: j=cand[0]; pool[s_esp],pool[j]=pool[j],pool[s_esp]
-        if pool[s_gl]!="Gas Lift":
-            cand=[i for i,l in enumerate(pool) if l=="Gas Lift" and i!=s_esp]
-            if cand: j=cand[0]; pool[s_gl],pool[j]=pool[j],pool[s_gl]
-
-        eng=PERSONNEL[lease]
-        for i,lift in enumerate(pool):
-            suffix="-V" if lift=="Pumping Unit" else "-H"
-            base=lease_base[lease]
-            well_no=base+i+1
-            aid=f"{lease}-1H-{well_no:03d}-V2{suffix}"
-            spud=rd(START_MIN,START_MAX)
-            is_clean = aid in ALL_CLEAN
-
-            print(f"  [{well_num:>3}/100] {aid} ({lift}{'|CLEAN' if is_clean else ''})")
-
-            if lift=="ESP":
-                hist,pump_curve,shutin_ev=gen_esp(aid,spud,is_clean)
-            elif lift=="Gas Lift":
-                hist,shutin_ev=gen_gl(aid,spud,is_clean)
-                pump_curve=None
-            else:
-                hist,shutin_ev=gen_pu(aid,spud,is_clean)
-                pump_curve=None
-
-            EPISODES.extend(shutin_ev)
-            # EPISODES is pooled with no well id on it; the outage-separability
-            # check needs failure dates per well, so key them here.
-            EPI_BY_WELL[aid]=shutin_ev
-            wi=info["wi"]; nri=info["nri"]
-            ledger=make_well_invoices(aid,hist,shutin_ev,wi,lift)
-
-            asset={
-                "type":"Well","lift":lift,
-                "organization_id":ORGANIZATION_ID,
-                "area":info["area"],"working_interest":wi,
-                "lease_type":info["lt"],"net_revenue_interest":nri,
-                "location":make_loc(info),
-                "assigned_personnel":make_pers(lease),
-                "financial_ledger":ledger,
-                "revenue_ledger":make_revenue(aid,hist,nri,
-                    random.uniform(*NGL_YIELD_BY_AREA[info["area"]])),
-                "history":hist,
-            }
-            if pump_curve: asset["pump_curve"]=pump_curve
-            all_assets[aid]=asset
-            well_num+=1
-
-    # Build supporting assets
-    wells_only={k:v for k,v in all_assets.items() if v['type']=='Well'}
-    all_dates=sorted(set(d['date'] for v in wells_only.values() for d in v['history']))
-    sd=datetime.strptime(all_dates[0],'%Y-%m-%d')
-    ed=datetime.strptime(all_dates[-1],'%Y-%m-%d')
-    print(f"\nBuilding 20 supporting assets ({all_dates[0]} → {all_dates[-1]})...")
-
-    SWD_PUMP={"Bravo":"Triplex","Maverick":"HPS","Carrizo":"Triplex","Cotulla":"HPS","Pearsall":"Triplex"}
-    SWD_SPECS={"Triplex":{"plunger_diameter_in":4.5,"stroke_length_in":12.0,"gear_ratio":5.0,"max_pressure_psi":3000},
-               "HPS":    {"plunger_diameter_in":5.0,"stroke_length_in":14.0,"gear_ratio":4.5,"max_pressure_psi":3500}}
-
-    for lease,info in LEASES.items():
-        print(f"  {lease}...")
-        p=make_pers(lease); l=make_loc(info); wi=info["wi"]
-        base={"lift":None,"organization_id":ORGANIZATION_ID,"area":info["area"],
-              "working_interest":wi,"lease_type":info["lt"],"net_revenue_interest":None,
-              "location":l,"assigned_personnel":p}
-
-        fac_hist=make_facility(wells_only,lease,info,sd,ed)
-        all_assets[f"{lease}-FAC-01"]={**base,"type":"Facility",
-            "financial_ledger":make_supp_invoices(f"{lease}-FAC-01","Facility",fac_hist,wi),
-            "history":fac_hist}
-
-        comp_hist=make_compressor(wells_only,lease,sd,ed)
-        all_assets[f"{lease}-COMP-01"]={**base,"type":"Compressor",
-            "financial_ledger":make_supp_invoices(f"{lease}-COMP-01","Compressor",comp_hist,wi),
-            "history":comp_hist}
-
-        tank_hist=make_tank(wells_only,lease,sd,ed)
-        all_assets[f"{lease}-TANK-01"]={**base,"type":"Tank Battery",
-            "tank_static_specs":TANK_SPECS,
-            "financial_ledger":make_supp_invoices(f"{lease}-TANK-01","Tank Battery",tank_hist,wi),
-            "history":tank_hist}
-
-        pt=SWD_PUMP[lease]
-        swd_hist=make_swd(wells_only,lease,info,sd,ed)
-        all_assets[f"{lease}-SWD-01"]={**base,"type":"SWD Well","net_revenue_interest":info["nri"],
-            "pump_type":pt,"pump_static_specs":SWD_SPECS[pt],
-            "financial_ledger":make_supp_invoices(f"{lease}-SWD-01","SWD Well",swd_hist,wi),
-            "history":swd_hist}
-
-    # Verification
-    total_h=sum(len(a['history']) for a in all_assets.values())
-    total_inv=sum(len(a['financial_ledger']) for a in all_assets.values())
-    avg_d=sum(len(v['history']) for v in wells_only.values())/len(wells_only)
-    fails=0
-    for v in wells_only.values():
-        in_s=False
-        for d in v['history']:
-            if d['run_status']=='SHUT-IN' and not in_s: in_s=True; fails+=1
-            elif d['run_status']!='SHUT-IN': in_s=False
-    # The clean cohort is defined by the build. It can no longer be inferred from
-    # uptime, because every well now takes ordinary non-failure downtime — which
-    # is the point: 100% uptime used to identify these 10 wells outright.
-    clean_keys={k for k in wells_only if k in ALL_CLEAN}
-    clean_ct=len(clean_keys)
-    _dn=lambda k: sum(1 for d in wells_only[k]['history'] if d['run_status']=='SHUT-IN')
-    clean_zero_dt=sum(1 for k in clean_keys if _dn(k)==0)
-
-    # Outage LENGTH must not decode failure vs routine downtime. Giving the clean
-    # cohort only SHORT outages would swap one perfect detector for another.
-    _lf=Counter(); _lr=Counter(); _clean_long=0
-    _fail_dates={k:{e['date'] for e in EPI_BY_WELL.get(k,[])} for k in wells_only}
-    for k,v in wells_only.items():
-        run=0; start=None; has_long=False
-        for d in v['history']+[{'run_status':'PRODUCING'}]:
-            if d['run_status']=='SHUT-IN':
-                if run==0: start=d.get('date')
-                run+=1
-            elif run:
-                isf = start in _fail_dates[k]
-                (_lf if isf else _lr)[run]+=1
-                if not isf and run>=4: has_long=True
-                run=0
-        if k in clean_keys and has_long: _clean_long+=1
-    _nf=sum(_lf.values()); _nr=sum(_lr.values())
-    outage_ks=0.0; outage_ks_t=0
-    if _nf and _nr:
-        for _T in range(1,41):
-            _a=sum(x for y,x in _lf.items() if y>=_T)/_nf
-            _b=sum(x for y,x in _lr.items() if y>=_T)/_nr
-            if abs(_a-_b)>outage_ks: outage_ks,outage_ks_t=abs(_a-_b),_T
-    routine_long_share=(sum(x for y,x in _lr.items() if y>=4)/_nr) if _nr else 0.0
-    outage_ok=(outage_ks<0.80 and routine_long_share>0.15 and _clean_long==clean_ct)
-
-    # No well may be identifiable by ABSENCE of workover spend. Clean wells used
-    # to carry zero Workover invoices for their whole life while every other well
-    # carried 5-17, so the financial ledger alone sorted the cohort perfectly.
-    _wo=lambda k: sum(1 for i in wells_only[k]['financial_ledger'] if i['category']=='Workover')
-    wells_no_wo=sum(1 for k in wells_only if _wo(k)==0)
-    clean_no_wo=sum(1 for k in clean_keys if _wo(k)==0)
-    _cwo=[_wo(k) for k in clean_keys]; _dwo=[_wo(k) for k in wells_only if k not in clean_keys]
-    # The COUNT must not be a proxy either. Measured directly: what share of the
-    # failing wells sit inside the clean cohort's workover-count range? If that is
-    # near zero, "fewest workovers" is just the old label wearing a different hat.
-    _clo,_chi=min(_cwo),max(_cwo)
-    wo_mix=sum(1 for x in _dwo if _clo<=x<=_chi)/len(_dwo) if _dwo else 0.0
-    _sp=lambda k: sum(i['gross_cost_usd'] for i in wells_only[k]['financial_ledger']
-                      if i['category']=='Workover')
-    _cs=[_sp(k) for k in clean_keys]; _ds=[_sp(k) for k in wells_only if k not in clean_keys]
-    _slo,_shi=min(_cs),max(_cs)
-    wo_spend_mix=sum(1 for x in _ds if _slo<=x<=_shi)/len(_ds) if _ds else 0.0
-
-    # How well can a single threshold on ONE lifetime statistic sort the cohort?
-    # Baseline is 90%: always guessing "failing" is right for 90 of 100 wells.
-    #
-    # This gate is deliberately set at "essentially perfect", not at chance.
-    # A well with no failure physics genuinely accumulates less downtime and less
-    # repair spend over 16 years — that is the real phenomenon, not an artifact,
-    # and forcing it to chance would mean the clean cohort is no longer a control
-    # group. What must NOT survive is a CATEGORICAL tell (zero workovers, zero
-    # downtime, a well-number block), which shows up here as 100%.
-    def _sep(f):
-        cs=[f(k) for k in clean_keys]; rs=[f(k) for k in wells_only if k not in clean_keys]
-        n=len(cs)+len(rs)
-        return max(max((sum(1 for x in cs if x<=t)+sum(1 for x in rs if x>t))/n,
-                       (sum(1 for x in cs if x>t)+sum(1 for x in rs if x<=t))/n)
-                   for t in sorted(set(cs+rs)))
-    sep_cnt=_sep(_wo); sep_spd=_sep(_sp); sep_dt=_sep(_dn)
-    wo_overlap = (max(sep_cnt,sep_spd,sep_dt)<0.99 and wo_mix>0.15
-                  and _shi>min(_ds) and wells_no_wo==0)
-
-    # ── Revenue ledger ───────────────────────────────────────────────────────
-    rev_rows=sum(len(v.get('revenue_ledger',[])) for v in all_assets.values())
-    # volume x price must equal revenue on all three streams or the ledger cannot
-    # be audited. Wet gas is NOT the priced stream — residue is.
-    _RS=[('oil_volume_bbl','realized_oil_usd_bbl','gross_oil_revenue_usd'),
-         ('residue_gas_mcf','realized_gas_usd_mcf','gross_gas_revenue_usd'),
-         ('ngl_volume_bbl','realized_ngl_usd_bbl','gross_ngl_revenue_usd')]
-    rev_recon_bad=0; rev_gas_rows=0
-    for v in all_assets.values():
-        for r in v.get('revenue_ledger',[]):
-            if r['residue_gas_mcf']<=0: continue
-            rev_gas_rows+=1
-            for _v,_p,_g in _RS:
-                if abs(r[_v]*r[_p]-r[_g])>0.011: rev_recon_bad+=1; break
-    # a missing revenue month labels a full-month outage exactly like a missing invoice
-    rev_months_missing=0
-    for v in wells_only.values():
-        hm={d['date'][:7] for d in v['history']}
-        rm={r['production_month'] for r in v['revenue_ledger']}
-        rev_months_missing+=len(hm-rm)
-    # revenue must actually track the well's own production
-    _rx=[];_ry=[]
-    for v in wells_only.values():
-        for r in v['revenue_ledger']:
-            if r['oil_volume_bbl']>0:
-                _rx.append(r['oil_volume_bbl']); _ry.append(r['gross_revenue_usd'])
-    _rn=len(_rx) or 1; _mx=sum(_rx)/_rn; _my=sum(_ry)/_rn
-    _sxy=sum((x-_mx)*(y-_my) for x,y in zip(_rx,_ry))
-    _sxx=sum((x-_mx)**2 for x in _rx); _syy=sum((y-_my)**2 for y in _ry)
-    rev_corr=_sxy/((_sxx*_syy)**0.5) if _sxx>0 and _syy>0 else 0.0
-    rev_neg=sum(1 for v in wells_only.values() for r in v['revenue_ledger']
-                if r['net_revenue_usd']<0)
-    rev_ok=(rev_recon_bad==0 and rev_months_missing==0 and rev_corr>0.5 and rev_rows>15000)
-
-    # Every month a well existed must carry an LOE invoice. A missing month is an
-    # unambiguous full-outage label.
-    months_no_loe=0
-    for v in wells_only.values():
-        hm={d['date'][:7] for d in v['history']}
-        lm={i['invoice_date'][:7] for i in v['financial_ledger'] if i['category']=='Monthly LOE'}
-        months_no_loe+=len(hm-lm)
-    esp_ct=sum(1 for v in wells_only.values() if v['lift']=='ESP')
-    pump_ct=sum(1 for v in wells_only.values() if v.get('pump_curve'))
-    wi_err=sum(1 for a in all_assets.values() for i in a['financial_ledger']
-               if i['total_usd']!=usd(i['gross_cost_usd']*i['working_interest']))
-    # guard against numpy scalars anywhere in the published payload
-    np_leak=sum(1 for a in all_assets.values()
-                for coll in (a['history'],a['financial_ledger'])
-                for r in coll for v in r.values() if isinstance(v,np.generic))
-    dup_ids=len(set(i['invoice_id'] for a in all_assets.values() for i in a['financial_ledger']))
-    all_inv=list(i['invoice_id'] for a in all_assets.values() for i in a['financial_ledger'])
-    fac_keys=[k for k in all_assets if 'FAC' in k]
-    pres_ok=all(all(d['wellhead_pressure_psi']>d['two_phase_separator_pressure_psi']>
-                    d['three_phase_separator_pressure_psi']>d['gas_sales_line_pressure_psi']
-                    for d in all_assets[k]['history'] if d['run_status']=='PRODUCING')
-                for k in fac_keys)
-    neg=sum(1 for v in all_assets.values() for d in v['history']
-            for k,val in d.items() if k in ['gross_oil_production_bbl','motor_load_amps',
-            'pump_intake_pressure_psi','annular_casing_pressure_psi'] and isinstance(val,(int,float)) and val<0)
-    # Tank battery: oil mass balance vs lease production, and alarm variance
-    bal_err=[]; alarm_dead=[]
-    for lease in LEASES:
-        tk=all_assets[f"{lease}-TANK-01"]['history']
-        oil_in=sum(d.get('gross_oil_production_bbl',0) for k,v in wells_only.items()
-                   if k.startswith(lease) for d in v['history'])
-        tickets=sum(d['ot_1_run_ticket_bbl']+d['ot_2_run_ticket_bbl']+d['ot_3_run_ticket_bbl'] for d in tk)
-        if oil_in>0 and abs(tickets-oil_in)/oil_in>0.02: bal_err.append((lease,round(100*tickets/oil_in,1)))
-        al=sum(d['high_level_alarm'] for d in tk)
-        if al==0: alarm_dead.append(lease)
-    # run_status must agree with the row payload. A SHUT-IN row carrying live
-    # production, amperage or drive frequency is a contradictory label sitting on
-    # the single most important timestamp in the dataset (the failure instant).
-    # No other check in this block tests status against the payload.
-    bad_shutin=sum(1 for a in all_assets.values() if a['type']=='Well'
-                   for d in a['history'] if d['run_status']=='SHUT-IN'
-                   and (d.get('gross_oil_production_bbl',0)>0
-                        or d.get('motor_load_amps',0)>0
-                        or d.get('vfd_output_frequency_hz',0)>0
-                        or d.get('surface_motor_amperage',0)>0
-                        or d.get('motor_drive_frequency_hz',0)>0
-                        or d.get('lift_gas_rate_mscfd',0)>0))
-    stamp_bad=sum(1 for a in all_assets.values() for d in a['history']
-                  if d.get('organization_id')!=ORGANIZATION_ID
-                  or d.get('timestamp')!=d['date']+" 00:00:00")
-    # Realism checks added in the final pass
-    wi_vals=sorted({i['working_interest'] for a in all_assets.values() for i in a['financial_ledger']})
-    nri_ok=all(a.get('net_revenue_interest') is None or a['net_revenue_interest']<a['working_interest']
-               for a in all_assets.values())
-    supp_down=sum(1 for a in all_assets.values() if a['type']!='Well'
-                  for d in a['history'] if d['run_status']=='DOWN')
-    # Per-type, not just aggregate: an aggregate count passes even when a whole
-    # asset type never goes DOWN (Tank Battery previously never did).
-    supp_types=sorted({a['type'] for a in all_assets.values() if a['type']!='Well'})
-    down_by_type={tp:sum(1 for a in all_assets.values() if a['type']==tp
-                         for d in a['history'] if d['run_status']=='DOWN')
-                  for tp in supp_types}
-    down_all_types=all(v>0 for v in down_by_type.values())
-    # A DOWN battery hauls no oil, so a DOWN row must carry no oil run tickets.
-    # Water disposal is a separate system and keeps running, so wt_1 is excluded.
-    down_ticket=sum(1 for a in all_assets.values() if a['type']=='Tank Battery'
-                    for d in a['history'] if d['run_status']=='DOWN'
-                    and (d['ot_1_run_ticket_bbl']>0 or d['ot_2_run_ticket_bbl']>0
-                         or d['ot_3_run_ticket_bbl']>0))
-    # Every vendor written to any invoice must exist in the VENDORS registry.
-    # This is what makes VENDORS load-bearing rather than decorative: a typo in
-    # any of the per-scope lists fails the build instead of shipping a name that
-    # appears nowhere else in the dataset.
-    _vend=collections.Counter(i['vendor'] for a in all_assets.values()
-                              for i in a['financial_ledger'])
-    vend_bad=sorted(set(_vend)-set(VENDORS))
-    wo_vend=collections.Counter(i['vendor'] for a in all_assets.values()
-                                for i in a['financial_ledger'] if i['category']=='Workover')
-    curtailed=sum(1 for a in all_assets.values() if a['type']=='Well'
-                  for d in a['history'] if d['run_status']=='CURTAILED')
-    # lag-1 autocorrelation on a representative producing sensor
-    _ac=[]
-    for aid_,a in list(wells_only.items())[:12]:
-        f={'ESP':'motor_winding_temp_f','Gas Lift':'wellhead_flowing_temp_f',
-           'Pumping Unit':'gearbox_motor_temp_f'}[a['lift']]
-        xs=[d[f] for d in a['history'][500:2500] if d['run_status']=='PRODUCING']
-        if len(xs)>400:
-            arr=np.array(xs)-np.mean(xs)
-            _ac.append(float(np.corrcoef(arr[:-1],arr[1:])[0,1]))
-    ac_med=float(np.median(_ac)) if _ac else 0.0
-    # biggest single-day production jump on a clean well (cliff detector)
-    max_jump=0.0
-    for aid_ in ALL_CLEAN:
-        hh=all_assets[aid_]['history']
-        for i in range(1,len(hh)):
-            a0=hh[i-1]['gross_oil_production_bbl']; a1=hh[i]['gross_oil_production_bbl']
-            if a0>5 and hh[i]['run_status']=='PRODUCING' and hh[i-1]['run_status']=='PRODUCING':
-                max_jump=max(max_jump,abs(a1-a0)/a0)
-    # SWD injection pressure must respond to cumulative fill
-    swd_rise=[]
-    for lease in LEASES:
-        hh=[d for d in all_assets[f'{lease}-SWD-01']['history'] if d['run_status']=='PRODUCING']
-        swd_rise.append(float(round(np.mean([d['surface_injection_pressure_psi'] for d in hh[-365:]])
-                              -np.mean([d['surface_injection_pressure_psi'] for d in hh[:365]]),1)))
-    # LOE cost must track the volumes actually handled
-    _c=[]
-    for a in list(wells_only.values())[:20]:
-        bym={}
-        for d in a['history']:
-            bym[d['date'][:7]]=bym.get(d['date'][:7],0)+d['gross_oil_production_bbl']+d['produced_water_volume_bbl']
-        pr=[(bym.get(i['invoice_date'][:7],0),i['gross_cost_usd'])
-            for i in a['financial_ledger'] if i['category']=='Monthly LOE']
-        if len(pr)>24:
-            arr=np.array(pr)
-            if arr[:,0].std()>0: _c.append(float(np.corrcoef(arr[:,0],arr[:,1])[0,1]))
-    loe_corr=float(np.median(_c)) if _c else 0.0
-    # concurrent (overlapping) failure modes
-    overlap=sum(1 for e in EPISODES if len(e.get('concurrent',[]))>1)
-    ov_pct=100.0*overlap/max(1,len(EPISODES))
-    fam=collections.Counter(x.split(' - ')[0] for e in EPISODES for x in e.get('concurrent',[]))
-    rod_ct=fam.get('Rod Part',0)+fam.get('Rod Wear',0)
-    # nothing in the payload may name a failure mode
-    freeze_hit=sum(1 for a in all_assets.values() if a['type']=='Well'
-                   for d in a['history'] if d['date'].startswith('2021-02-1') and d['run_status']=='CURTAILED')
-
-    bad=['failure_scenario','failure_cause','optimization_flag']
-    still=[f for f in bad if any(f in d for v in all_assets.values() for d in v['history'])]
-    # No failure-mode name, and no derived hint, may appear anywhere in the payload.
-    _names={x.split(' - ')[0] for t in (ESP_TYPES+GL_TYPES+PU_TYPES) for x in [t[0]]}
-    _txt=json.dumps(all_assets)
-    leak=sorted(n for n in _names if n in _txt)
-
-    print(f"\n{'='*60}")
-    print(f"  Total assets:       {len(all_assets)}/120 {'✓' if len(all_assets)==120 else '⚠'}")
-    print(f"  Wells:              {len(wells_only)}/100 {'✓' if len(wells_only)==100 else '⚠'}")
-    print(f"  Supporting:         {len(all_assets)-len(wells_only)}/20 {'✓' if len(all_assets)-len(wells_only)==20 else '⚠'}")
-    print(f"  Total daily rows:   {total_h:,}")
-    print(f"  Total invoices:     {total_inv:,}")
-    print(f"  Avg years/well:     {avg_d/365:.1f}")
-    print(f"  Failure events:     {fails} ({fails/len(wells_only):.1f}/well)")
-    print(f"  Clean wells:        {clean_ct}/10 {'✓' if clean_ct==10 else '⚠'}")
-    print(f"  Clean w/ 0 downtime:{clean_zero_dt} {'✓' if clean_zero_dt==0 else '⚠ UPTIME LABELS COHORT'}")
-    print(f"  Outage len separability: KS {outage_ks:.2f} at >={outage_ks_t}d {'✓' if outage_ks<0.80 else '⚠ LENGTH DECODES FAILURE'}")
-    print(f"  Routine outages >=4d:    {routine_long_share*100:.0f}% of {_nr:,} {'✓' if routine_long_share>0.15 else '⚠ no long tail'}")
-    print(f"  Clean wells w/ long o/a: {_clean_long}/{clean_ct} {'✓' if _clean_long==clean_ct else '⚠ clean cohort short-only'}")
-    print(f"  Months w/o LOE invoice:  {months_no_loe} {'✓' if months_no_loe==0 else '⚠ IDLE MONTH LABELED'}")
-    print(f"  Revenue records:         {rev_rows:,} {'✓' if rev_rows>15000 else '⚠'}")
-    print(f"  Ledger ties out (o/g/ngl): {rev_gas_rows-rev_recon_bad:,}/{rev_gas_rows:,} {'✓' if rev_recon_bad==0 else '⚠ WILL NOT TIE OUT'}")
-    print(f"  Months w/o revenue rec:  {rev_months_missing} {'✓' if rev_months_missing==0 else '⚠ IDLE MONTH LABELED'}")
-    print(f"  Revenue vs oil volume:   r={rev_corr:.2f} {'✓' if rev_corr>0.5 else '⚠ not production-derived'}")
-    print(f"  Revenue recs w/ neg net: {rev_neg:,}")
-    print(f"  Wells w/o workover spend:{wells_no_wo} (clean {clean_no_wo}) {'✓' if wells_no_wo==0 else '⚠ LEDGER LABELS COHORT'}")
-    print(f"  Workover count overlap:  clean {_clo}-{_chi} vs rest {min(_dwo)}-{max(_dwo)}; {wo_mix*100:.0f}% inside {'✓' if wo_mix>0.15 else '⚠ COUNT IS A PROXY'}")
-    print(f"  Workover spend overlap:  clean ${_slo/1e3:.0f}k-{_shi/1e3:.0f}k vs rest ${min(_ds)/1e3:.0f}k-{max(_ds)/1e3:.0f}k; {wo_spend_mix*100:.0f}% inside")
-    print(f"  Cohort separability (90% = chance): count {sep_cnt*100:.0f}%, spend {sep_spd*100:.0f}%, downtime {sep_dt*100:.0f}% {'✓' if max(sep_cnt,sep_spd,sep_dt)<0.99 else '⚠ CATEGORICAL TELL'}")
-    print(f"  ESP pump curves:    {pump_ct}/{esp_ct} {'✓' if pump_ct==esp_ct else '⚠'}")
-    print(f"  WI math errors:     {wi_err} {'✓' if wi_err==0 else '⚠'}")
-    print(f"  numpy scalars leaked:{np_leak} {'✓' if np_leak==0 else '⚠'}")
-    print(f"  Duplicate inv IDs:  {len(all_inv)-dup_ids} {'✓' if len(all_inv)==dup_ids else '⚠'}")
-    print(f"  Pressure step-down: {'✓' if pres_ok else '⚠'}")
-    print(f"  Negatives:          {neg} {'✓' if neg==0 else '⚠'}")
-    print(f"  Rows missing stamp: {stamp_bad} {'✓' if stamp_bad==0 else '⚠'}")
-    print(f"  SHUT-IN rows w/ live payload: {bad_shutin} {'✓' if bad_shutin==0 else '⚠'}")
-    print(f"  Tank oil balance:   {'✓ all leases within 2%' if not bal_err else f'⚠ {bal_err}'}")
-    print(f"  Tank alarm variance:{' ✓ all leases fire' if not alarm_dead else f' ⚠ never fires: {alarm_dead}'}")
-    print(f"  Bad fields:         {still if still else 'none ✓'}")
-    print(f"  Working interests:  {wi_vals} {'✓' if len(wi_vals)>1 else '⚠ vacuous'}")
-    print(f"  NRI < WI all assets:{' ✓' if nri_ok else ' ⚠'}")
-    print(f"  Supporting DOWN rows:{supp_down} {'✓' if supp_down>0 else '⚠ none'}")
-    print(f"  DOWN rows per type: {down_by_type} {'✓' if down_all_types else '⚠ a type never goes DOWN'}")
-    print(f"  DOWN battery w/ tickets: {down_ticket} {'✓' if down_ticket==0 else '⚠'}")
-    print(f"  Freeze curtailment: {curtailed:,} well-days ({freeze_hit} in Uri peak) {'✓' if freeze_hit>0 else '⚠'}")
-    print(f"  Sensor lag-1 autocorr: {ac_med:.3f} {'✓' if ac_med>0.5 else '⚠ white noise'}")
-    print(f"  Max 1-day clean-well jump: {100*max_jump:.1f}% {'✓' if max_jump<0.25 else '⚠ cliff'}")
-    print(f"  SWD pressure rise/lease: {swd_rise} psi {'✓' if min(swd_rise)>50 else '⚠ flat'}")
-    print(f"  LOE cost vs volume corr: {loe_corr:+.2f} {'✓' if loe_corr>0.5 else '⚠ decoupled'}")
-    print(f"  Overlapping episodes: {overlap}/{len(EPISODES)} ({ov_pct:.1f}%) {'✓' if ov_pct>15 else '⚠'}")
-    print(f"  Rod-string failures: {rod_ct} {'✓' if rod_ct>0 else '⚠ none'}")
-    print(f"  Vendors not in registry: {vend_bad if vend_bad else 'none ✓'}")
-    print(f"  Workover vendors used: {len(wo_vend)} of {len(VENDORS)} — {dict(wo_vend)}")
-    print(f"  Mode leakage in payload: {leak if leak else 'none ✓'}")
-    print(f"  End date:           {all_dates[-1]}")
-
-    output={
-        "company":COMPANY,"organization_id":ORGANIZATION_ID,
-        
-        "generated":datetime.now().strftime("%Y-%m-%d"),
-        "currency_rounding":"USD amounts are quantized to cents with ROUND_HALF_UP "
-                            "(matches Snowflake ROUND and Excel ROUND). Python's built-in "
-                            "round() is half-to-even and will disagree on ~8.6% of invoices; "
-                            "validate with Decimal(...).quantize(Decimal('0.01'), ROUND_HALF_UP).",
-        "run_status_values":["PRODUCING","CURTAILED","SHUT-IN","DOWN"],
-        "price_deck":PRICE_DECK,
-        "price_deck_note":"Synthetic monthly realized prices. Oil is Gulf Coast "
-                          "(LLS/MEH) which carries a PREMIUM to WTI Cushing, unlike "
-                          "a Midland barrel. Gas is Houston Ship Channel, close to "
-                          "Henry Hub. Shaped to plausible history, not sourced.",
-        "fiscal_terms":{"severance_oil":SEV_TAX_OIL,"severance_gas":SEV_TAX_GAS,
-                        "ad_valorem":AD_VALOREM,"oil_transport_usd_bbl":OIL_TRANSPORT,
-                        "gas_gpt_usd_mcf":GAS_GPT,"ngl_pct_wti":NGL_PCT_WTI},
-        "assets":all_assets,
-    }
-    # Verify BEFORE writing. This build used to dump the full 568 MB artifact and
-    # only then evaluate all_ok, printing CHECK NEEDED while still leaving a
-    # complete-looking file on disk and exiting 0 — so a broken dataset was
-    # indistinguishable from a good one to any caller checking the exit code.
-    all_ok=all([len(all_assets)==120,clean_ct==10,pump_ct==esp_ct,wi_err==0,
-                len(all_inv)==dup_ids,pres_ok,neg==0,not still,stamp_bad==0,bad_shutin==0,
-                not bal_err,not alarm_dead,len(wi_vals)>1,nri_ok,supp_down>0,np_leak==0,
-                down_all_types,down_ticket==0,not vend_bad,len(wo_vend)>3,
-                ov_pct>15,rod_ct>0,not leak,
-                freeze_hit>0,ac_med>0.5,max_jump<0.25,min(swd_rise)>50,loe_corr>0.5,
-                clean_zero_dt==0,outage_ok,months_no_loe==0,
-                wells_no_wo==0,wo_overlap,rev_ok])
-    print(f"\n  {'ALL CLEAR' if all_ok else 'CHECK NEEDED'}")
-    if not all_ok:
-        print("  BUILD FAILED — output not written.")
-        sys.exit(1)
-    print(f"\nSaving to {os.path.abspath(OUTPUT_PATH)} ...")
-    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_PATH)),exist_ok=True)
-    with open(OUTPUT_PATH,"w") as f:
-        json.dump(output,f,indent=2)
-    print(f"✓ {os.path.getsize(OUTPUT_PATH)/1024/1024:.0f} MB — done")
+        s_esp, s_gl = CLEAN_SLOTS[lease]
+        if pool[s_esp] != "ESP":
+            cand = [i for i, lift in enumerate(pool) if lift == "ESP" and i != s_gl]
+            if cand:
+                j = cand[0]
+                pool[s_esp], pool[j] = pool[j], pool[s_esp]
+        if pool[s_gl] != "Gas Lift":
+            cand = [i for i, lift in enumerate(pool) if lift == "Gas Lift" and i != s_esp]
+            if cand:
+                j = cand[0]
+                pool[s_gl], pool[j] = pool[j], pool[s_gl]
+        for i, lift in enumerate(pool):
+            suffix = "-V" if lift == "Pumping Unit" else "-H"
+            well_no = LEASE_BASE[lease] + i + 1
+            aid = f"{lease}-1H-{well_no:03d}-V2{suffix}"
+            spud = rd(START_MIN, START_MAX)
+            wells.append(
+                {
+                    "asset_id": aid,
+                    "lease": lease,
+                    "lift": lift,
+                    "spud_date": spud.strftime("%Y-%m-%d"),
+                    "is_clean": aid in ALL_CLEAN,
+                    "working_interest": info["wi"],
+                    "net_revenue_interest": info["nri"],
+                    "area": info["area"],
+                    "lease_type": info["lt"],
+                    "county": info["county"],
+                }
+            )
+    return wells

@@ -181,7 +181,7 @@ def run_pipeline(skip_training: bool = False, confidence_threshold: float = 0.75
                     analysis = str(rec.get("analysis_description") or "")
                     if (not analysis) or analysis.startswith("OpenRouter analysis generation failed"):
                         apply_analysis_description(rec)
-                        finalize_analysis_fields(rec)
+                    finalize_analysis_fields(rec)
                     apply_alternatives_and_citations(rec)
                     action = rec.get("action") or action
 

@@ -1,0 +1,1 @@
+"""RED_BUFF V2 synthetic data → Snowflake (*_V2 tables)."""

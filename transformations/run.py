@@ -32,7 +32,11 @@ def _planned_exports(config: TransformationConfig) -> List[Dict[str, Any]]:
     from transformations.checkpoint import load_checkpoint, production_window, sensor_window
     from transformations.s3 import build_s3_key
 
-    specs = get_export_specs(config.tables)
+    specs = get_export_specs(
+        config.tables,
+        data_version=config.data_version,
+        organization_id=config.organization_id,
+    )
     prefix = config.sensor_data_prefix()
     checkpoint = None
     if config.organization_id:
@@ -81,19 +85,25 @@ def run_transformations(
     """Run configured Snowflake-to-S3 parquet exports."""
     config = config or TransformationConfig.from_env()
     config.validate()
-    specs = get_export_specs(config.tables)
+    specs = get_export_specs(
+        config.tables,
+        data_version=config.data_version,
+        organization_id=config.organization_id,
+    )
 
     if dry_run:
         return {
             "status": "success",
             "dry_run": True,
             "mode": config.mode,
+            "data_version": config.data_version,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "exports": _planned_exports(config),
         }
 
     result = run_export(config, specs)
     result["dry_run"] = False
+    result["data_version"] = config.data_version
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     return result
 
@@ -116,7 +126,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-prefix",
-        help="S3 prefix for output files. Defaults to {ORGANIZATION_ID}/sensor_data.",
+        help="S3 prefix for output files. Defaults to {ORGANIZATION_ID}/sensor_data or .../v2/sensor_data.",
+    )
+    parser.add_argument(
+        "--data-version",
+        "--version",
+        dest="data_version",
+        choices=("v1", "v2"),
+        default=None,
+        help="v1 = {org}/sensor_data (default, unchanged). v2 = {org}/v2/sensor_data from *_V2 tables.",
     )
     parser.add_argument(
         "--batch-size",
@@ -178,6 +196,8 @@ def main() -> None:
         config.tables = [part.strip() for part in args.tables.split(",") if part.strip()]
     if args.output_prefix:
         config.output_prefix = args.output_prefix
+    if getattr(args, "data_version", None):
+        config.data_version = args.data_version
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.mode:

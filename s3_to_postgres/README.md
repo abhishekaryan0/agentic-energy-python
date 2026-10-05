@@ -14,7 +14,7 @@ Incremental (or backfill) sync of detection and production parquet from S3 into 
 
 Checkpoints: `{prefix}/_state/postgres_sync_{table}.json`.
 
-Ops sync may call schema ensure helpers (e.g. analysis text columns, oil-price related fields on `operation_recommendations`).
+Ops sync may call schema ensure helpers (e.g. analysis text columns, oil-price related fields, **`chart_data` JSONB** on `operation_recommendations`).
 
 `sync_anomaly_violations.py` exists in the package but is **not** registered in `SYNC_HANDLERS` / CLI — violations stay on S3 only until wired.
 

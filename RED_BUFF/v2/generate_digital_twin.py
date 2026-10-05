@@ -1,3 +1,10 @@
+"""
+RED_BUFF V2 digital twin engine — same role as v1 generate_digital_twin.py.
+
+Ported from RBNR V2 master logic. Used by v2/pipeline.py to write Snowflake *_V2.
+Does not write RBNR_V2_Master.json.
+"""
+
 import json, os, random, sys
 import numpy as np
 from datetime import datetime, timedelta
@@ -28,7 +35,16 @@ if SCALE in ("test","mid"):
     START_MIN = datetime(2019, 1, 1); START_MAX = datetime(2019, 6, 30)
 
 COMPANY         = "Red Bluff Resources"
-ORGANIZATION_ID = "RED_BLUFF_RESOURCES"
+try:
+    from config import RED_BUFF_ORGANIZATION_ID as ORGANIZATION_ID
+except ImportError:
+    import os
+    ORGANIZATION_ID = (
+        os.getenv("RED_BUFF_ORGANIZATION_ID")
+        or os.getenv("ORGANIZATION_ID")
+        or "3e0b5b18-bec1-488a-82c1-a47881c69058"
+    )
+LEGACY_ORGANIZATION_LABEL = "RED_BLUFF_RESOURCES"
 
 # ── Leases ────────────────────────────────────────────────────────────────────
 # NRI is WI x (1 - royalty), set by lease type:
@@ -1697,638 +1713,106 @@ def make_revenue(aid, history, nri, ngl_yield):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ── Build ─────────────────────────────────────────────────────────────────────
-# Guarded so that importing this module gives you the configuration and the
-# generator functions without running a ~70s build or writing a ~650 MB file.
-# An `if` block creates no new scope, so every name below remains module-level
-# exactly as before.
-if __name__ == "__main__":
-    print("="*60); print(f"Red Bluff Resources V2 — Build [{SCALE}]"); print("="*60)
 
-    all_assets={}; well_num=1
-    # In-process only. Never serialized — the label scan at the end enforces that.
-    FAILURE_EVENTS={}
-    _per=N_WELLS//len(LEASES)
-    lease_base={lz:i*_per for i,lz in enumerate(LEASES)}
 
-    for lease,info in LEASES.items():
-        pool=[]
-        for lift,count in info["dist"].items():
-            pool.extend([lift]*count)
+# ── V1-style pipeline API (used by v2/pipeline.py) ────────────────────────────
+
+def simulate_well(asset_id, lift, spud_date, is_clean=False, lateral_ft=0):
+    """Generate one well history. Returns (history, failure_events, pump_curve_or_None)."""
+    if isinstance(spud_date, datetime):
+        spud = spud_date
+    else:
+        spud = datetime.strptime(str(spud_date)[:10], "%Y-%m-%d")
+    if lift == "Pumping Unit":
+        hist, fev = gen_pu(asset_id, spud, is_clean, lateral_ft)
+        stamp_rows(hist)
+        return hist, fev, None
+    if lift == "ESP":
+        hist, fev = gen_esp(asset_id, spud, is_clean, lateral_ft)
+        stamp_rows(hist)
+        prod = [d for d in hist if d.get("run_status") == "PRODUCING"]
+        gross = sorted(
+            d.get("allocated_oil_bbl", 0) + d.get("allocated_water_bbl", 0) for d in prod
+        )
+        med = gross[len(gross) // 2] if gross else 0
+        return hist, fev, make_pump_curve(med)
+    hist, fev = gen_gl(asset_id, spud, is_clean, lateral_ft)
+    stamp_rows(hist)
+    return hist, fev, None
+
+
+def build_wells():
+    """Build the fixed 100-well RBNR V2 catalog."""
+    random.seed(20260708)
+    np.random.seed(20260708)
+    wells = []
+    _per = N_WELLS // len(LEASES)
+    lease_base = {lz: i * _per for i, lz in enumerate(LEASES)}
+    for lease, info in LEASES.items():
+        pool = []
+        for lift, count in info["dist"].items():
+            pool.extend([lift] * count)
         random.shuffle(pool)
+        n_horiz = round(len(pool) * HORIZ_FRAC[info["sub_basin"]])
+        order = sorted(
+            range(len(pool)),
+            key=lambda j: -(random.random() ** (1.0 / H_AFFINITY[pool[j]])),
+        )
+        horiz_idx = set(order[:n_horiz])
+        for i, lift in enumerate(pool):
+            base = lease_base[lease]
+            well_no = base + i + 1
+            is_horiz = i in horiz_idx
+            suffix = "-H" if is_horiz else "-V"
+            aid = f"{lease}-RB-{well_no:03d}{suffix}"
+            lateral_ft = int(round(random.uniform(4500, 10500), -2)) if is_horiz else 0
+            spud = rd(START_MIN, START_MAX)
+            wells.append(
+                {
+                    "asset_id": aid,
+                    "lease": lease,
+                    "lift": lift,
+                    "spud_date": spud.strftime("%Y-%m-%d"),
+                    "is_clean": well_no in ALL_CLEAN_NUMS,
+                    "working_interest": info["wi"],
+                    "net_revenue_interest": info["nri"],
+                    "area": info["sub_basin"],
+                    "lease_type": info["lease_type"],
+                    "wellbore_profile": "Horizontal" if is_horiz else "Vertical",
+                    "lateral_length_ft": lateral_ft,
+                    "basin": info["basin"],
+                    "sub_basin": info["sub_basin"],
+                    "state": info["state"],
+                    "county": info["county"],
+                    "region": info["region"],
+                    "engineer": info["engineer"],
+                }
+            )
+    return wells
 
-        # Wellbore geometry is a property of the well, not of the lift method.
-        # Assign H/V per lease at the target horizontal fraction, weighting by lift
-        # (horizontals skew ESP/GL; verticals skew rod pump) so the lift counts above
-        # stay exact. Previously the suffix was derived FROM the lift, which made every
-        # rod pump vertical and every ESP/GL horizontal — no horizontal rod pumps at all.
-        n_horiz=round(len(pool)*HORIZ_FRAC[info["sub_basin"]])
-        # Weighted sampling without replacement (Efraimidis-Spirakis): affinity biases the
-        # draw but does not determine it, so every lift method gets both profiles.
-        order=sorted(range(len(pool)),
-                     key=lambda j: -(random.random()**(1.0/H_AFFINITY[pool[j]])))
-        horiz_idx=set(order[:n_horiz])
 
-        print(f"\n{lease} ({info['sub_basin']}): {n_horiz} horizontal / {len(pool)-n_horiz} vertical")
-        for i,lift in enumerate(pool):
-            base=lease_base[lease]
-            well_no=base+i+1
-            is_horiz=i in horiz_idx
-            suffix="-H" if is_horiz else "-V"
-            aid=f"{lease}-RB-{well_no:03d}{suffix}"
-            lateral_ft=int(round(random.uniform(4500,10500),-2)) if is_horiz else 0
-            spud=rd(START_MIN,START_MAX)
-            is_clean=well_no in ALL_CLEAN_NUMS
-
-            print(f"  [{well_num:>3}/100] {aid} ({lift}{'|CLEAN' if is_clean else ''})")
-
-            if lift=="Pumping Unit":
-                hist,fev=gen_pu(aid,spud,is_clean,lateral_ft)
-            elif lift=="ESP":
-                hist,fev=gen_esp(aid,spud,is_clean,lateral_ft)
-            else:
-                hist,fev=gen_gl(aid,spud,is_clean,lateral_ft)
-            stamp_rows(hist)
-
-            wi=info["wi"]; nri=info["nri"]
-            ledger=make_well_invoices(aid,hist,wi,lift,fev)
-            # Retained in-process only, for the scope/vendor consistency audit below.
-            FAILURE_EVENTS[aid]=fev
-
-            asset={
-                "type":"Well","lift":lift,"organization_id":ORGANIZATION_ID,
-                "wellbore_profile":"Horizontal" if is_horiz else "Vertical",
-                "lateral_length_ft":lateral_ft,
-                "area":info["sub_basin"],"working_interest":wi,"lease_type":info["lease_type"],
-                "net_revenue_interest":nri,
-                "location":{"basin":info["basin"],"sub_basin":info["sub_basin"],
-                            "state":info["state"],"county":info["county"],"region":info["region"]},
-                "assigned_personnel":{
-                    "well_perf_engineer":{"name":info["engineer"],"role":"Well Performance Engineer",
-                                           "email":f"{info['engineer'].lower().replace(' ','.')}@redbluffresources.com"},
-                    "prod_technician":   {"name":f"{lease} Production Tech","role":"Production Technician",
-                                           "email":f"prodtech.{lease.lower()}@redbluffresources.com"},
-                },
-                "financial_ledger":ledger,
-                "revenue_ledger":make_revenue(aid,hist,nri,random.uniform(NGL_YIELD_MIN,NGL_YIELD_MAX)),
-                "history":hist,
-            }
-            if lift=="ESP":
-                prod=[d for d in hist if d['run_status']=='PRODUCING']
-                gross=sorted(d.get('allocated_oil_bbl',0)+d.get('allocated_water_bbl',0) for d in prod)
-                # Size on median lifetime gross liquid, not the first 30 days of peak
-                med=gross[len(gross)//2] if gross else 0
-                asset["pump_curve"]=make_pump_curve(med)
-
-            all_assets[aid]=asset
-            well_num+=1
-
-    # Build supporting assets
-    wells_only={k:v for k,v in all_assets.items() if v['type']=='Well'}
-    all_dates=sorted(set(d['date'] for v in wells_only.values() for d in v['history']))
-    sd=datetime.strptime(all_dates[0],'%Y-%m-%d')
-    ed=datetime.strptime(all_dates[-1],'%Y-%m-%d')
-    print(f"\nBuilding {4*len(LEASES)} supporting assets ({all_dates[0]} → {all_dates[-1]})...")
-
-    SWD_SPECS={"Triplex":{"plunger_diameter_in":4.5,"stroke_length_in":12.0,"gear_ratio":5.0,"max_pressure_psi":3500},
-               "HPS":    {"plunger_diameter_in":5.0,"stroke_length_in":14.0,"gear_ratio":4.5,"max_pressure_psi":4000}}
-
-    for lease,info in LEASES.items():
-        print(f"  {lease}...")
-        wi=info["wi"]; lt=info["lease_type"]
-        loc={"basin":info["basin"],"sub_basin":info["sub_basin"],"state":info["state"],
-             "county":info["county"],"region":info["region"]}
-        pers={"well_perf_engineer":{"name":info["engineer"],"role":"Well Performance Engineer",
-                                     "email":f"{info['engineer'].lower().replace(' ','.')}@redbluffresources.com"},
-              "prod_technician":   {"name":f"{lease} Production Tech","role":"Production Technician",
-                                     "email":f"prodtech.{lease.lower()}@redbluffresources.com"}}
-        base={"lift":None,"organization_id":ORGANIZATION_ID,"area":info["sub_basin"],
-              "revenue_ledger":[],
-              "working_interest":wi,"lease_type":lt,"net_revenue_interest":None,
-              "location":loc,"assigned_personnel":pers}
-
-        # Per-lease start. Using the global earliest date gave every lease's
-        # facility, compressor, tank battery and SWD rows dated before that lease
-        # had a single well — zero-throughput rows that read as downtime.
-        _lw=[v for k,v in all_assets.items() if v['type']=='Well' and k.startswith(lease)]
-        lsd=datetime.strptime(min(v['history'][0]['date'] for v in _lw),'%Y-%m-%d')
-        fh=make_facility(all_assets,lease,info,lsd,ed)
-        all_assets[f"{lease}-FAC-01"]={**base,"type":"Facility","financial_ledger":make_supp_invoices(f"{lease}-FAC-01","Facility",fh,wi),"history":fh}
-
-        ch=make_compressor(all_assets,lease,lsd,ed)
-        all_assets[f"{lease}-COMP-01"]={**base,"type":"Compressor","financial_ledger":make_supp_invoices(f"{lease}-COMP-01","Compressor",ch,wi),"history":ch}
-
-        th=make_tank(all_assets,lease,lsd,ed)
-        all_assets[f"{lease}-TANK-01"]={**base,"type":"Tank Battery","financial_ledger":make_supp_invoices(f"{lease}-TANK-01","Tank Battery",th,wi),"history":th}
-
-        pt=info["swd_pump"]
-        sh=make_swd(all_assets,lease,info,lsd,ed,th)
-        all_assets[f"{lease}-SWD-01"]={**base,"type":"SWD Well","net_revenue_interest":info["nri"],
-                                        "pump_type":pt,"pump_static_specs":SWD_SPECS[pt],
-                                        "financial_ledger":make_supp_invoices(f"{lease}-SWD-01","SWD Well",sh,wi),"history":sh}
-
-    # ── Final verification ────────────────────────────────────────────────────────
-    total_h=sum(len(a['history']) for a in all_assets.values())
-    wells_f={k:v for k,v in all_assets.items() if v['type']=='Well'}
-    supp_f ={k:v for k,v in all_assets.items() if v['type']!='Well'}
-    avg_days=sum(len(v['history']) for v in wells_f.values())/len(wells_f)
-    max_date=max(d['date'] for v in all_assets.values() for d in v['history'])
-    min_date=min(d['date'] for v in all_assets.values() for d in v['history'])
-
-    # Failure counts come from the in-process event list. run_status
-    # alone can no longer be used: it also carries ordinary non-failure downtime,
-    # which is the entire point of routine downtime.
-    fails=0; recent=0; last_dates=[]
-    for k in wells_f:
-        evs=FAILURE_EVENTS.get(k,[])
-        fails+=len(evs)
-        if evs:
-            last=max(e['date'] for e in evs)
-            last_dates.append(last)
-            if last>='2024-01-01': recent+=1
-
-    # The healthy cohort is defined by the build, not inferred from uptime.
-    clean_keys={k for k in wells_f if int(k.split('-RB-')[1][:3]) in ALL_CLEAN_NUMS}
-    clean_ct=len(clean_keys)
-    clean_had_failure=sum(1 for k in clean_keys if FAILURE_EVENTS.get(k))
-    # Clean wells must NOT be separable by uptime. Every well takes routine
-    # outages, so both cohorts must show downtime days.
-    _dn=lambda k: sum(1 for d in wells_f[k]['history'] if d['run_status']=='SHUT-IN')
-    clean_zero_dt=sum(1 for k in clean_keys if _dn(k)==0)
-    clean_dt_rate=(sum(_dn(k) for k in clean_keys)/
-                   sum(len(wells_f[k]['history']) for k in clean_keys)) if clean_keys else 0.0
-    total_inv=sum(len(a['financial_ledger']) for a in all_assets.values())
-    all_ids=[i['invoice_id'] for a in all_assets.values() for i in a['financial_ledger']]
-    dups=len(all_ids)-len(set(all_ids))
-    wi_err=sum(1 for a in all_assets.values() for i in a['financial_ledger']
-               if abs(i['total_usd']-round(i['gross_cost_usd']*i['working_interest'],2))>0.01)
-    pump_ct=sum(1 for v in wells_f.values() if v.get('pump_curve'))
-    esp_ct =sum(1 for v in wells_f.values() if v['lift']=='ESP')
-    pres_ok=all(all(d['wellhead_pressure_psi']>d['two_phase_separator_pressure_psi']>
-                    d['three_phase_separator_pressure_psi']>d['gas_sales_line_pressure_psi']
-                    for d in all_assets[k]['history']) for k in all_assets if 'FAC' in k)
-    LABEL_FIELDS=['failure_cause','failure_scenario','failure_type','failure_subtype',
-                  'optimization_flag','shutin_duration_days','days_to_failure','is_clean',
-                  'scenario','scope_key','failure_mode','repair_scope_key','idle_days',
-                  'downtime_days']
-    # Scan history AND financial_ledger — the ledger is where labels previously leaked.
-    bad=[f for f in LABEL_FIELDS
-         if any(f in d for v in all_assets.values() for d in v['history'])
-         or any(f in i for v in all_assets.values() for i in v['financial_ledger'])]
-
-    # Workover invoices must NOT coincide with shut-in start dates.
-    wo_exact=0; wo_tot=0
-    for _k,v in wells_f.items():
-        starts={e['date'] for e in FAILURE_EVENTS.get(_k,[])}
-        for i in v['financial_ledger']:
-            if i['category']=='Workover':
-                wo_tot+=1
-                if i['invoice_date'] in starts: wo_exact+=1
-    wo_leak_pct=(wo_exact/wo_tot*100) if wo_tot else 0.0
-
-    # Clean wells must not be identifiable by absence of workover spend.
-    clean_no_wo=sum(1 for k in clean_keys
-                    if not any(i['category']=='Workover' for i in wells_f[k]['financial_ledger']))
-
-    # A SHUT-IN row must be a genuinely dead row. This is the check that
-    # would have caught the earlier bug where the failure day was emitted as SHUT-IN with
-    # live amps, pressures and oil volume.
-    LIVE_ON_SHUTIN=['allocated_oil_bbl','test_oil_bopd','motor_current_amps',
-                    'strokes_per_min','injection_rate_mscfd','freq_hz']
-    shutin_live=sum(1 for v in wells_f.values() for d in v['history']
-                    if d['run_status']=='SHUT-IN'
-                    and any((d.get(f,0.0) or 0.0)>0 for f in LIVE_ON_SHUTIN))
-
-    # Every month a well existed must carry an LOE invoice and a revenue
-    # record. A missing month used to label a full-month outage.
-    months_no_loe=0; months_no_rev=0
-    for v in wells_f.values():
-        hm={d['date'][:7] for d in v['history']}
-        lm={i['invoice_date'][:7] for i in v['financial_ledger'] if i['category']=='Monthly LOE'}
-        rm={r['production_month'] for r in v['revenue_ledger']}
-        months_no_loe+=len(hm-lm); months_no_rev+=len(hm-rm)
-
-    # Geometry sanity: both profiles must appear on every lift method.
-    geom=Counter((v['lift'],v['wellbore_profile']) for v in wells_f.values())
-    geom_ok=all(geom.get((lf,p),0)>0 for lf in ['ESP','Gas Lift','Pumping Unit'] for p in ['Horizontal','Vertical'])
-    horiz_ct=sum(1 for v in wells_f.values() if v['wellbore_profile']=='Horizontal')
-    lat_ok=all((v['lateral_length_ft']>0)==(v['wellbore_profile']=='Horizontal') for v in wells_f.values())
-
-    # Geometry must be visible in the production, not just stored as a field.
-    def _peak(v):
-        p=[d.get('allocated_oil_bbl',0.0) for d in v['history'][:365] if d['run_status']=='PRODUCING']
-        return sum(sorted(p)[-30:])/30.0 if len(p)>=30 else 0.0
-    # Per-lift H/V ratios are reported but NOT gated on: with 17 gas lift wells the
-    # vertical cell is ~5 wells and the ratio is mostly noise (it has printed
-    # anywhere from 1.6x to 5.7x across seeds on identical physics).
-    # The gate is on two pooled statistics that actually have the sample size to
-    # mean something, and that test the geometry claim directly:
-    #   1. peak oil normalised by the lift's own vertical median, horizontals vs 1.0
-    #   2. correlation between lateral_length_ft and that normalised peak
-    geom_ratio={}; geom_cells={}; _vmed={}
-    for lf in ['ESP','Gas Lift','Pumping Unit']:
-        hz=[_peak(v) for v in wells_f.values() if v['lift']==lf and v['wellbore_profile']=='Horizontal']
-        vt=sorted(_peak(v) for v in wells_f.values() if v['lift']==lf and v['wellbore_profile']=='Vertical')
-        geom_cells[lf]=(len(hz),len(vt))
-        _vmed[lf]=vt[len(vt)//2] if vt else 0.0
-        geom_ratio[lf]=(sum(hz)/len(hz))/(sum(vt)/len(vt)) if hz and vt and sum(vt)>0 else 0.0
-    _nx=[];_ny=[]
-    for v in wells_f.values():
-        if v['wellbore_profile']!='Horizontal': continue
-        m=_vmed.get(v['lift'],0.0)
-        if m<=0: continue
-        _nx.append(v['lateral_length_ft']); _ny.append(_peak(v)/m)
-    geom_pooled=(sum(_ny)/len(_ny)) if _ny else 0.0
-    geom_lat_corr=_pearson(_nx,_ny) if len(_nx)>=10 else 0.0
-    # Scale-aware: the 16-well smoke build cannot put 3 wells on both profiles of
-    # every lift, so a hardcoded 3 failed the test scale outright.
-    MIN_CELL=3 if SCALE=="full" else 1
-    geom_cells_ok=all(min(c)>=MIN_CELL for c in geom_cells.values())
-    geom_live=(geom_pooled>1.15 and geom_lat_corr>0.20 and geom_cells_ok)
-
-    # Derived-feature liveness: rod_load_ratio must move with motor_current_amps.
-    import statistics as _st
-    _rl=[]
-    for v in wells_f.values():
-        if v['lift']!='Pumping Unit': continue
-        p=[r for r in v['history'] if r['run_status']=='PRODUCING']
-        if len(p)<500: continue
-        hi=sorted(p,key=lambda r:-r['motor_current_amps'])[:50]
-        _rl.append(_st.mean(r['rod_load_ratio'] for r in hi))
-    rl_live=(_st.mean(_rl) if _rl else 0)
-    # Fillage trend must be negative when fillage is collapsing.
-    _ft=[]
-    for v in wells_f.values():
-        if v['lift']!='Pumping Unit': continue
-        low=[r for r in v['history'] if r['run_status']=='PRODUCING' and r['pump_fillage_pct']<25]
-        if len(low)>=20: _ft.append(_st.mean(r['pump_fillage_trend_7day'] for r in low))
-    ft_neg=(sum(1 for x in _ft if x<0)/len(_ft)*100) if _ft else -1.0  # -1 = no sample
-
-    # Tank battery must be coupled to production: run tickets should account for
-    # essentially all lease oil (previously ~30%, a decoupled random walk).
-    tank_ratio={}; alarm_tot=0; tank_rows=0
-    for _lease in LEASES:
-        _oil=sum(d.get('allocated_oil_bbl',0) for k,v in wells_f.items()
-                 if k.startswith(_lease) for d in v['history'])
-        _t=all_assets[f"{_lease}-TANK-01"]['history']
-        _tix=sum(r['ot_1_run_ticket_bbl']+r['ot_2_run_ticket_bbl']+r['ot_3_run_ticket_bbl'] for r in _t)
-        tank_ratio[_lease]=(_tix/_oil*100) if _oil else 0.0
-        alarm_tot+=sum(r['high_level_alarm'] for r in _t); tank_rows+=len(_t)
-    tank_lo=min(tank_ratio.values()); tank_hi=max(tank_ratio.values())
-    tank_ok=90<=tank_lo and tank_hi<=110
-    alarm_ok=0<alarm_tot<tank_rows*0.25
-
-    # Oil must be conserved: run tickets must account for essentially all lease
-    # oil. The old 90-110% band let 10% of it vanish unnoticed.
-    # Water disposed must not exceed water produced.
-    mb_oil={}; mb_wtr={}
-    for _lease in LEASES:
-        _o=sum(d.get('allocated_oil_bbl',0) for k,v in wells_f.items()
-               if k.startswith(_lease) for d in v['history'])
-        _w=sum(d.get('allocated_water_bbl',0) for k,v in wells_f.items()
-               if k.startswith(_lease) for d in v['history'])
-        _t=all_assets[f"{_lease}-TANK-01"]['history']
-        _s=all_assets[f"{_lease}-SWD-01"]['history']
-        _tix=sum(r['ot_1_run_ticket_bbl']+r['ot_2_run_ticket_bbl']+r['ot_3_run_ticket_bbl'] for r in _t)
-        mb_oil[_lease]=(_tix/_o*100) if _o else 0.0
-        _disp=sum(r['disposal_rate_bpd'] for r in _s)
-        mb_wtr[_lease]=(_disp/_w*100) if _w else 0.0
-    mb_oil_lo=min(mb_oil.values()); mb_oil_hi=max(mb_oil.values())
-    mb_wtr_lo=min(mb_wtr.values()); mb_wtr_hi=max(mb_wtr.values())
-    mb_oil_ok=98.0<=mb_oil_lo and mb_oil_hi<=102.0
-    mb_wtr_ok=mb_wtr_hi<=100.5
-
-    # Every row on every asset must carry organization_id and timestamp.
-    rows_missing=sum(1 for v in all_assets.values() for d in v['history']
-                     if 'organization_id' not in d or 'timestamp' not in d)
-
-    # Revenue ledger integrity
-    rev_rows=sum(len(v.get('revenue_ledger',[])) for v in all_assets.values())
-    # The gas line must tie out against RESIDUE volume, not wet wellhead volume.
-    # Before residue_gas_mcf was published, every gas-bearing record failed this
-    # by 11-14% and the ledger could not be audited.
-    _STREAMS=[('oil_volume_bbl','realized_oil_usd_bbl','gross_oil_revenue_usd'),
-              ('residue_gas_mcf','realized_gas_usd_mcf','gross_gas_revenue_usd'),
-              ('ngl_volume_bbl','realized_ngl_usd_bbl','gross_ngl_revenue_usd')]
-    rev_recon_bad=0; rev_gas_rows=0
-    for v in all_assets.values():
-        for r in v.get('revenue_ledger',[]):
-            if r.get('residue_gas_mcf',0)<=0: continue
-            rev_gas_rows+=1
-            for _vol,_pr,_rv in _STREAMS:
-                if abs(r[_vol]*r[_pr]-r[_rv])>0.011: rev_recon_bad+=1; break
-    rev_dups=0; rev_math=0; rev_nri=0; rev_months_missing=0
-    _seen=set()
-    for k,v in wells_f.items():
-        prod_months={d['date'][:7] for d in v['history'] if d['run_status']=='PRODUCING'}
-        rl=v['revenue_ledger']
-        if len({r['production_month'] for r in rl})!=len(rl): rev_dups+=1
-        rev_months_missing+=len(prod_months-{r['production_month'] for r in rl})
-        for r in rl:
-            if r['revenue_id'] in _seen: rev_dups+=1
-            _seen.add(r['revenue_id'])
-            exp=r['gross_oil_revenue_usd']+r['gross_gas_revenue_usd']+r['gross_ngl_revenue_usd']
-            if abs(exp-r['gross_revenue_usd'])>0.05: rev_math+=1
-            net=(r['net_revenue_before_deducts_usd']-r['severance_tax_usd']
-                 -r['ad_valorem_tax_usd']-r['gathering_processing_usd'])
-            if abs(net-r['net_revenue_usd'])>0.05: rev_math+=1
-            if abs(r['net_revenue_before_deducts_usd']
-                   -r['gross_revenue_usd']*r['net_revenue_interest'])>0.05: rev_nri+=1
-    neg_gas_months=sum(1 for m,p in PRICE_DECK.items() if p['realized_gas_usd_mcf']<0)
-    tot_net=sum(r['net_revenue_usd'] for v in wells_f.values() for r in v['revenue_ledger'])
-    tot_cost=sum(i['total_usd'] for v in all_assets.values() for i in v['financial_ledger'])
-    deck_ok=len(PRICE_DECK)==228 and neg_gas_months>0
-
-    # ── Scope / vendor consistency (change 1, 2, 3) ───────────────────────────────
-    DESC_TO_KEY={v[0]:k for k,v in WO_SCOPES.items()}
-    vendor_mismatch=0; scope_unknown=0; wo_scope_ct=Counter()
-    for v in all_assets.values():
-        for i in v['financial_ledger']:
-            if i['category']!='Workover': continue
-            desc=i['service_description'].rsplit(' — ',1)[0]
-            key=DESC_TO_KEY.get(desc)
-            if key is None: scope_unknown+=1; continue
-            wo_scope_ct[key]+=1
-            if i['vendor'] not in WO_VENDORS_BY_DISCIPLINE[WO_SCOPES[key][3]]:
-                vendor_mismatch+=1
-    # Preventive scopes must be lift-appropriate.
-    prev_lift_bad=sum(1 for lf,k,_ in PREV_AUDIT if k not in PREVENTIVE_SCOPES[lf])
-    prev_vendor_bad=sum(1 for _,k,vd in PREV_AUDIT
-                        if vd not in WO_VENDORS_BY_DISCIPLINE[WO_SCOPES[k][3]])
-
-    # Scope must be operationally consistent with the failure without decoding it.
-    _by_scope=defaultdict(Counter); _by_mode=defaultdict(set)
-    for scen,key,_vd in WO_AUDIT:
-        mode=next((m for m in MODE_SCOPES if m in scen), scen)
-        _by_scope[key][mode]+=1; _by_mode[mode].add(key)
-    _prev_by_scope=Counter(k for _,k,_ in PREV_AUDIT)
-    scope_leak=0.0; scope_leak_key=None
-    for key,c in _by_scope.items():
-        share=max(c.values())/(sum(c.values())+_prev_by_scope.get(key,0))
-        if share>scope_leak: scope_leak, scope_leak_key = share, key
-    scopes_single_mode=[k for k,c in _by_scope.items() if len(c)<2]
-    modes_single_scope=[m for m,ks in _by_mode.items() if len(ks)<3]
-
-    # ── Supporting-asset spend must track its own throughput (change 4) ───────────
-    # Correlate against total throughput moved, since more than one volume drives
-    # the bill (a tank battery hauls both oil and water).
-    SUPP_DRIVER_KEY={"Facility":["oil_bbl_month","water_bbl_month","gas_mcf_month"],
-                     "Compressor":["gas_mcf_month","fuel_mcf_month"],
-                     "Tank Battery":["oil_hauled_bbl_month","water_hauled_bbl_month"],
-                     "SWD Well":["water_disposed_bbl_month"]}
-    supp_corr={}
-    for atype,dks in SUPP_DRIVER_KEY.items():
-        xs=[];ys=[]
-        for v in supp_f.values():
-            if v['type']!=atype: continue
-            for i in v['financial_ledger']:
-                if i['category']=='Monthly LOE' and all(k in i for k in dks):
-                    # rate-weighted throughput: a tank hauling cheap water and dear oil
-                    # is not "decoupled" just because the two volumes differ in size
-                    xs.append(sum(i[k]*SUPP_RATES[atype].get(k[:-6],1.0) for k in dks))
-                    ys.append(i['gross_cost_usd'])
-        supp_corr[atype]=_pearson(xs,ys)
-    supp_corr_ok=all(c>0.5 for c in supp_corr.values())
-    supp_flat=sum(1 for v in supp_f.values() for i in v['financial_ledger']
-                  if i['category']=='Monthly LOE' and not any(k.endswith('_month') for k in i))
-    maint_ct=sum(1 for v in supp_f.values() for i in v['financial_ledger']
-                 if i['category']=='Maintenance')
-    _supp_loe=[i for v in supp_f.values() for i in v['financial_ledger'] if i['category']=='Monthly LOE']
-    supp_cap_hits=sum(1 for i in _supp_loe if abs(i['gross_cost_usd']-SUPP_MAX_CAP)<0.01)
-
-    # Supporting-asset upsets must be present and bounded, and must produce repairs.
-    supp_exc={}; supp_rows={}
-    for atype in SUPP_DRIVER_KEY:
-        e=0; r=0
-        for v in supp_f.values():
-            if v['type']!=atype: continue
-            for d in v['history']:
-                r+=1; _u,_x=_supp_drivers(atype,d); e+=_x
-        supp_exc[atype]=e; supp_rows[atype]=r
-    supp_exc_ok=all(0<supp_exc[a]<supp_rows[a]*0.20 for a in supp_exc)
-    comp_down=sum(1 for v in supp_f.values() if v['type']=='Compressor'
-                  for d in v['history'] if d['run_status']=='DOWN')
-
-    # ── Well LOE must be more than a function of oil (change 5) ───────────────────
-    _loe=[i for v in wells_f.values() for i in v['financial_ledger'] if i['category']=='Monthly LOE']
-    loe_corr_oil  =_pearson([i['production_bbl_month'] for i in _loe],[i['gross_cost_usd'] for i in _loe])
-    loe_corr_water=_pearson([i['water_bbl_month'] for i in _loe],[i['gross_cost_usd'] for i in _loe])
-    loe_corr_kwh  =_pearson([i['electricity_kwh_month'] for i in _loe],[i['gross_cost_usd'] for i in _loe])
-    # Partial signal test: within a narrow oil band, cost must still vary materially
-    # with water and power. If oil were the only driver this spread would collapse.
-    _band=[i for i in _loe if 900<=i['production_bbl_month']<=1100]
-    if len(_band)>=30:
-        _b=sorted(_band,key=lambda i:i['water_bbl_month']+i['electricity_kwh_month']*0.05)
-        _q=max(1,len(_b)//4)
-        _lo=sum(i['gross_cost_usd'] for i in _b[:_q])/_q
-        _hi=sum(i['gross_cost_usd'] for i in _b[-_q:])/_q
-        loe_band_ratio=_hi/_lo if _lo>0 else 0.0
-    else:
-        loe_band_ratio=0.0
-    loe_ok=(loe_corr_water>0.25 and loe_corr_kwh>0.25 and loe_band_ratio>1.25)
-    loe_cap_hits=sum(1 for i in _loe if abs(i['gross_cost_usd']-LOE_MAX_CAP)<0.01)
-    loe_med=sorted(i['gross_cost_usd'] for i in _loe)[len(_loe)//2] if _loe else 0
-
-    # ── Outage length must NOT decode failure vs routine downtime ────────────────
-    # An earlier cut gave clean wells downtime but only SHORT downtime, so
-    # every outage >= 5 days was a failure and the cohort was still perfectly
-    # separable. This measures the actual separation instead of assuming it away.
-    _len_fail=Counter(); _len_rout=Counter(); _clean_long=0
-    for _k,_v in wells_f.items():
-        _fd={e['date'] for e in FAILURE_EVENTS.get(_k,[])}
-        _run=0; _start=None; _has_long=False
-        for _d in _v['history']:
-            if _d['run_status']=='SHUT-IN':
-                if _run==0: _start=_d['date']
-                _run+=1
-            elif _run:
-                (_len_fail if _start in _fd else _len_rout)[_run]+=1
-                if _start not in _fd and _run>=6: _has_long=True
-                _run=0
-        if _run:
-            (_len_fail if _start in _fd else _len_rout)[_run]+=1
-            if _start not in _fd and _run>=6: _has_long=True
-        if _k in clean_keys and _has_long: _clean_long+=1
-    _nf=sum(_len_fail.values()); _nr=sum(_len_rout.values())
-    # Kolmogorov-Smirnov style: the best single length threshold an attacker could use
-    outage_ks=0.0; outage_ks_t=0
-    if _nf and _nr:
-        for _T in range(1,41):
-            _a=sum(v for k,v in _len_fail.items() if k>=_T)/_nf
-            _b=sum(v for k,v in _len_rout.items() if k>=_T)/_nr
-            if abs(_a-_b)>outage_ks: outage_ks, outage_ks_t = abs(_a-_b), _T
-    routine_long_share=(sum(v for k,v in _len_rout.items() if k>=6)/_nr) if _nr else 0.0
-    clean_long_ok=(_clean_long==len(clean_keys))
-
-    fpw=fails/len(wells_f)
-    neg=sum(1 for v in wells_f.values() for d in v['history']
-            for k,val in d.items() if k in ['allocated_oil_bbl','motor_current_amps','pump_intake_pressure_psi',
-            'pump_fillage_pct','strokes_per_min'] and isinstance(val,(int,float)) and val<0)
-
-    lift_ct=Counter(v['lift'] for v in wells_f.values())
-
-    print(f"\n{'='*60}")
-    print(f"FINAL VERIFICATION")
-    print(f"{'='*60}")
-    MIN_INV=20000 if SCALE=="full" else 100
-    print(f"  Total assets:       {len(all_assets)}/{N_ASSETS} {'✓' if len(all_assets)==N_ASSETS else '⚠'}")
-    print(f"  Wells:              {len(wells_f)}/{N_WELLS} {'✓' if len(wells_f)==N_WELLS else '⚠'}")
-    print(f"  Supporting:         {len(supp_f)}/{4*len(LEASES)} {'✓' if len(supp_f)==4*len(LEASES) else '⚠'}")
-    print(f"  Lift mix:           {dict(lift_ct)}")
-    print(f"  Total daily rows:   {total_h:,}")
-    print(f"  Avg years/well:     {avg_days/365:.1f}")
-    print(f"  Date span:          {min_date} → {max_date} {'✓' if max_date==END_DATE.strftime('%Y-%m-%d') else '⚠'}")
-    print(f"  Failure events:     {fails} ({fails/len(wells_f):.1f}/well)")
-    _den=len(wells_f)-clean_ct
-    print(f"  Post-2024 failures: {recent}/{_den} {'✓' if recent>=int(_den*0.85) else '⚠'}")
-    print(f"  Latest failure:     {max(last_dates) if last_dates else None}")
-    print(f"  Clean wells:        {clean_ct}/{N_CLEAN} {'✓' if clean_ct==N_CLEAN else '⚠'}")
-    print(f"  Clean w/ failures:  {clean_had_failure} {'✓' if clean_had_failure==0 else '⚠ physics leaked'}")
-    print(f"  Clean w/ 0 downtime:{clean_zero_dt} {'✓' if clean_zero_dt==0 else '⚠ UPTIME LABELS COHORT'}")
-    print(f"  Clean downtime rate:{clean_dt_rate*100:.2f}% of days")
-    print(f"  Outage len separability: KS {outage_ks:.2f} at >={outage_ks_t}d {'✓' if outage_ks<0.80 else '⚠ LENGTH DECODES FAILURE'}")
-    print(f"  Routine outages >=6d:    {routine_long_share*100:.0f}% of {_nr:,} {'✓' if routine_long_share>0.15 else '⚠ no long tail'}")
-    print(f"  Clean wells w/ long o/a: {_clean_long}/{len(clean_keys)} {'✓' if clean_long_ok else '⚠ clean cohort short-only'}")
-    print(f"  Horizontal/Vertical:{horiz_ct}/{len(wells_f)-horiz_ct} {'✓' if geom_ok and lat_ok else '⚠'}")
-    print(f"  Geometry x lift:    {'all 6 combos present ✓' if geom_ok else '⚠ missing combo'}")
-    print(f"  Failures/well:      {fpw:.1f} {'✓' if 8<=fpw<=13 else '⚠ (target 8-13)'}")
-    print(f"  Total invoices:     {total_inv:,} {'✓' if total_inv>MIN_INV else '⚠'}")
-    print(f"  Duplicate inv IDs:  {dups} {'✓' if dups==0 else '⚠'}")
-    print(f"  WI math errors:     {wi_err} {'✓' if wi_err==0 else '⚠'}")
-    print(f"  ESP pump curves:    {pump_ct}/{esp_ct} {'✓' if pump_ct==esp_ct else '⚠'}")
-    print(f"  Pressure step-down: {'✓' if pres_ok else '⚠'}")
-    print(f"  Bad/label fields:   {bad if bad else 'none ✓'}")
-    print(f"  Negatives:          {neg} {'✓' if neg==0 else '⚠'}")
-    print(f"  WO invoices on event date: {wo_exact}/{wo_tot} ({wo_leak_pct:.1f}%) {'✓' if wo_leak_pct<10 else '⚠ LABEL LEAK'}")
-    print(f"  Clean wells w/o WO spend:  {clean_no_wo}/{len(clean_keys)} {'✓' if clean_no_wo==0 else '⚠ LABEL LEAK'}")
-    print(f"  Live values on SHUT-IN row:{shutin_live} {'✓' if shutin_live==0 else '⚠ FAILURE DAY EXPOSED'}")
-    print(f"  Months w/o LOE invoice:    {months_no_loe} {'✓' if months_no_loe==0 else '⚠ IDLE MONTH LABELED'}")
-    print(f"  Months w/o revenue rec:    {months_no_rev} {'✓' if months_no_rev==0 else '⚠ IDLE MONTH LABELED'}")
-    print(f"  Oil mass balance:          {mb_oil_lo:.1f}-{mb_oil_hi:.1f}% {'✓' if mb_oil_ok else '⚠ OIL LOST'}")
-    print(f"  Water disposed vs made:    {mb_wtr_lo:.1f}-{mb_wtr_hi:.1f}% {'✓' if mb_wtr_ok else '⚠ DOUBLE DISPOSAL'}")
-    print(f"  Horiz/vert peak-oil ratio: "+", ".join(f"{k} {v:.2f}x" for k,v in geom_ratio.items())+f" {'✓' if geom_live else '⚠ geometry inert'}")
-    print(f"  Horiz/vert well counts:    "+", ".join(f"{k} {h}H/{vv}V" for k,(h,vv) in geom_cells.items())+f" {'✓' if geom_cells_ok else '⚠ profile cell too thin'}")
-    print(f"  Pooled H uplift (norm):    {geom_pooled:.2f}x {'✓' if geom_pooled>1.15 else '⚠ geometry inert'}")
-    print(f"  Lateral length vs peak:    r={geom_lat_corr:.2f} {'✓' if geom_lat_corr>0.20 else '⚠ length does not drive rate'}")
-    print(f"  High level alarms:         {alarm_tot:,} of {tank_rows:,} rows {'✓' if alarm_ok else '⚠ alarm dead'}")
-    print(f"  Rows missing org_id/ts:    {rows_missing:,} {'✓' if rows_missing==0 else '⚠'}")
-    print(f"  Revenue records:           {rev_rows:,} {'✓' if rev_rows>MIN_INV else '⚠'}")
-    print(f"  Ledger ties out (o/g/ngl): {rev_gas_rows-rev_recon_bad:,}/{rev_gas_rows:,} {'✓' if rev_recon_bad==0 else '⚠ LEDGER WILL NOT TIE OUT'}")
-    print(f"  Revenue math errors:       {rev_math} {'✓' if rev_math==0 else '⚠'}")
-    print(f"  NRI application errors:    {rev_nri} {'✓' if rev_nri==0 else '⚠'}")
-    print(f"  Producing months w/o rev:  {rev_months_missing} {'✓' if rev_months_missing==0 else '⚠'}")
-    print(f"  Price deck months:         {len(PRICE_DECK)} ({neg_gas_months} negative-gas) {'✓' if deck_ok else '⚠'}")
-    print(f"  Lifetime net revenue:      ${tot_net/1e6:,.0f}M  vs cost ${tot_cost/1e6:,.0f}M")
-    print(f"  rod_load on high-amp days: {rl_live:.3f} {'✓' if rl_live>1.05 else '⚠ feature dead'}")
-    print(f"  fillage trend neg on collapse: "+(f"n/a ({len(_ft)} wells sampled)" if ft_neg<0
-          else f"{ft_neg:.0f}% {'✓' if ft_neg>=80 else '⚠ feature dead'}"))
-    print(f"\n  ── Scope / vendor coupling ──")
-    print(f"  Unrecognized WO scopes:    {scope_unknown} {'✓' if scope_unknown==0 else '⚠'}")
-    print(f"  Vendor not qualified:      {vendor_mismatch}/{sum(wo_scope_ct.values()):,} {'✓' if vendor_mismatch==0 else '⚠ VENDOR MISMATCH'}")
-    print(f"  Preventive scope off-lift: {prev_lift_bad} {'✓' if prev_lift_bad==0 else '⚠'}")
-    print(f"  Preventive vendor bad:     {prev_vendor_bad} {'✓' if prev_vendor_bad==0 else '⚠'}")
-    print(f"  Sub-types per scope:       min {min(len(c) for c in _by_scope.values())} {'✓' if not scopes_single_mode else '⚠ '+str(scopes_single_mode)}")
-    print(f"  Scopes per sub-type:       min {min(len(k) for k in _by_mode.values())} {'✓' if not modes_single_scope else '⚠ '+str(modes_single_scope)}")
-    print(f"  Max P(sub-type | scope):   {scope_leak:.2f} on '{scope_leak_key}' {'✓' if scope_leak<0.75 else '⚠ SCOPE DECODES MODE'}")
-    print(f"  Scope mix:                 {dict(wo_scope_ct.most_common())}")
-    print(f"\n  ── Cost drivers ──")
-    print(f"  Supp invoices w/o driver:  {supp_flat} {'✓' if supp_flat==0 else '⚠'}")
-    for _a,_c in supp_corr.items():
-        print(f"  Supp corr {_a:<13}{_c:.2f} {'✓' if _c>0.5 else '⚠ decoupled'}")
-    print(f"  Supp maintenance invoices: {maint_ct:,} {'✓' if maint_ct>0 else '⚠ repair path dead'}")
-    print(f"  Supp cap hits:             {supp_cap_hits}/{len(_supp_loe):,} {'✓' if supp_cap_hits==0 else '⚠ CAP BINDING'}")
-    print(f"  Supp excursion days:       "+", ".join(f"{a} {supp_exc[a]:,}/{supp_rows[a]:,}" for a in supp_exc)+f" {'✓' if supp_exc_ok else '⚠'}")
-    print(f"  Compressor down days:      {comp_down:,} {'✓' if comp_down>0 else '⚠'}")
-    print(f"  LOE corr oil/water/kwh:    {loe_corr_oil:.2f} / {loe_corr_water:.2f} / {loe_corr_kwh:.2f} {'✓' if loe_ok else '⚠'}")
-    print(f"  LOE spread at fixed oil:   {loe_band_ratio:.2f}x {'✓' if loe_band_ratio>1.25 else '⚠ oil-only'}")
-    print(f"  LOE median / cap hits:     ${loe_med:,.0f} / {loe_cap_hits} {'✓' if loe_cap_hits<len(_loe)*0.01 else '⚠ cap binding'}")
-
-    issues=[x for x in[
-        f"Assets: {len(all_assets)}" if len(all_assets)!=N_ASSETS else None,
-        f"Wells: {len(wells_f)}" if len(wells_f)!=N_WELLS else None,
-        f"Clean: {clean_ct}" if clean_ct!=N_CLEAN else None,
-        f"Clean wells with failure events: {clean_had_failure}" if clean_had_failure else None,
-        f"Clean wells with zero downtime (uptime labels cohort): {clean_zero_dt}" if clean_zero_dt else None,
-        f"Outage length decodes failure: KS={outage_ks:.2f} at >={outage_ks_t}d" if outage_ks>=0.80 else None,
-        f"Routine outages have no long tail: {routine_long_share*100:.0f}% >=6d" if routine_long_share<=0.15 else None,
-        f"Clean wells with only short outages: {len(clean_keys)-_clean_long}" if not clean_long_ok else None,
-        f"SHUT-IN rows carrying live sensor values: {shutin_live}" if shutin_live else None,
-        f"Well-months with no LOE invoice: {months_no_loe}" if months_no_loe else None,
-        f"Well-months with no revenue record: {months_no_rev}" if months_no_rev else None,
-        f"Oil mass balance {mb_oil_lo:.1f}-{mb_oil_hi:.1f}% of lease oil" if not mb_oil_ok else None,
-        f"Water disposed exceeds produced: {mb_wtr_hi:.1f}%" if not mb_wtr_ok else None,
-        f"Geometry inert — pooled H uplift {geom_pooled:.2f}x" if geom_pooled<=1.15 else None,
-        f"Lateral length does not drive rate — r={geom_lat_corr:.2f}" if geom_lat_corr<=0.20 else None,
-        f"Too few wells on one profile to compare: {geom_cells}" if not geom_cells_ok else None,
-        f"Post-2024: {recent}" if SCALE=="full" and recent<int((len(wells_f)-clean_ct)*0.85) else None,
-        f"Failures/well: {fpw:.1f}" if SCALE=="full" and not (8<=fpw<=13) else None,
-        f"WO label leak: {wo_leak_pct:.1f}% on exact event date" if wo_leak_pct>=10 else None,
-        f"Clean wells w/o workover spend: {clean_no_wo}" if clean_no_wo>0 else None,
-        "Geometry: missing lift x profile combo" if not geom_ok else None,
-        "Lateral length inconsistent with profile" if not lat_ok else None,
-        f"Tank run tickets {tank_lo:.0f}-{tank_hi:.0f}% of lease oil" if not tank_ok else None,
-        f"high_level_alarm fired {alarm_tot} times" if not alarm_ok else None,
-        f"Rows missing organization_id/timestamp: {rows_missing:,}" if rows_missing>0 else None,
-        f"Revenue records: {rev_rows}" if rev_rows<MIN_INV else None,
-        f"Revenue does not reconcile on {rev_recon_bad} records" if rev_recon_bad else None,
-        f"Revenue math errors: {rev_math}" if rev_math>0 else None,
-        f"NRI application errors: {rev_nri}" if rev_nri>0 else None,
-        f"Duplicate revenue ids/months: {rev_dups}" if rev_dups>0 else None,
-        f"Producing months without revenue: {rev_months_missing}" if rev_months_missing>0 else None,
-        "Price deck incomplete" if not deck_ok and SCALE=="full" else None,
-        f"rod_load_ratio dead ({rl_live:.3f})" if rl_live<=1.05 else None,
-        f"fillage trend dead ({ft_neg:.0f}% negative)" if 0<=ft_neg<80 else None,
-        f"Unrecognized workover scopes: {scope_unknown}" if scope_unknown>0 else None,
-        f"Vendor not qualified for scope: {vendor_mismatch}" if vendor_mismatch>0 else None,
-        f"Preventive scope not valid for lift: {prev_lift_bad}" if prev_lift_bad>0 else None,
-        f"Preventive vendor not qualified: {prev_vendor_bad}" if prev_vendor_bad>0 else None,
-        f"Scope decodes sub-type: max P={scope_leak:.2f} on {scope_leak_key}" if scope_leak>=0.75 else None,
-        (f"Scopes reachable from one sub-type only: {scopes_single_mode}"
-            if scopes_single_mode and SCALE=="full" else None),
-        (f"Sub-types with <3 candidate scopes: {modes_single_scope}"
-            if modes_single_scope and SCALE=="full" else None),
-        f"Supporting-asset spend decoupled from throughput: {supp_corr}" if not supp_corr_ok else None,
-        f"Supporting-asset invoices without driver volumes: {supp_flat}" if supp_flat>0 else None,
-        f"Well LOE not multi-driver (water {loe_corr_water:.2f}, kwh {loe_corr_kwh:.2f}, band {loe_band_ratio:.2f}x)" if not loe_ok else None,
-        f"LOE cap binding on {loe_cap_hits} invoices" if loe_cap_hits>=len(_loe)*0.01 else None,
-        "Supporting-asset maintenance path never fired" if maint_ct==0 else None,
-        f"SUPP_MAX_CAP binding on {supp_cap_hits} invoices" if supp_cap_hits>0 else None,
-        f"Supporting-asset excursion days out of range: {supp_exc}" if not supp_exc_ok else None,
-        "Compressor has no downtime" if comp_down==0 else None,
-        f"Invoices: {total_inv}" if total_inv<MIN_INV else None,
-        f"Dups: {dups}" if dups>0 else None,
-        f"WI errors: {wi_err}" if wi_err>0 else None,
-        f"Pump curves: {pump_ct}/{esp_ct}" if pump_ct!=esp_ct else None,
-        "Pressure step-down" if not pres_ok else None,
-        f"Bad fields: {bad}" if bad else None,
-        f"Negatives: {neg}" if neg>0 else None,
-        f"End date: {max_date}" if max_date!=END_DATE.strftime('%Y-%m-%d') else None,
-    ] if x]
-
-    if issues:
-        print(f"\n  ISSUES ({len(issues)}):")
-        for iss in issues: print(f"    ⚠ {iss}")
-        print("\n  BUILD FAILED — output not written.")
-        sys.exit(1)
-    else:
-        print(f"\n  ALL CLEAR")
-
-    output={
-        "company":COMPANY,"organization_id":ORGANIZATION_ID,"build_version":"V2",
-        # Defaults to the dataset as-of date, NOT wall-clock time, so repeated builds of
-        # the same script are byte-identical and the artifact can be checksummed.
-        # Override with RBNR_BUILD_DATE=YYYY-MM-DD to stamp a real build date.
-        "generated":os.environ.get("RBNR_BUILD_DATE", END_DATE.strftime("%Y-%m-%d")),
-        "description":f"Red Bluff Resources V2 — {N_WELLS} wells, Permian Basin, sensor-driven failures, no labels",
-        "price_deck":PRICE_DECK,
-        "price_deck_note":("SYNTHETIC monthly realized prices shaped to real Permian history "
-                          "(2008 spike/collapse, H2-2014 crash, 2018 Midland diff blowout, "
-                          "Apr-2020, 2022 spike, negative Waha months). Not market data."),
-        "fiscal_terms":{"severance_tax_oil":SEV_TAX_OIL,"severance_tax_gas":SEV_TAX_GAS,
-                        "ad_valorem":AD_VALOREM,"oil_transport_usd_bbl":OIL_TRANSPORT,
-                        "gas_gpt_usd_mcf":GAS_GPT},
-        "assets":all_assets,
+def make_loc(info):
+    return {
+        "basin": info["basin"],
+        "sub_basin": info["sub_basin"],
+        "state": info["state"],
+        "county": info["county"],
+        "region": info["region"],
     }
-    print(f"\nSaving {OUTPUT_FILE}...")
-    with open(OUTPUT_FILE,"w") as f: json.dump(output,f,indent=2)
-    sz=os.path.getsize(OUTPUT_FILE)
-    print(f"Done — {sz/1024/1024:.0f} MB saved as {OUTPUT_FILE}")
+
+
+def make_pers(lease, info=None):
+    info = info or LEASES[lease]
+    eng = info["engineer"]
+    return {
+        "well_perf_engineer": {
+            "name": eng,
+            "role": "Well Performance Engineer",
+            "email": f"{eng.lower().replace(' ', '.')}@redbluffresources.com",
+        },
+        "prod_technician": {
+            "name": f"{lease} Production Tech",
+            "role": "Production Technician",
+            "email": f"prodtech.{lease.lower()}@redbluffresources.com",
+        },
+    }
