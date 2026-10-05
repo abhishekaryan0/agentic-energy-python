@@ -50,6 +50,9 @@ htmlcov/
 *.db
 *.sqlite
 
+# Local test / Lambda invoke output
+response.json
+
 # Archives (local packaging only — do not commit)
 *.zip
 
